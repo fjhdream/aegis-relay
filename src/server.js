@@ -141,137 +141,334 @@ function accessSnapshot(){
   return store.data.routes.map(r=>{const b=nodeChannels(viewers,r,channelLabels(r),true);return {id:r.id,alias:r.alias,name:r.name,threshold:b.threshold,distinctIps:b.distinctIps,distinctDevices:b.distinctDevices,suspicious:b.suspicious,status:b.suspicious?'疑似多人共享':'安全',channels:b.channels};});
 }
 
-async function api(req, res, rel, cookiePath = cfg.adminPath) {
-  if (req.method === 'GET' && rel === '/status') return json(res, 200, { initialized:!!store.data.admin, adminPath:cfg.adminPath, version:APP_VERSION });
+const notFound=res=>json(res,404,{error:'not found'});
+const adminAccount=()=>store.data.admin;
+const otpUri=secret=>`otpauth://totp/${encodeURIComponent(`AegisRelay:${adminAccount().username}`)}?secret=${secret}&issuer=AegisRelay&digits=6&period=30`;
+const findRoute=id=>store.data.routes.find(x=>x.id===id);
+// A node change goes live on the panel's own proxy and is pushed to every remote machine.
+function publishRoutes(){localAgent.reconcile();agentApi.invalidate();}
+// The node record shared by create and import. Callers validate the alias and upstreams and pick the key.
+function buildRoute(input,{alias,upstreams,accessMode,accessKey,enabled}){
+  const now=new Date().toISOString();
+  return {id:randomToken(12),alias,name:String(input.name||alias).slice(0,80),upstreams,allowPrivate:input.allowPrivate===true,tlsVerify:input.tlsVerify!==false,enabled,accessMode,
+    showOnHome:input.showOnHome===true,clientProfile:cleanProfile(input.clientProfile),streamRewrite:cleanStreamRewrite(input.streamRewrite),tags:cleanTags(input.tags),notes:String(input.notes||'').slice(0,500),favorite:input.favorite===true,
+    sortOrder:numeric(input.sortOrder,-10000,10000),speedLimitMbps:numeric(input.speedLimitMbps,0,100000),monthlyQuotaGB:numeric(input.monthlyQuotaGB,0,1000000),reminderDays:numeric(input.reminderDays,0,365),accessAlertThreshold:numeric(input.accessAlertThreshold,0,100000),
+    ...routeAuthFields(accessKey),createdAt:now,updatedAt:now};
+}
+// Node fields a PATCH sets directly, applied in this order.
+const ROUTE_PATCH_FIELDS={
+  name:v=>String(v).slice(0,80),enabled:v=>v===true,tlsVerify:v=>v===true,showOnHome:v=>v===true,clientProfile:cleanProfile,streamRewrite:cleanStreamRewrite,tags:cleanTags,notes:v=>String(v).slice(0,500),favorite:v=>v===true,
+  sortOrder:v=>numeric(v,-10000,10000),speedLimitMbps:v=>numeric(v,0,100000),monthlyQuotaGB:v=>numeric(v,0,1000000),reminderDays:v=>numeric(v,0,365),accessAlertThreshold:v=>numeric(v,0,100000)
+};
+
+// --- Endpoints answered before any session exists ---
+async function setupAdmin(req,res){
+  if (store.data.admin) return json(res, 409, { error:'already initialized' });
+  const b = await body(req); if (!cfg.setupToken || !timingEqual(b.setupToken || '', cfg.setupToken)) { store.audit('setup.denied', ip(req)); return json(res, 403, { error:'invalid setup token' }); }
+  // A fresh install is password-only; two-factor is opt-in from 个人设置 afterwards.
+  store.data.admin = { username:String(b.username || 'admin').slice(0,64), passwordHash:hashPassword(b.password), totpSecret:null, recoveryDigests:[], createdAt:new Date().toISOString() };
+  store.audit('admin.initialized', ip(req));
+  return json(res, 201, { totpEnabled:false });
+}
+async function login(req,res,cookiePath){
+  if (!store.data.admin || !loginLimiter.take(ip(req))) { store.audit('login.denied', ip(req)); return json(res, 429, { error:'try again later' }); }
+  const b = await body(req), a = store.data.admin, totpOn = !!a.totpSecret;
+  let second = !totpOn || verifyTotp(a.totpSecret, b.code);
+  if (totpOn && !second && b.recovery) { const d=tokenDigest(String(b.recovery),key), idx=(a.recoveryDigests||[]).findIndex(x=>timingEqual(x,d)); if(idx>=0){a.recoveryDigests.splice(idx,1);store.save();second=true;} }
+  if (!verifyPassword(b.password || '', a.passwordHash) || !second) { store.audit('login.failed', ip(req)); return json(res, 401, { error:'invalid credentials' }); }
+  const sid=randomToken(), csrf=randomToken(24); sessions[sid]={csrf,expires:Date.now()+30*60_000};pruneSessions();store.audit('login.success',ip(req));
+  const cookie=`aegis_session=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=${cookiePath}; Max-Age=604800${cfg.secureCookies?'; Secure':''}`; return json(res,200,{csrf},{'set-cookie':cookie});
+}
+function logout(req,res,cookiePath){ const s=requireAuth(req);delete sessions[s.sid];store.audit('logout',ip(req));return json(res,200,{ok:true},{'set-cookie':`aegis_session=; HttpOnly; SameSite=Strict; Path=${cookiePath}; Max-Age=0`}); }
+// Resume an existing session after a page refresh: hands the CSRF token back to a browser that still
+// holds the HttpOnly, SameSite=Strict session cookie. No CSRF token is required to read it, and the
+// strict cookie plus same-origin policy keep it unreadable to other sites.
+function resumeSession(req,res){ const s=auth(req); if(!s) return json(res,401,{error:'登录已失效，请重新登录'}); return json(res,200,{csrf:s.csrf,username:store.data.admin?.username||''}); }
+const publicApi={
+  'GET /status':(req,res)=>json(res, 200, { initialized:!!store.data.admin, adminPath:cfg.adminPath, version:APP_VERSION }),
   // The panel icon shows on the login screen and as the favicon, both of which render before any session
   // exists. Served no-store (via the default headers): caching it made a freshly saved icon revert to the
   // stale cached value on the next refresh.
-  if (req.method === 'GET' && rel === '/branding') return json(res, 200, { icon:store.data.settings.panelIcon||'' });
-  if (req.method === 'POST' && rel === '/setup') {
-    if (store.data.admin) return json(res, 409, { error:'already initialized' });
-    const b = await body(req); if (!cfg.setupToken || !timingEqual(b.setupToken || '', cfg.setupToken)) { store.audit('setup.denied', ip(req)); return json(res, 403, { error:'invalid setup token' }); }
-    // A fresh install is password-only; two-factor is opt-in from 个人设置 afterwards.
-    store.data.admin = { username:String(b.username || 'admin').slice(0,64), passwordHash:hashPassword(b.password), totpSecret:null, recoveryDigests:[], createdAt:new Date().toISOString() };
-    store.audit('admin.initialized', ip(req));
-    return json(res, 201, { totpEnabled:false });
-  }
-  if (req.method === 'POST' && rel === '/login') {
-    if (!store.data.admin || !loginLimiter.take(ip(req))) { store.audit('login.denied', ip(req)); return json(res, 429, { error:'try again later' }); }
-    const b = await body(req), a = store.data.admin, totpOn = !!a.totpSecret;
-    let second = !totpOn || verifyTotp(a.totpSecret, b.code);
-    if (totpOn && !second && b.recovery) { const d=tokenDigest(String(b.recovery),key), idx=(a.recoveryDigests||[]).findIndex(x=>timingEqual(x,d)); if(idx>=0){a.recoveryDigests.splice(idx,1);store.save();second=true;} }
-    if (!verifyPassword(b.password || '', a.passwordHash) || !second) { store.audit('login.failed', ip(req)); return json(res, 401, { error:'invalid credentials' }); }
-    const sid=randomToken(), csrf=randomToken(24); sessions[sid]={csrf,expires:Date.now()+30*60_000};pruneSessions();store.audit('login.success',ip(req));
-    const cookie=`aegis_session=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=${cookiePath}; Max-Age=604800${cfg.secureCookies?'; Secure':''}`; return json(res,200,{csrf},{'set-cookie':cookie});
-  }
-  if (req.method === 'POST' && rel === '/logout') { const s=requireAuth(req);delete sessions[s.sid];store.audit('logout',ip(req));return json(res,200,{ok:true},{'set-cookie':`aegis_session=; HttpOnly; SameSite=Strict; Path=${cookiePath}; Max-Age=0`}); }
-  // Resume an existing session after a page refresh: hands the CSRF token back to a browser that still
-  // holds the HttpOnly, SameSite=Strict session cookie. No CSRF token is required to read it, and the
-  // strict cookie plus same-origin policy keep it unreadable to other sites.
-  if (req.method === 'GET' && rel === '/session') { const s=auth(req); if(!s) return json(res,401,{error:'登录已失效，请重新登录'}); return json(res,200,{csrf:s.csrf,username:store.data.admin?.username||''}); }
-  requireAuth(req);
-  const admin=()=>store.data.admin;
-  const otpUri=secret=>`otpauth://totp/${encodeURIComponent(`AegisRelay:${admin().username}`)}?secret=${secret}&issuer=AegisRelay&digits=6&period=30`;
-  if (req.method === 'GET' && rel === '/account') return json(res,200,{username:admin().username,totpEnabled:!!admin().totpSecret,recoveryRemaining:(admin().recoveryDigests||[]).length});
-  if (req.method === 'PUT' && rel === '/account/icon') {
-    const b=await body(req,MAX_ICON_BYTES*2);
-    const icon=typeof b.url==='string'&&b.url.trim()?normalizePanelIcon(await fetchPanelIcon(b.url.trim())):normalizePanelIcon(b.icon);
-    store.data.settings.panelIcon=icon;
-    store.audit(icon?'account.icon_updated':'account.icon_reset',ip(req));store.save();
-    return json(res,200,{ok:true,icon});
-  }
-  if (req.method === 'POST' && rel === '/account/password') {
-    const b=await body(req);
-    if(!verifyPassword(b.currentPassword||'',admin().passwordHash)){store.audit('account.password_denied',ip(req));return json(res,401,{error:'当前密码不正确'});}
-    admin().passwordHash=hashPassword(b.newPassword||'');
-    store.audit('account.password_changed',ip(req));store.save();
-    return json(res,200,{ok:true});
-  }
-  // Enrolment is two-step: the secret stays pending until a generated code proves the app has it.
-  if (req.method === 'POST' && rel === '/account/totp/begin') {
-    const b=await body(req);
-    if(!verifyPassword(b.password||'',admin().passwordHash))return json(res,401,{error:'当前密码不正确'});
-    const secret=newTotpSecret();
-    admin().pendingTotp={secret,startedAt:new Date().toISOString()};store.save();
-    const uri=otpUri(secret);
-    return json(res,200,{secret,uri,qr:qrRows(uri)});
-  }
-  if (req.method === 'POST' && rel === '/account/totp/enable') {
-    const b=await body(req),pending=admin().pendingTotp;
-    if(!pending?.secret)return json(res,409,{error:'请先重新生成二维码'});
-    if(!verifyTotp(pending.secret,b.code||'')){store.audit('account.totp_failed',ip(req));return json(res,401,{error:'验证码不正确，请确认手机时间已同步'});}
-    const recovery=Array.from({length:8},()=>randomToken(9));
-    admin().totpSecret=pending.secret;admin().recoveryDigests=recovery.map(v=>tokenDigest(v,key));
-    delete admin().pendingTotp;
-    store.audit('account.totp_enabled',ip(req));store.save();
-    return json(res,200,{ok:true,recovery});
-  }
-  if (req.method === 'POST' && rel === '/account/totp/disable') {
-    const b=await body(req);
-    if(!admin().totpSecret)return json(res,409,{error:'两步验证尚未开启'});
-    if(!verifyPassword(b.password||'',admin().passwordHash))return json(res,401,{error:'当前密码不正确'});
-    if(!verifyTotp(admin().totpSecret,b.code||''))return json(res,401,{error:'验证码不正确'});
-    admin().totpSecret=null;admin().recoveryDigests=[];delete admin().pendingTotp;
-    store.audit('account.totp_disabled',ip(req));store.save();
-    return json(res,200,{ok:true});
-  }
-  if (req.method === 'GET' && rel === '/routes') return json(res,200,{routes:store.data.routes.map(publicRoute).sort((a,b)=>a.sortOrder-b.sortOrder||Number(b.favorite)-Number(a.favorite)||a.name.localeCompare(b.name))});
-  // Sort is stable, so machines that never got an explicit order keep their registration order.
-  if (req.method === 'GET' && rel === '/agents') return json(res,200,{panelVersion:APP_VERSION,agents:store.data.agents.map(agentView).sort((a,b)=>a.sortOrder-b.sortOrder)});
-  if (req.method === 'POST' && rel === '/agents/enrollment') {const b=await body(req),issued=issueEnrollment(store.data,{name:b.name,domain:b.domain,routeIds:b.routeIds});let command;try{command=enrollmentInstallCommand({publicBaseUrl:cfg.publicBaseUrl,token:issued.token,name:issued.record.name,domain:issued.record.domain,email:store.data.settings.certificateEmail});}catch(error){store.data.enrollmentTokens=store.data.enrollmentTokens.filter(item=>item!==issued.record);throw error;}store.audit('agent.enrollment_created',ip(req),issued.record.id);return json(res,201,{expiresAt:issued.record.expiresAt,command,uninstallCommand:'sudo aegis-relay-agent uninstall'});}
-  if (req.method === 'GET' && rel === '/dashboard') return json(res,200,dashboardSnapshot());
-  if (req.method === 'GET' && rel === '/access') return json(res,200,{nodes:accessSnapshot()});
-  if (req.method === 'GET' && rel === '/deployment') return json(res,200,{adminPath:cookiePath,secureCookies:cfg.secureCookies,publicBaseUrl:cfg.publicBaseUrl,localProxyBaseUrl:clientBaseUrl(),splitDomains:!!cfg.localProxyBaseUrl&&baseHostname(cfg.localProxyBaseUrl)!==baseHostname(cfg.publicBaseUrl),httpsReady:cfg.secureCookies&&cfg.publicBaseUrl.startsWith('https://'),certificateEmail:store.data.settings.certificateEmail||'',domainChange:localDomainStatus()});
-  if (req.method === 'PUT' && rel === '/deployment') {const b=await body(req);store.data.settings.certificateEmail=normalizeCertificateEmail(b.certificateEmail);store.audit('deployment.certificate_email_updated',ip(req));return json(res,200,{ok:true,certificateEmail:store.data.settings.certificateEmail});}
-  if (req.method === 'GET' && rel === '/notifications') return json(res,200,notifier.view());
-  if (req.method === 'PUT' && rel === '/notifications') {const b=await body(req),result=notifier.configure(b);store.audit('notifications.updated',ip(req));return json(res,200,result);}
-  if (req.method === 'POST' && rel === '/notifications/test') {await notifier.test();store.audit('notifications.tested',ip(req));return json(res,200,{ok:true});}
-  if (req.method === 'GET' && rel === '/events') {res.writeHead(200,headers({'content-type':'text/event-stream','connection':'keep-alive'}));req.on('close',dashboardFeed.follow(res));return;}
-  if (req.method === 'GET' && rel === '/export') return json(res,200,{version:1,exportedAt:new Date().toISOString(),routes:store.data.routes.map(r=>{const x=publicRoute(r);delete x.id;delete x.createdAt;delete x.updatedAt;return x})});
-  if (req.method === 'POST' && rel === '/import') {const b=await body(req),items=Array.isArray(b.routes)?b.routes.slice(0,50):[];const credentials=[],errors=[];for(const item of items){try{const alias=checkedAlias(item.alias);if(store.data.routes.some(r=>r.alias===alias))throw new Error('alias already exists');const allowPrivate=item.allowPrivate===true,upstreams=await validateUpstreamList(item.upstreams||item.upstream,allowPrivate),accessMode=item.accessMode==='alias_only'?'alias_only':'key',accessKey=accessMode==='key'?randomToken(24):'',now=new Date().toISOString();const r={id:randomToken(12),alias,name:String(item.name||alias).slice(0,80),upstreams,allowPrivate,tlsVerify:item.tlsVerify!==false,enabled:item.enabled!==false,accessMode,showOnHome:item.showOnHome===true,clientProfile:cleanProfile(item.clientProfile),streamRewrite:cleanStreamRewrite(item.streamRewrite),tags:cleanTags(item.tags),notes:String(item.notes||'').slice(0,500),favorite:item.favorite===true,sortOrder:numeric(item.sortOrder,-10000,10000),speedLimitMbps:numeric(item.speedLimitMbps,0,100000),monthlyQuotaGB:numeric(item.monthlyQuotaGB,0,1000000),reminderDays:numeric(item.reminderDays,0,365),accessAlertThreshold:numeric(item.accessAlertThreshold,0,100000),...routeAuthFields(accessKey),createdAt:now,updatedAt:now};store.data.routes.push(r);ensureLocalDeployment(store.data,r.id,now);credentials.push({alias,...credentialsFor(r,accessKey)})}catch(e){errors.push({alias:String(item?.alias||''),error:e.message})}}store.audit('routes.imported',ip(req),`${credentials.length} imported`);(localAgent.reconcile(),agentApi.invalidate());return json(res,200,{imported:credentials.length,credentials,errors});}
-  if (req.method === 'GET' && rel === '/diagnostics') return json(res,200,{nodes:getRuntimeStatus(localAgent.routeSource.getRoutes())});
-  if (req.method === 'GET' && rel === '/audit') return json(res,200,{audit:store.data.audit.slice(0,100)});
-  if (req.method === 'POST' && rel === '/routes') {
-    const b=await body(req), alias=checkedAlias(b.alias); if(store.data.routes.some(r=>r.alias===alias)) return json(res,409,{error:'alias already exists'});
-    const allowPrivate=b.allowPrivate===true, upstreams=await validateUpstreamList(b.upstreams||b.upstream,allowPrivate);
-    const accessMode=b.accessMode==='alias_only'?'alias_only':'key', accessKey=accessMode==='key'?connectionKey(b.accessKey):'', now=new Date().toISOString();
-    const r={id:randomToken(12),alias,name:String(b.name||alias).slice(0,80),upstreams,allowPrivate,tlsVerify:b.tlsVerify!==false,enabled:true,accessMode,showOnHome:b.showOnHome===true,clientProfile:cleanProfile(b.clientProfile),streamRewrite:cleanStreamRewrite(b.streamRewrite),tags:cleanTags(b.tags),notes:String(b.notes||'').slice(0,500),favorite:b.favorite===true,sortOrder:numeric(b.sortOrder,-10000,10000),speedLimitMbps:numeric(b.speedLimitMbps,0,100000),monthlyQuotaGB:numeric(b.monthlyQuotaGB,0,1000000),reminderDays:numeric(b.reminderDays,0,365),accessAlertThreshold:numeric(b.accessAlertThreshold,0,100000),...routeAuthFields(accessKey),createdAt:now,updatedAt:now};
-    store.data.routes.push(r);
-    // Deploy the new node onto exactly the machine picked in the drawer, so its shown client address
-    // uses that machine's domain (routeBaseUrl prefers the remote deployment). A panel machine used
-    // only for management must not silently pick up every new node as well — that deployment would
-    // have to be turned off by hand after every single create. The panel keeps serving the node when
-    // no agent is picked, when the picked one is unknown, or when it has no usable entry host yet
-    // (freshly enrolled, no domain/IP): without that fallback the address handed out would be dead.
-    const deployAgentId=String(b.agentId||''),deployAgent=deployAgentId&&deployAgentId!==LOCAL_AGENT_ID?store.data.agents?.find(a=>a.id===deployAgentId):null;
-    if(deployAgent)store.data.deployments.push({id:deploymentId(deployAgentId,r.id),agentId:deployAgentId,routeId:r.id,enabled:true,createdAt:now,updatedAt:now});
-    if(!deployAgent||!agentEntryUrl(deployAgent))ensureLocalDeployment(store.data,r.id,now);
-    store.audit('route.created',ip(req),alias);(localAgent.reconcile(),agentApi.invalidate());return json(res,201,{route:publicRoute(r),...credentialsFor(r,accessKey)});
-  }
-  const agentMatch=rel.match(/^\/agents\/([^/]+)$/);if(agentMatch){const agent=store.data.agents.find(item=>item.id===agentMatch[1]);if(!agent)return json(res,404,{error:'agent not found'});
-    if(req.method==='PATCH'){const b=await body(req),now=new Date().toISOString(),localDomainRequested=agent.id===LOCAL_AGENT_ID&&b.domain!==undefined;if(b.name!==undefined){const name=String(b.name||'').trim();if(!name||name.length>80)return json(res,400,{error:'invalid agent name'});agent.name=name;}if(b.domain!==undefined){const domain=normalizeAgentDomain(b.domain);if(agent.id===LOCAL_AGENT_ID){if(!domain)return json(res,400,{error:'本机代理域名不能为空，请填写与面板不同的子域名'});if(!cfg.publicBaseUrl.startsWith('https://'))return json(res,409,{error:'请先在部署向导完成面板 HTTPS 配置'});if(domain===baseHostname(cfg.publicBaseUrl))return json(res,409,{error:'代理域名不能与面板域名相同'});const existing=localDomainStatus();if(existing&&['pending','applying'].includes(existing.state)&&existing.desiredDomain!==domain)return json(res,409,{error:`正在切换到 ${existing.desiredDomain}，完成后再提交新域名`});if(domain!==configuredLocalDomain&&!(existing&&['pending','applying'].includes(existing.state)))requestDomainSwitch({dataFile:cfg.dataFile,domain,email:store.data.settings.certificateEmail,currentDomain:configuredLocalDomain});else if(domain===configuredLocalDomain)agent.domain=domain;}else{const currentMode=agent.proxyMode||(agent.domain?'domain':'ip');if(domain){if(!store.data.settings.certificateEmail)return json(res,409,{error:'请先在部署向导保存统一证书邮箱'});if(currentMode!=='domain'||domain!==agent.domain){agent.desiredMode='domain';agent.desiredDomain=domain;agent.domainStatus={requestId:'',state:'pending',mode:'domain',desiredDomain:domain,currentDomain:agent.domain||'',message:'等待机器申请证书并切换 Nginx',updatedAt:new Date().toISOString()};}}else{if(currentMode!=='ip'){agent.desiredMode='ip';delete agent.desiredDomain;agent.domainStatus={requestId:'',state:'pending',mode:'ip',desiredDomain:'',currentDomain:agent.domain||'',message:'等待机器切换为 IP 反代（HTTP）',updatedAt:new Date().toISOString()};}}}}if(b.routeIds!==undefined){if(!Array.isArray(b.routeIds))return json(res,400,{error:'routeIds must be an array'});const routeIds=[...new Set(b.routeIds.map(String))];if(routeIds.some(id=>!store.data.routes.some(route=>route.id===id)))return json(res,400,{error:'unknown route id'});replaceAgentDeployments(store.data,agent.id,routeIds,now);}if(b.sortOrder!==undefined)agent.sortOrder=numeric(b.sortOrder,-10000,10000);agent.updatedAt=now;if(agent.id===LOCAL_AGENT_ID)localAgent.reconcile();agentApi.invalidate();store.audit(localDomainRequested?'agent.local_domain_requested':'agent.updated',ip(req),agent.id);return json(res,200,{agent:agentView(agent)});}
-    if(req.method==='DELETE'){if(agent.id===LOCAL_AGENT_ID)return json(res,409,{error:'the local agent cannot be deleted'});store.data.agents=store.data.agents.filter(item=>item!==agent);store.data.deployments=store.data.deployments.filter(item=>item.agentId!==agent.id);store.audit('agent.deleted',ip(req),agent.id);agentApi.invalidate();return json(res,200,{ok:true});}
-  }
-  const m=rel.match(/^\/routes\/([^/]+)$/); if(m){const r=store.data.routes.find(x=>x.id===m[1]);if(!r)return json(res,404,{error:'not found'});
-    if(req.method==='PATCH'){const b=await body(req);let switchedKey=null;if(b.accessMode!==undefined){const mode=b.accessMode==='alias_only'?'alias_only':'key';if(mode!==r.accessMode){if(mode==='alias_only'){r.accessMode='alias_only';r.keyDigest=null;r.accessKey=null;delete r.routeAuthKey;delete r.authVersion;delete r.authMigrationRequired;switchedKey='';}else{const accessKey=connectionKey(b.accessKey);r.accessMode='key';Object.assign(r,routeAuthFields(accessKey));delete r.authMigrationRequired;switchedKey=accessKey;}}}if(b.name!==undefined)r.name=String(b.name).slice(0,80);if(b.enabled!==undefined)r.enabled=b.enabled===true;if(b.tlsVerify!==undefined)r.tlsVerify=b.tlsVerify===true;if(b.showOnHome!==undefined)r.showOnHome=b.showOnHome===true;if(b.clientProfile!==undefined)r.clientProfile=cleanProfile(b.clientProfile);if(b.streamRewrite!==undefined)r.streamRewrite=cleanStreamRewrite(b.streamRewrite);if(b.tags!==undefined)r.tags=cleanTags(b.tags);if(b.notes!==undefined)r.notes=String(b.notes).slice(0,500);if(b.favorite!==undefined)r.favorite=b.favorite===true;if(b.sortOrder!==undefined)r.sortOrder=numeric(b.sortOrder,-10000,10000);if(b.speedLimitMbps!==undefined)r.speedLimitMbps=numeric(b.speedLimitMbps,0,100000);if(b.monthlyQuotaGB!==undefined)r.monthlyQuotaGB=numeric(b.monthlyQuotaGB,0,1000000);if(b.reminderDays!==undefined)r.reminderDays=numeric(b.reminderDays,0,365);if(b.accessAlertThreshold!==undefined)r.accessAlertThreshold=numeric(b.accessAlertThreshold,0,100000);
-      if(b.alias!==undefined){const a=checkedAlias(b.alias);if(store.data.routes.some(x=>x!==r&&x.alias===a))return json(res,409,{error:'alias already exists'});r.alias=a;}
-      if(b.upstreams!==undefined||b.upstream!==undefined||b.allowPrivate!==undefined){r.allowPrivate=b.allowPrivate===undefined?r.allowPrivate:b.allowPrivate===true;r.upstreams=await validateUpstreamList(b.upstreams||b.upstream||routeUpstreams(r),r.allowPrivate);delete r.upstream;}r.updatedAt=new Date().toISOString();store.audit(switchedKey===null?'route.updated':'route.access_mode_changed',ip(req),r.alias);(localAgent.reconcile(),agentApi.invalidate());return json(res,200,{route:publicRoute(r),...(switchedKey===null?{}:clientCredentials(r,switchedKey))});}
-    if(req.method==='DELETE'){store.data.routes=store.data.routes.filter(x=>x!==r);removeRouteDeployments(store.data,r.id);metrics.drop(r.id);dropRouteRuntime(r.id);store.audit('route.deleted',ip(req),r.alias);(localAgent.reconcile(),agentApi.invalidate());return json(res,200,{ok:true});}
-  }
-  const credentials=rel.match(/^\/routes\/([^/]+)\/credentials$/);if(credentials&&req.method==='GET'){const r=store.data.routes.find(x=>x.id===credentials[1]);if(!r)return json(res,404,{error:'not found'});store.audit('route.credentials_viewed',ip(req),r.alias);return json(res,200,{...savedCredentials(r),publicBaseUrl:routeBaseUrl(r)});}
-  const rot=rel.match(/^\/routes\/([^/]+)\/rotate-key$/);if(rot&&req.method==='POST'){const r=store.data.routes.find(x=>x.id===rot[1]);if(!r)return json(res,404,{error:'not found'});if(r.accessMode==='alias_only')return json(res,409,{error:'this node does not use an access key'});const b=await body(req),accessKey=connectionKey(b.accessKey),routeAuthKey=r.authVersion===ROUTE_AUTH_VERSION&&isRouteAuthKey(r.routeAuthKey)?r.routeAuthKey:newRouteAuthKey();r.authVersion=ROUTE_AUTH_VERSION;r.routeAuthKey=routeAuthKey;r.keyDigest=routeTokenDigest(accessKey,routeAuthKey);r.accessKey=accessKey;delete r.authMigrationRequired;r.updatedAt=new Date().toISOString();store.audit('route.key_rotated',ip(req),r.alias);(localAgent.reconcile(),agentApi.invalidate());return json(res,200,credentialsFor(r,accessKey));}
-  const chans=rel.match(/^\/routes\/([^/]+)\/channels$/);if(chans){const r=store.data.routes.find(x=>x.id===chans[1]);if(!r)return json(res,404,{error:'not found'});
-    if(req.method==='GET')return json(res,200,{channels:channelCredentials(r),publicBaseUrl:routeBaseUrl(r)});
-    if(req.method==='POST'){if(r.accessMode!=='key')return json(res,409,{error:'该节点未启用连接密码，无法添加分发通道；请先在编辑里开启连接密码'});const b=await body(req);r.channels=Array.isArray(r.channels)?r.channels:[];if(r.channels.length>=32)return json(res,409,{error:'一个节点最多 32 个分发通道'});const channel=newChannel(b.label,b.accessKey);r.channels.push(channel);r.updatedAt=new Date().toISOString();store.audit('route.channel_added',ip(req),`${r.alias}:${channel.label}`);(localAgent.reconcile(),agentApi.invalidate());return json(res,201,{channel:{id:channel.id,label:channel.label,clientPath:`/${r.alias}/${channel.accessKey}/`},publicBaseUrl:routeBaseUrl(r)});}}
-  const chOne=rel.match(/^\/routes\/([^/]+)\/channels\/([^/]+)$/);if(chOne){const r=store.data.routes.find(x=>x.id===chOne[1]);if(!r)return json(res,404,{error:'not found'});const cid=chOne[2];if(cid==='default')return json(res,409,{error:'默认通道不能在此删除/改名，请用列表中的“密码”按钮'});r.channels=Array.isArray(r.channels)?r.channels:[];const channel=r.channels.find(c=>c.id===cid);if(!channel)return json(res,404,{error:'通道不存在'});
-    if(req.method==='DELETE'){r.channels=r.channels.filter(c=>c.id!==cid);r.updatedAt=new Date().toISOString();store.audit('route.channel_removed',ip(req),`${r.alias}:${channel.label}`);(localAgent.reconcile(),agentApi.invalidate());return json(res,200,{ok:true});}
-    if(req.method==='PATCH'){const b=await body(req);channel.label=String(b.label||'').slice(0,40);r.updatedAt=new Date().toISOString();(localAgent.reconcile(),agentApi.invalidate());return json(res,200,{ok:true,label:channel.label});}}
-  const reminder=rel.match(/^\/routes\/([^/]+)\/reminder-complete$/);if(reminder&&req.method==='POST'){const r=store.data.routes.find(x=>x.id===reminder[1]);if(!r)return json(res,404,{error:'not found'});r.reminderLastAt=new Date().toISOString();r.reminderNotifiedAt=null;store.audit('route.reminder_completed',ip(req),r.alias);return json(res,200,{ok:true,at:r.reminderLastAt});}
-  const diag=rel.match(/^\/diagnostics\/([^/]+)$/);if(diag&&(req.method==='GET'||req.method==='POST')){const r=store.data.routes.find(x=>x.id===diag[1]);if(!r)return json(res,404,{error:'not found'});const result=await diagnoseRoute(r);store.audit('route.diagnosed',ip(req),r.alias);return json(res,200,result);}
-  return json(res,404,{error:'not found'});
+  'GET /branding':(req,res)=>json(res, 200, { icon:store.data.settings.panelIcon||'' }),
+  'POST /setup':setupAdmin,
+  'POST /login':login,
+  'POST /logout':logout,
+  'GET /session':resumeSession
+};
+
+// --- Account ---
+async function updateIcon(req,res){
+  const b=await body(req,MAX_ICON_BYTES*2);
+  const icon=typeof b.url==='string'&&b.url.trim()?normalizePanelIcon(await fetchPanelIcon(b.url.trim())):normalizePanelIcon(b.icon);
+  store.data.settings.panelIcon=icon;
+  store.audit(icon?'account.icon_updated':'account.icon_reset',ip(req));store.save();
+  return json(res,200,{ok:true,icon});
+}
+async function changePassword(req,res){
+  const b=await body(req);
+  if(!verifyPassword(b.currentPassword||'',adminAccount().passwordHash)){store.audit('account.password_denied',ip(req));return json(res,401,{error:'当前密码不正确'});}
+  adminAccount().passwordHash=hashPassword(b.newPassword||'');
+  store.audit('account.password_changed',ip(req));store.save();
+  return json(res,200,{ok:true});
+}
+// Enrolment is two-step: the secret stays pending until a generated code proves the app has it.
+async function beginTotp(req,res){
+  const b=await body(req);
+  if(!verifyPassword(b.password||'',adminAccount().passwordHash))return json(res,401,{error:'当前密码不正确'});
+  const secret=newTotpSecret();
+  adminAccount().pendingTotp={secret,startedAt:new Date().toISOString()};store.save();
+  const uri=otpUri(secret);
+  return json(res,200,{secret,uri,qr:qrRows(uri)});
+}
+async function enableTotp(req,res){
+  const b=await body(req),pending=adminAccount().pendingTotp;
+  if(!pending?.secret)return json(res,409,{error:'请先重新生成二维码'});
+  if(!verifyTotp(pending.secret,b.code||'')){store.audit('account.totp_failed',ip(req));return json(res,401,{error:'验证码不正确，请确认手机时间已同步'});}
+  const recovery=Array.from({length:8},()=>randomToken(9));
+  adminAccount().totpSecret=pending.secret;adminAccount().recoveryDigests=recovery.map(v=>tokenDigest(v,key));
+  delete adminAccount().pendingTotp;
+  store.audit('account.totp_enabled',ip(req));store.save();
+  return json(res,200,{ok:true,recovery});
+}
+async function disableTotp(req,res){
+  const b=await body(req);
+  if(!adminAccount().totpSecret)return json(res,409,{error:'两步验证尚未开启'});
+  if(!verifyPassword(b.password||'',adminAccount().passwordHash))return json(res,401,{error:'当前密码不正确'});
+  if(!verifyTotp(adminAccount().totpSecret,b.code||''))return json(res,401,{error:'验证码不正确'});
+  adminAccount().totpSecret=null;adminAccount().recoveryDigests=[];delete adminAccount().pendingTotp;
+  store.audit('account.totp_disabled',ip(req));store.save();
+  return json(res,200,{ok:true});
 }
 
-async function serveAdmin(req,res,prefix){try{const u=new URL(req.url,'http://admin.invalid');if(prefix!=='/'&&u.pathname===prefix&&req.method==='GET'){res.writeHead(308,headers({location:`${prefix}/`}));return res.end()}const rel=adminRelative(u.pathname,prefix);if(rel===null)return json(res,404,{error:'not found'});if(rel.startsWith('/api/'))return await api(req,res,rel.slice(4),prefix);if(req.method!=='GET')return json(res,405,{error:'method not allowed'});if(rel==='/app.js'){res.writeHead(200,headers({'content-type':'text/javascript; charset=utf-8'}));return res.end(appjs)}if(rel==='/style.css'){res.writeHead(200,headers({'content-type':'text/css; charset=utf-8'}));return res.end(stylesheet)}if(rel==='/help.css'){res.writeHead(200,headers({'content-type':'text/css; charset=utf-8'}));return res.end(helpStylesheet)}if(rel!=='/'&&rel!=='/index.html')return json(res,404,{error:'not found'});res.writeHead(200,headers({'content-type':'text/html; charset=utf-8'}));res.end(ui);}catch(e){json(res,e.status||400,{error:String(e.message||'request rejected').slice(0,160)});}}
+// --- Machines ---
+async function createEnrollment(req,res){
+  const b=await body(req),issued=issueEnrollment(store.data,{name:b.name,domain:b.domain,routeIds:b.routeIds});
+  let command;
+  try{command=enrollmentInstallCommand({publicBaseUrl:cfg.publicBaseUrl,token:issued.token,name:issued.record.name,domain:issued.record.domain,email:store.data.settings.certificateEmail});}
+  catch(error){store.data.enrollmentTokens=store.data.enrollmentTokens.filter(item=>item!==issued.record);throw error;}
+  store.audit('agent.enrollment_created',ip(req),issued.record.id);
+  return json(res,201,{expiresAt:issued.record.expiresAt,command,uninstallCommand:'sudo aegis-relay-agent uninstall'});
+}
+async function updateAgent(req,res,agent){
+  const b=await body(req),now=new Date().toISOString(),localDomainRequested=agent.id===LOCAL_AGENT_ID&&b.domain!==undefined;
+  if(b.name!==undefined){const name=String(b.name||'').trim();if(!name||name.length>80)return json(res,400,{error:'invalid agent name'});agent.name=name;}
+  if(b.domain!==undefined){
+    const domain=normalizeAgentDomain(b.domain);
+    if(agent.id===LOCAL_AGENT_ID){
+      if(!domain)return json(res,400,{error:'本机代理域名不能为空，请填写与面板不同的子域名'});
+      if(!cfg.publicBaseUrl.startsWith('https://'))return json(res,409,{error:'请先在部署向导完成面板 HTTPS 配置'});
+      if(domain===baseHostname(cfg.publicBaseUrl))return json(res,409,{error:'代理域名不能与面板域名相同'});
+      const existing=localDomainStatus(),switching=existing&&['pending','applying'].includes(existing.state);
+      if(switching&&existing.desiredDomain!==domain)return json(res,409,{error:`正在切换到 ${existing.desiredDomain}，完成后再提交新域名`});
+      if(domain!==configuredLocalDomain&&!switching)requestDomainSwitch({dataFile:cfg.dataFile,domain,email:store.data.settings.certificateEmail,currentDomain:configuredLocalDomain});
+      else if(domain===configuredLocalDomain)agent.domain=domain;
+    }else{
+      const currentMode=agent.proxyMode||(agent.domain?'domain':'ip');
+      if(domain){
+        if(!store.data.settings.certificateEmail)return json(res,409,{error:'请先在部署向导保存统一证书邮箱'});
+        if(currentMode!=='domain'||domain!==agent.domain){agent.desiredMode='domain';agent.desiredDomain=domain;agent.domainStatus={requestId:'',state:'pending',mode:'domain',desiredDomain:domain,currentDomain:agent.domain||'',message:'等待机器申请证书并切换 Nginx',updatedAt:new Date().toISOString()};}
+      }else if(currentMode!=='ip'){agent.desiredMode='ip';delete agent.desiredDomain;agent.domainStatus={requestId:'',state:'pending',mode:'ip',desiredDomain:'',currentDomain:agent.domain||'',message:'等待机器切换为 IP 反代（HTTP）',updatedAt:new Date().toISOString()};}
+    }
+  }
+  if(b.routeIds!==undefined){
+    if(!Array.isArray(b.routeIds))return json(res,400,{error:'routeIds must be an array'});
+    const routeIds=[...new Set(b.routeIds.map(String))];
+    if(routeIds.some(id=>!store.data.routes.some(route=>route.id===id)))return json(res,400,{error:'unknown route id'});
+    replaceAgentDeployments(store.data,agent.id,routeIds,now);
+  }
+  if(b.sortOrder!==undefined)agent.sortOrder=numeric(b.sortOrder,-10000,10000);
+  agent.updatedAt=now;
+  if(agent.id===LOCAL_AGENT_ID)localAgent.reconcile();
+  agentApi.invalidate();
+  store.audit(localDomainRequested?'agent.local_domain_requested':'agent.updated',ip(req),agent.id);
+  return json(res,200,{agent:agentView(agent)});
+}
+async function agentResource(req,res,[,id]){
+  const agent=store.data.agents.find(item=>item.id===id);if(!agent)return json(res,404,{error:'agent not found'});
+  if(req.method==='PATCH')return updateAgent(req,res,agent);
+  if(req.method==='DELETE'){
+    if(agent.id===LOCAL_AGENT_ID)return json(res,409,{error:'the local agent cannot be deleted'});
+    store.data.agents=store.data.agents.filter(item=>item!==agent);store.data.deployments=store.data.deployments.filter(item=>item.agentId!==agent.id);
+    store.audit('agent.deleted',ip(req),agent.id);agentApi.invalidate();
+    return json(res,200,{ok:true});
+  }
+  return notFound(res);
+}
+
+// --- Nodes ---
+async function createRoute(req,res){
+  const b=await body(req), alias=checkedAlias(b.alias); if(store.data.routes.some(r=>r.alias===alias)) return json(res,409,{error:'alias already exists'});
+  const upstreams=await validateUpstreamList(b.upstreams||b.upstream,b.allowPrivate===true);
+  const accessMode=b.accessMode==='alias_only'?'alias_only':'key', accessKey=accessMode==='key'?connectionKey(b.accessKey):'';
+  const r=buildRoute(b,{alias,upstreams,accessMode,accessKey,enabled:true}),now=r.createdAt;
+  store.data.routes.push(r);
+  // Deploy the new node onto exactly the machine picked in the drawer, so its shown client address
+  // uses that machine's domain (routeBaseUrl prefers the remote deployment). A panel machine used
+  // only for management must not silently pick up every new node as well — that deployment would
+  // have to be turned off by hand after every single create. The panel keeps serving the node when
+  // no agent is picked, when the picked one is unknown, or when it has no usable entry host yet
+  // (freshly enrolled, no domain/IP): without that fallback the address handed out would be dead.
+  const deployAgentId=String(b.agentId||''),deployAgent=deployAgentId&&deployAgentId!==LOCAL_AGENT_ID?store.data.agents?.find(a=>a.id===deployAgentId):null;
+  if(deployAgent)store.data.deployments.push({id:deploymentId(deployAgentId,r.id),agentId:deployAgentId,routeId:r.id,enabled:true,createdAt:now,updatedAt:now});
+  if(!deployAgent||!agentEntryUrl(deployAgent))ensureLocalDeployment(store.data,r.id,now);
+  store.audit('route.created',ip(req),alias);publishRoutes();
+  return json(res,201,{route:publicRoute(r),...credentialsFor(r,accessKey)});
+}
+async function importRoutes(req,res){
+  const b=await body(req),items=Array.isArray(b.routes)?b.routes.slice(0,50):[];const credentials=[],errors=[];
+  for(const item of items){
+    try{
+      const alias=checkedAlias(item.alias);if(store.data.routes.some(r=>r.alias===alias))throw new Error('alias already exists');
+      const upstreams=await validateUpstreamList(item.upstreams||item.upstream,item.allowPrivate===true),accessMode=item.accessMode==='alias_only'?'alias_only':'key',accessKey=accessMode==='key'?randomToken(24):'';
+      const r=buildRoute(item,{alias,upstreams,accessMode,accessKey,enabled:item.enabled!==false});
+      store.data.routes.push(r);ensureLocalDeployment(store.data,r.id,r.createdAt);credentials.push({alias,...credentialsFor(r,accessKey)});
+    }catch(e){errors.push({alias:String(item?.alias||''),error:e.message})}
+  }
+  store.audit('routes.imported',ip(req),`${credentials.length} imported`);publishRoutes();
+  return json(res,200,{imported:credentials.length,credentials,errors});
+}
+async function updateRoute(req,res,r){
+  const b=await body(req);let switchedKey=null;
+  if(b.accessMode!==undefined){
+    const mode=b.accessMode==='alias_only'?'alias_only':'key';
+    if(mode!==r.accessMode){
+      if(mode==='alias_only'){r.accessMode='alias_only';r.keyDigest=null;r.accessKey=null;delete r.routeAuthKey;delete r.authVersion;delete r.authMigrationRequired;switchedKey='';}
+      else{const accessKey=connectionKey(b.accessKey);r.accessMode='key';Object.assign(r,routeAuthFields(accessKey));delete r.authMigrationRequired;switchedKey=accessKey;}
+    }
+  }
+  for(const [field,clean] of Object.entries(ROUTE_PATCH_FIELDS))if(b[field]!==undefined)r[field]=clean(b[field]);
+  if(b.alias!==undefined){const a=checkedAlias(b.alias);if(store.data.routes.some(x=>x!==r&&x.alias===a))return json(res,409,{error:'alias already exists'});r.alias=a;}
+  if(b.upstreams!==undefined||b.upstream!==undefined||b.allowPrivate!==undefined){r.allowPrivate=b.allowPrivate===undefined?r.allowPrivate:b.allowPrivate===true;r.upstreams=await validateUpstreamList(b.upstreams||b.upstream||routeUpstreams(r),r.allowPrivate);delete r.upstream;}
+  r.updatedAt=new Date().toISOString();
+  store.audit(switchedKey===null?'route.updated':'route.access_mode_changed',ip(req),r.alias);publishRoutes();
+  return json(res,200,{route:publicRoute(r),...(switchedKey===null?{}:clientCredentials(r,switchedKey))});
+}
+async function routeResource(req,res,[,id]){
+  const r=findRoute(id);if(!r)return notFound(res);
+  if(req.method==='PATCH')return updateRoute(req,res,r);
+  if(req.method==='DELETE'){
+    store.data.routes=store.data.routes.filter(x=>x!==r);removeRouteDeployments(store.data,r.id);metrics.drop(r.id);dropRouteRuntime(r.id);
+    store.audit('route.deleted',ip(req),r.alias);publishRoutes();
+    return json(res,200,{ok:true});
+  }
+  return notFound(res);
+}
+function routeCredentials(req,res,[,id]){
+  if(req.method!=='GET')return notFound(res);
+  const r=findRoute(id);if(!r)return notFound(res);
+  store.audit('route.credentials_viewed',ip(req),r.alias);
+  return json(res,200,{...savedCredentials(r),publicBaseUrl:routeBaseUrl(r)});
+}
+async function rotateRouteKey(req,res,[,id]){
+  if(req.method!=='POST')return notFound(res);
+  const r=findRoute(id);if(!r)return notFound(res);
+  if(r.accessMode==='alias_only')return json(res,409,{error:'this node does not use an access key'});
+  const b=await body(req),accessKey=connectionKey(b.accessKey),routeAuthKey=r.authVersion===ROUTE_AUTH_VERSION&&isRouteAuthKey(r.routeAuthKey)?r.routeAuthKey:newRouteAuthKey();
+  r.authVersion=ROUTE_AUTH_VERSION;r.routeAuthKey=routeAuthKey;r.keyDigest=routeTokenDigest(accessKey,routeAuthKey);r.accessKey=accessKey;delete r.authMigrationRequired;r.updatedAt=new Date().toISOString();
+  store.audit('route.key_rotated',ip(req),r.alias);publishRoutes();
+  return json(res,200,credentialsFor(r,accessKey));
+}
+async function routeChannelList(req,res,[,id]){
+  const r=findRoute(id);if(!r)return notFound(res);
+  if(req.method==='GET')return json(res,200,{channels:channelCredentials(r),publicBaseUrl:routeBaseUrl(r)});
+  if(req.method==='POST'){
+    if(r.accessMode!=='key')return json(res,409,{error:'该节点未启用连接密码，无法添加分发通道；请先在编辑里开启连接密码'});
+    const b=await body(req);r.channels=Array.isArray(r.channels)?r.channels:[];
+    if(r.channels.length>=32)return json(res,409,{error:'一个节点最多 32 个分发通道'});
+    const channel=newChannel(b.label,b.accessKey);r.channels.push(channel);r.updatedAt=new Date().toISOString();
+    store.audit('route.channel_added',ip(req),`${r.alias}:${channel.label}`);publishRoutes();
+    return json(res,201,{channel:{id:channel.id,label:channel.label,clientPath:`/${r.alias}/${channel.accessKey}/`},publicBaseUrl:routeBaseUrl(r)});
+  }
+  return notFound(res);
+}
+async function routeChannel(req,res,[,id,cid]){
+  const r=findRoute(id);if(!r)return notFound(res);
+  if(cid==='default')return json(res,409,{error:'默认通道不能在此删除/改名，请用列表中的“密码”按钮'});
+  r.channels=Array.isArray(r.channels)?r.channels:[];const channel=r.channels.find(c=>c.id===cid);if(!channel)return json(res,404,{error:'通道不存在'});
+  if(req.method==='DELETE'){r.channels=r.channels.filter(c=>c.id!==cid);r.updatedAt=new Date().toISOString();store.audit('route.channel_removed',ip(req),`${r.alias}:${channel.label}`);publishRoutes();return json(res,200,{ok:true});}
+  if(req.method==='PATCH'){const b=await body(req);channel.label=String(b.label||'').slice(0,40);r.updatedAt=new Date().toISOString();publishRoutes();return json(res,200,{ok:true,label:channel.label});}
+  return notFound(res);
+}
+function completeReminder(req,res,[,id]){
+  if(req.method!=='POST')return notFound(res);
+  const r=findRoute(id);if(!r)return notFound(res);
+  r.reminderLastAt=new Date().toISOString();r.reminderNotifiedAt=null;store.audit('route.reminder_completed',ip(req),r.alias);
+  return json(res,200,{ok:true,at:r.reminderLastAt});
+}
+async function diagnose(req,res,[,id]){
+  if(req.method!=='GET'&&req.method!=='POST')return notFound(res);
+  const r=findRoute(id);if(!r)return notFound(res);
+  const result=await diagnoseRoute(r);store.audit('route.diagnosed',ip(req),r.alias);
+  return json(res,200,result);
+}
+
+// --- Settings ---
+async function updateDeployment(req,res){const b=await body(req);store.data.settings.certificateEmail=normalizeCertificateEmail(b.certificateEmail);store.audit('deployment.certificate_email_updated',ip(req));return json(res,200,{ok:true,certificateEmail:store.data.settings.certificateEmail});}
+async function updateNotifications(req,res){const b=await body(req),result=notifier.configure(b);store.audit('notifications.updated',ip(req));return json(res,200,result);}
+async function testNotifications(req,res){await notifier.test();store.audit('notifications.tested',ip(req));return json(res,200,{ok:true});}
+
+const adminApi={
+  'GET /account':(req,res)=>json(res,200,{username:adminAccount().username,totpEnabled:!!adminAccount().totpSecret,recoveryRemaining:(adminAccount().recoveryDigests||[]).length}),
+  'PUT /account/icon':updateIcon,
+  'POST /account/password':changePassword,
+  'POST /account/totp/begin':beginTotp,
+  'POST /account/totp/enable':enableTotp,
+  'POST /account/totp/disable':disableTotp,
+  'GET /routes':(req,res)=>json(res,200,{routes:store.data.routes.map(publicRoute).sort((a,b)=>a.sortOrder-b.sortOrder||Number(b.favorite)-Number(a.favorite)||a.name.localeCompare(b.name))}),
+  'POST /routes':createRoute,
+  'POST /import':importRoutes,
+  'GET /export':(req,res)=>json(res,200,{version:1,exportedAt:new Date().toISOString(),routes:store.data.routes.map(r=>{const x=publicRoute(r);delete x.id;delete x.createdAt;delete x.updatedAt;return x})}),
+  // Sort is stable, so machines that never got an explicit order keep their registration order.
+  'GET /agents':(req,res)=>json(res,200,{panelVersion:APP_VERSION,agents:store.data.agents.map(agentView).sort((a,b)=>a.sortOrder-b.sortOrder)}),
+  'POST /agents/enrollment':createEnrollment,
+  'GET /dashboard':(req,res)=>json(res,200,dashboardSnapshot()),
+  'GET /events':(req,res)=>{res.writeHead(200,headers({'content-type':'text/event-stream','connection':'keep-alive'}));req.on('close',dashboardFeed.follow(res));},
+  'GET /access':(req,res)=>json(res,200,{nodes:accessSnapshot()}),
+  'GET /diagnostics':(req,res)=>json(res,200,{nodes:getRuntimeStatus(localAgent.routeSource.getRoutes())}),
+  'GET /audit':(req,res)=>json(res,200,{audit:store.data.audit.slice(0,100)}),
+  'GET /deployment':(req,res,cookiePath)=>json(res,200,{adminPath:cookiePath,secureCookies:cfg.secureCookies,publicBaseUrl:cfg.publicBaseUrl,localProxyBaseUrl:clientBaseUrl(),splitDomains:!!cfg.localProxyBaseUrl&&baseHostname(cfg.localProxyBaseUrl)!==baseHostname(cfg.publicBaseUrl),httpsReady:cfg.secureCookies&&cfg.publicBaseUrl.startsWith('https://'),certificateEmail:store.data.settings.certificateEmail||'',domainChange:localDomainStatus()}),
+  'PUT /deployment':updateDeployment,
+  'GET /notifications':(req,res)=>json(res,200,notifier.view()),
+  'PUT /notifications':updateNotifications,
+  'POST /notifications/test':testNotifications
+};
+// [pattern, handler]: each handler answers the methods it supports and 404s the rest.
+const adminResources=[
+  [/^\/agents\/([^/]+)$/,agentResource],
+  [/^\/routes\/([^/]+)$/,routeResource],
+  [/^\/routes\/([^/]+)\/credentials$/,routeCredentials],
+  [/^\/routes\/([^/]+)\/rotate-key$/,rotateRouteKey],
+  [/^\/routes\/([^/]+)\/channels$/,routeChannelList],
+  [/^\/routes\/([^/]+)\/channels\/([^/]+)$/,routeChannel],
+  [/^\/routes\/([^/]+)\/reminder-complete$/,completeReminder],
+  [/^\/diagnostics\/([^/]+)$/,diagnose]
+];
+
+// Public endpoints answer first; everything else needs a live session and its CSRF token, even to learn
+// that a path does not exist. Exact paths are matched before parameterised ones.
+async function api(req, res, rel, cookiePath = cfg.adminPath) {
+  const endpoint=`${req.method} ${rel}`;
+  if(publicApi[endpoint])return publicApi[endpoint](req,res,cookiePath);
+  requireAuth(req);
+  if(adminApi[endpoint])return adminApi[endpoint](req,res,cookiePath);
+  for(const [pattern,handle] of adminResources){const match=rel.match(pattern);if(match)return handle(req,res,match);}
+  return notFound(res);
+}
+
+async function serveAdmin(req,res,prefix){
+  try{
+    const u=new URL(req.url,'http://admin.invalid');
+    if(prefix!=='/'&&u.pathname===prefix&&req.method==='GET'){res.writeHead(308,headers({location:`${prefix}/`}));return res.end()}
+    const rel=adminRelative(u.pathname,prefix);if(rel===null)return json(res,404,{error:'not found'});
+    if(rel.startsWith('/api/'))return await api(req,res,rel.slice(4),prefix);
+    if(req.method!=='GET')return json(res,405,{error:'method not allowed'});
+    if(rel==='/app.js'){res.writeHead(200,headers({'content-type':'text/javascript; charset=utf-8'}));return res.end(appjs)}
+    if(rel==='/style.css'){res.writeHead(200,headers({'content-type':'text/css; charset=utf-8'}));return res.end(stylesheet)}
+    if(rel==='/help.css'){res.writeHead(200,headers({'content-type':'text/css; charset=utf-8'}));return res.end(helpStylesheet)}
+    if(rel!=='/'&&rel!=='/index.html')return json(res,404,{error:'not found'});
+    res.writeHead(200,headers({'content-type':'text/html; charset=utf-8'}));res.end(ui);
+  }catch(e){json(res,e.status||400,{error:String(e.message||'request rejected').slice(0,160)});}
+}
 const admin=http.createServer((req,res)=>serveAdmin(req,res,cfg.adminPath));
 admin.requestTimeout=35_000;admin.headersTimeout=10_000;admin.listen(cfg.adminPort,cfg.adminHost,()=>console.log(`AegisRelay admin listening on http://${cfg.adminHost}:${cfg.adminPort}${cfg.adminPath}`));
 const relay=makeProxyHandler(localAgent.routeSource,key,metrics);
@@ -282,7 +479,15 @@ function relayFailed(res,err){console.error('[aegis] relay error',err&&err.stack
 const proxy=http.createServer(RELAY_SERVER_OPTIONS,(req,res)=>{
   res.on('error',()=>{});
   let pathname; try{pathname=new URL(req.url,'http://relay.invalid').pathname}catch{return relayFailed(res,new Error('invalid request target'))}
-  try{const role=domainRequestRole({panelHostname,proxyHostname,requestHostname:requestHostname(req)});if(role==='reject')return json(res,421,{error:'misdirected request'});if(role==='proxy'){const out=relay(req,res);if(out&&typeof out.catch==='function')out.catch(err=>relayFailed(res,err));return}if(pathname==='/agent-install.sh'&&req.method==='GET'){res.writeHead(200,headers({'content-type':'text/x-shellscript; charset=utf-8'}));return res.end(agentInstaller)}if(pathname==='/agent-upgrade.sh'&&req.method==='GET'){res.writeHead(200,headers({'content-type':'text/x-shellscript; charset=utf-8'}));return res.end(agentUpgrader)}const out=pathname.startsWith('/api/agent/v1/')?agentApi.handle(req,res):(isRootAdminRequest(pathname)?serveAdmin(req,res,'/'):(role==='control'?json(res,404,{error:'not found'}):relay(req,res)));if(out&&typeof out.catch==='function')out.catch(err=>relayFailed(res,err))}
+  try{
+    const role=domainRequestRole({panelHostname,proxyHostname,requestHostname:requestHostname(req)});
+    if(role==='reject')return json(res,421,{error:'misdirected request'});
+    if(role==='proxy'){const out=relay(req,res);if(out&&typeof out.catch==='function')out.catch(err=>relayFailed(res,err));return}
+    if(pathname==='/agent-install.sh'&&req.method==='GET'){res.writeHead(200,headers({'content-type':'text/x-shellscript; charset=utf-8'}));return res.end(agentInstaller)}
+    if(pathname==='/agent-upgrade.sh'&&req.method==='GET'){res.writeHead(200,headers({'content-type':'text/x-shellscript; charset=utf-8'}));return res.end(agentUpgrader)}
+    const out=pathname.startsWith('/api/agent/v1/')?agentApi.handle(req,res):(isRootAdminRequest(pathname)?serveAdmin(req,res,'/'):(role==='control'?json(res,404,{error:'not found'}):relay(req,res)));
+    if(out&&typeof out.catch==='function')out.catch(err=>relayFailed(res,err));
+  }
   catch(err){relayFailed(res,err)}
 });
 proxy.requestTimeout=0;proxy.keepAliveTimeout=75_000;proxy.keepAliveTimeoutBuffer=5_000;proxy.headersTimeout=80_000;
