@@ -317,4 +317,4 @@ process.on('uncaughtException',err=>console.error('[aegis] uncaught exception',e
 process.on('unhandledRejection',err=>console.error('[aegis] unhandled rejection',err&&err.stack||err));
 const flushTimer=setInterval(()=>store.save(),60_000);flushTimer.unref();
 const reminderTimer=setInterval(()=>notifier.tick(store.data.routes),60*60_000);reminderTimer.unref();
-for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{clearInterval(flushTimer);clearInterval(reminderTimer);store.save();admin.close();proxy.close(()=>process.exit(0));setTimeout(()=>process.exit(1),10_000).unref();});
+for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{clearInterval(flushTimer);clearInterval(reminderTimer);const saved=store.save();agentApi.close();admin.close();proxy.close(()=>saved.then(()=>process.exit(0)));setTimeout(()=>process.exit(1),10_000).unref();});

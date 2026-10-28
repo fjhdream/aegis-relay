@@ -1,5 +1,5 @@
-import test from 'node:test';import assert from 'node:assert/strict';import http from 'node:http';import https from 'node:https';
-import {clearTlsSessions,getRuntimeStatus,makeProxyHandler,RELAY_HIGH_WATER_MARK,RELAY_SERVER_OPTIONS,shouldRewriteStreamBody,stripAdminCredentials,stripAdminSetCookies,validateUpstream,validateUpstreamList} from '../src/proxy.js';import {deriveKey,tokenDigest} from '../src/security.js';
+import test from 'node:test';import assert from 'node:assert/strict';import http from 'node:http';import https from 'node:https';import net from 'node:net';
+import {clearTlsSessions,getRuntimeStatus,handleUpgrade,makeProxyHandler,RELAY_HIGH_WATER_MARK,RELAY_SERVER_OPTIONS,shouldRewriteStreamBody,stripAdminCredentials,stripAdminSetCookies,validateUpstream,validateUpstreamList} from '../src/proxy.js';import {deriveKey,tokenDigest} from '../src/security.js';
 const TEST_TLS_CERT=`-----BEGIN CERTIFICATE-----
 MIIDGjCCAgKgAwIBAgIUIbeDFssFh3d60STn8JZVJvohWqwwDQYJKoZIhvcNAQEL
 BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcyNDA1NTI1MFoXDTM2MDcy
@@ -416,5 +416,53 @@ test('rewrite decodes a gzip-compressed API body before rewriting stream URLs',a
   const r=await request(port,'/emu/Items/1',{headers:{host:'relay.test','x-forwarded-proto':'https'}});
   assert.equal(r.headers['content-encoding'],undefined); // re-served decoded
   assert.ok(r.body.toString().includes('https://relay.test/emu/.aegis-vod/https/vod.example.net/a.mp4'),r.body.toString());
+  await close(relay);await close(upstream);
+});
+
+// Raw client for an upgrade: resolves with everything the relay sent once it closes, or once `until`
+// matches what has arrived so far (the socket is then left open for the caller). `send` is written as
+// soon as the response head is complete.
+const upgradeClient=(port,path,{until,send}={})=>new Promise((resolve,reject)=>{
+  const socket=net.connect(port,'127.0.0.1');let received='';
+  socket.on('connect',()=>socket.write(`GET ${path} HTTP/1.1\r\nHost: relay.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`));
+  socket.on('data',chunk=>{received+=chunk.toString('latin1');if(send&&received.includes('\r\n\r\n')){socket.write(send);send=null}if(until&&until.test(received))resolve({received,socket})});
+  socket.on('end',()=>resolve({received,socket}));socket.on('error',reject);
+});
+const upgradeRelay=async upstreamPort=>{
+  const key=deriveKey('u'.repeat(32)),store={data:{routes:[{id:'ws',alias:'ws',enabled:true,accessMode:'alias_only',upstreams:[`http://127.0.0.1:${upstreamPort}`],allowPrivate:true}]}};
+  const relay=http.createServer(makeProxyHandler(store,key));relay.on('upgrade',(req,socket,head)=>handleUpgrade(req,socket,head,store,key));
+  return {relay,port:await listen(relay)};
+};
+test('an origin that refuses a WebSocket upgrade is answered, not left hanging',{timeout:5000},async()=>{
+  // With no 'upgrade' listener Node hands the upgrade request to the plain request handler.
+  const upstream=http.createServer((_q,s)=>{s.writeHead(401,{'content-type':'text/plain','set-cookie':['emby=1; Path=/','aegis_session=evil; Path=/']});s.end('denied')}),up=await listen(upstream);
+  const {relay,port}=await upgradeRelay(up);
+  const {received}=await upgradeClient(port,'/ws/socket');
+  assert.match(received,/^HTTP\/1\.1 401 /);
+  assert.match(received,/\r\nconnection: close\r\n/);
+  assert.match(received,/\r\nset-cookie: emby=1; Path=\/\r\n/);
+  assert.doesNotMatch(received,/aegis_session/);
+  assert.match(received,/\r\n\r\ndenied$/);
+  await close(relay);await close(upstream);
+});
+test('a WebSocket 101 keeps each Set-Cookie on its own line, tunnels both ways and closes with the viewer',{timeout:5000},async()=>{
+  let originClosed;const originGone=new Promise(resolve=>{originClosed=resolve});
+  const upstream=http.createServer();
+  upstream.on('upgrade',(_req,socket)=>{
+    socket.on('end',()=>socket.end());socket.on('error',()=>{});socket.on('close',originClosed);
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nSet-Cookie: aegis_session=evil\r\nServer: origin-secret\r\n\r\n');
+    socket.on('data',chunk=>socket.write(chunk));
+  });
+  const up=await listen(upstream),{relay,port}=await upgradeRelay(up);
+  const {received,socket}=await upgradeClient(port,'/ws/socket',{until:/\r\n\r\n[\s\S]*ping$/,send:'ping'});
+  const [head]=received.split('\r\n\r\n');
+  assert.match(head,/^HTTP\/1\.1 101 Switching Protocols\r\n/);
+  assert.match(head,/\r\nset-cookie: a=1\r\nset-cookie: b=2(\r\n|$)/);
+  assert.doesNotMatch(head,/aegis_session|origin-secret/);
+  assert.match(head,/\r\nconnection: Upgrade(\r\n|$)/);
+  assert.match(head,/\r\nupgrade: websocket(\r\n|$)/);
+  assert.match(head,/\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK\+xOo=(\r\n|$)/);
+  socket.destroy();
+  await originGone;
   await close(relay);await close(upstream);
 });

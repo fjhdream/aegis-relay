@@ -72,8 +72,9 @@ test('agents expose a sort order so the panel can reorder machines', () => {
   assert.deepEqual(order,['a','b','c']);
 });
 
-// A remote machine only learns about a config change on its next heartbeat, so the panel must (a) stop
-// claiming 「配置已同步」 the moment deployments change and (b) keep that heartbeat short. Without (a)
+// A remote machine without the config long poll only learns about a config change on its next
+// heartbeat, so the panel must (a) stop claiming 「配置已同步」 the moment deployments change and (b) keep
+// that heartbeat short. Without (a)
 // the card looked identical before and after de-selecting a node while the machine kept serving it —
 // the change read as "点了没反应". Regression cover for both halves.
 import { AgentApi } from '../src/agent-api.js';
@@ -125,8 +126,20 @@ test('a machine with un-applied configuration is asked to check back sooner', ()
   const source=fs.readFileSync(new URL('../src/agent-api.js',import.meta.url),'utf8');
   const beat=source.match(/heartbeatSeconds:[^,]+/);
   assert.ok(beat,'check-in must send a heartbeat interval');
-  assert.ok(source.includes('heartbeatSeconds:pendingConfig?5:10'),'pending config gets a 5s beat, idle machines 10s');
+  // 30s was long enough that a de-selected node looked like it had not been removed at all, so only an
+  // agent that is woken over the config long poll may be handed the relaxed beat.
+  assert.ok(source.includes('heartbeatSeconds:longPoll?30:pendingConfig?5:10'),'pending config gets a 5s beat, idle machines 10s, long-poll agents 30s');
   assert.match(source,/const pendingConfig=snapshot\.revision>Number\(agent\.appliedRevision\|\|0\)/);
-  // 30s was long enough that a de-selected node looked like it had not been removed at all
-  assert.doesNotMatch(source,/heartbeatSeconds:30/);
+  assert.match(source,/longPoll=agent\.capabilities\.includes\('config-longpoll-v1'\)/);
+});
+
+test('the agent follows config over the long poll instead of waiting for its heartbeat', () => {
+  const main=fs.readFileSync(new URL('../src/agent-main.js',import.meta.url),'utf8');
+  assert.match(main,/const CAPABILITIES=\[[^\]]*'config-longpoll-v1'/);
+  assert.match(main,/wait=\$\{wait\}/);
+  assert.match(main,/followConfig\(identity,config,healthy\);for\(;;\)/,'the long poll must run beside the heartbeat loop');
+  // A single config fetcher: a second one on the heartbeat path would apply and ACK the same revision twice.
+  assert.doesNotMatch(main,/desiredRevision\|\|0\)>config\.revision\)await pollConfig/);
+  // An old panel answers 204 at once; the floor keeps that from becoming a busy loop.
+  assert.match(main,/CONFIG_POLL_FLOOR_MS-\(Date\.now\(\)-started\)/);
 });

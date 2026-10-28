@@ -13,7 +13,7 @@ function route(name='Original') {
   return {id:'node-1',alias:'charity',name,enabled:true,upstreams:['https://emby.example.com'],playbackUpstreams:[],allowPrivate:false,tlsVerify:true,showOnHome:false,clientProfile:{enabled:false},speedLimitMbps:0,monthlyQuotaGB:0,accessMode:'key',accessKey,authVersion:ROUTE_AUTH_VERSION,routeAuthKey,keyDigest:routeTokenDigest(accessKey,routeAuthKey)};
 }
 
-test('local agent completes register, pull, verify, atomic apply and ACK', () => {
+test('local agent completes register, pull, verify, atomic apply and ACK', async () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-local-agent-')),file=path.join(dir,'aegis.enc.json'),cache=path.join(dir,'local.snapshot');
   try {
     const key=deriveKey('a'.repeat(32)),store=new Store(file,key);store.data.routes=[route()];store.save();
@@ -50,6 +50,8 @@ test('local agent completes register, pull, verify, atomic apply and ACK', () =>
     assert.equal(deselected.ok,true);
     assert.equal(agent.routeSource.getRoutes().length,0);
     assert.deepEqual(agent.status().routeIds,[]);
+    // The restart below must see exactly what reconcile persisted, not the in-memory pull that follows.
+    await store.flush();
 
     const snapshot=agent.pull(store.data.routes),tampered=structuredClone(snapshot);tampered.nodes[0].name='Attacker';
     const activeBefore=agent.routeSource.getRoutes();

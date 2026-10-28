@@ -67,6 +67,8 @@ const CONNECT_TIMEOUT_MS=10_000;
 const RESPONSE_HEADER_TIMEOUT_MS=60_000;
 const FAILOVER_HEADER_TIMEOUT_MS=15_000;
 const PLAYBACK_HEADER_TIMEOUT_MS=45_000;
+// A WebSocket handshake answers right after connect; nothing legitimate takes this long.
+const UPGRADE_HANDSHAKE_TIMEOUT_MS=15_000;
 // Byte-addressable media can be resumed safely. Do not leave the player frozen for the previous
 // 30-second window after an origin has stopped producing bytes — but on-the-fly transcode legitimately
 // pauses for several seconds while it renders ahead, so the watchdog must be slower than a transcode
@@ -450,6 +452,11 @@ function cleanResponseHeaders(input) {
   const out=strip(input); delete out.server; delete out.via; delete out['x-powered-by'];
   stripAdminSetCookies(out);out['referrer-policy']='no-referrer'; out['x-content-type-options']='nosniff'; return out;
 }
+// Header block for a response hand-written onto a hijacked upgrade socket. Multi-value headers go out
+// one line each: joining Set-Cookie values with commas corrupts the cookies.
+function rawHeaderBlock(headers) {
+  return Object.entries(headers).flatMap(([k,v])=>v===undefined?[]:(Array.isArray(v)?v:[v]).map(item=>`${k}: ${item}\r\n`)).join('');
+}
 
 export function makeProxyHandler(routeSource, key, metrics = null) {
   return async (req, res) => {
@@ -723,13 +730,33 @@ export function handleUpgrade(req, socket, head, routeSource, key) {
   let clientGone=false;
   socket.on('error',()=>socket.destroy());
   socket.on('close',()=>{clientGone=true;if(!up.destroyed)up.destroy()});
+  // A dead or silent origin would otherwise hold the client's socket open until the OS gave up.
+  const handshake=setTimeout(()=>up.destroy(Object.assign(new Error('upgrade handshake timeout'),{code:'ETIMEDOUT'})),UPGRADE_HANDSHAKE_TIMEOUT_MS);
+  handshake.unref?.();
+  up.on('close',()=>clearTimeout(handshake));
   up.on('upgrade',(r,s,h)=>{
+    clearTimeout(handshake);
     markSuccess(found.route,targets[0]);
     s.on('error',()=>s.destroy());
     if(clientGone||socket.destroyed)return s.destroy();
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\n${Object.entries(r.headers).map(([k,v])=>`${k}: ${v}`).join('\r\n')}\r\n\r\n`);
+    const out={...cleanResponseHeaders(r.headers),connection:'Upgrade'};if(r.headers.upgrade)out.upgrade=r.headers.upgrade;
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\n${rawHeaderBlock(out)}\r\n`);
     if(h.length)socket.write(h);if(head.length)s.write(head);
     s.pipe(socket);socket.pipe(s);
+    // Once hijacked, the origin socket no longer belongs to `up`, so destroying the request above never
+    // reaches it: tie the two legs together, or a viewer who leaves keeps the origin connection open.
+    socket.on('close',()=>s.destroy());s.on('close',()=>socket.destroy());
+  });
+  // An origin that refuses the upgrade (401, 404, 502…) answers with an ordinary response. Without a
+  // listener Node silently discards it and the client is left hanging with no reply at all, so relay
+  // the status and body, then close.
+  up.on('response',r=>{
+    clearTimeout(handshake);
+    if(RETRY_STATUS.has(r.statusCode))markFailure(found.route,targets[0],`HTTP ${r.statusCode}`);else markSuccess(found.route,targets[0]);
+    if(clientGone||socket.destroyed)return r.destroy();
+    socket.write(`HTTP/1.1 ${r.statusCode} ${r.statusMessage||''}\r\n${rawHeaderBlock({...cleanResponseHeaders(r.headers),connection:'close'})}\r\n`);
+    r.on('error',()=>socket.destroy());
+    r.pipe(socket);
   });
   up.on('error',err=>{if(!clientGone)markFailure(found.route,targets[0],err.message);socket.destroy()});up.end();
 }

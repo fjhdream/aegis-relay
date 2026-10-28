@@ -148,6 +148,11 @@ export class AgentApi {
     this.wake();
   }
   wake() { for(const waiter of [...this.waiters])waiter.release('changed'); }
+  // Shutdown: every agent parks a long poll here, and an in-flight request keeps server.close() waiting
+  // until the poll times out — past Docker's stop grace period. Answer them all now, park no more, and
+  // close each connection with its answer: server.close() only drops connections idle at the moment it
+  // is called, so a keep-alive socket freed afterwards would carry the agent's next poll right back in.
+  close() { this.closing=true;this.wake(); }
 
   waitForConfig(seconds) {
     const waiter={done:false};
@@ -157,6 +162,7 @@ export class AgentApi {
       waiter.timer.unref?.();
       this.waiters.add(waiter);
     });
+    if(this.closing)waiter.release('closing');
     return waiter;
   }
 
@@ -164,7 +170,7 @@ export class AgentApi {
     if(res.writableEnded||res.destroyed)return;
     const raw=status===204?Buffer.alloc(0):Buffer.from(JSON.stringify(payload)),timestamp=nowSeconds(),contentHash=sha256(raw);
     const signature=b64u(crypto.sign(null,Buffer.from(panelResponseInput({status,requestNonce,timestamp,contentHash})),importPanelPrivate(this.panelIdentity)));
-    const responseHeaders=baseHeaders({'x-aegis-panel-key-id':this.panelIdentity.keyId,'x-aegis-timestamp':String(timestamp),'x-aegis-content-sha256':contentHash,'x-aegis-signature':signature});if(status===204)delete responseHeaders['content-type'];
+    const responseHeaders=baseHeaders({'x-aegis-panel-key-id':this.panelIdentity.keyId,'x-aegis-timestamp':String(timestamp),'x-aegis-content-sha256':contentHash,'x-aegis-signature':signature});if(status===204)delete responseHeaders['content-type'];if(this.closing)responseHeaders.connection='close';
     res.writeHead(status,responseHeaders);res.end(raw);
   }
 
@@ -213,16 +219,18 @@ export class AgentApi {
         // Heartbeat state is disposable; the panel's periodic flush persists it. Writing the whole
         // encrypted store synchronously on every check-in stalled the event loop serving playback.
         const snapshot=this.desired(agent);delete agent.error;
-        // Agents poll for config with wait=0, so a machine only learns about a change on its next
-        // heartbeat — and it is already asleep when the change happens. At a flat 30s beat a node
-        // de-selected in the panel kept being served for up to half a minute, which reads as
+        // Agents older than 0.10.21 poll config with wait=0, so such a machine only learns about a
+        // change on its next heartbeat — and it is already asleep when the change happens. At a flat
+        // 30s beat a node de-selected in the panel kept being served for up to half a minute, which reads as
         // "取消勾选没有生效". The beat is the only lever the panel has here, so keep it short enough
         // that the wait is never mistaken for a failure. A check-in is one signature each way, so
         // 10s costs little; a machine that still has un-applied configuration is asked back sooner
         // still. Agents have always honoured this field (clamped to a 5s floor), so no probe update
         // is needed, and one that keeps failing to apply backs off on its own error path.
-        const pendingConfig=snapshot.revision>Number(agent.appliedRevision||0);
-        return this.send(res,200,{protocolVersion:AGENT_PROTOCOL_VERSION,serverTime:nowSeconds(),desiredRevision:snapshot.revision,heartbeatSeconds:pendingConfig?5:10,agentVersion:this.version,desiredDomain:agent.desiredDomain||'',desiredMode:agent.desiredMode||'',certificateEmail:this.store.data.settings?.certificateEmail||''},requestNonce);
+        // An agent that follows config over the long poll (config-longpoll-v1) is woken the moment its
+        // node set changes, so the beat is no longer the lever: it only carries health and telemetry.
+        const pendingConfig=snapshot.revision>Number(agent.appliedRevision||0),longPoll=agent.capabilities.includes('config-longpoll-v1');
+        return this.send(res,200,{protocolVersion:AGENT_PROTOCOL_VERSION,serverTime:nowSeconds(),desiredRevision:snapshot.revision,heartbeatSeconds:longPoll?30:pendingConfig?5:10,agentVersion:this.version,desiredDomain:agent.desiredDomain||'',desiredMode:agent.desiredMode||'',certificateEmail:this.store.data.settings?.certificateEmail||''},requestNonce);
       }
       if(req.method==='GET'&&url.pathname==='/api/agent/v1/config'){
         const {raw}=await readBody(req),verified=this.verify(req,url,raw);requestNonce=verified.nonce;

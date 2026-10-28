@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { AgentApi, agentRequestInput, consumeEnrollment, enrollmentDigest, enrollmentInstallCommand, issueEnrollment, panelResponseInput } from '../src/agent-api.js';
 import { openAgentSnapshot } from '../src/agent-config.js';
+import { replaceAgentDeployments } from '../src/agent-registry.js';
 
 const publicDer=key=>key.export({format:'der',type:'spki'}).toString('base64url');
 
@@ -110,4 +112,58 @@ test('panel drives an agent from domain to IP mode and clears the desire when th
   assert.equal(agent.proxyMode,'ip');
   assert.equal(agent.desiredMode,undefined,'panel stops re-pushing once the agent confirms IP mode');
   assert.equal(JSON.parse(r2.raw).desiredMode,'');
+});
+
+async function enrolledAgent(capabilities){
+  const route={id:'route-a',alias:'alpha',name:'Alpha',enabled:true,upstreams:['https://origin.example.com'],allowPrivate:false,tlsVerify:true,showOnHome:false,clientProfile:{enabled:false},speedLimitMbps:0,monthlyQuotaGB:0,accessMode:'alias_only'};
+  const data={routes:[route],agents:[],deployments:[],enrollmentTokens:[],controlPlane:{},settings:{}},store={data,save(){},audit(){}};
+  const api=new AgentApi({store,version:'0.10.21'}),issued=issueEnrollment(data,{name:'HK 01',routeIds:['route-a']}),sign=crypto.generateKeyPairSync('ed25519'),box=crypto.generateKeyPairSync('x25519');
+  const enrollBody=JSON.stringify({protocolVersion:1,requestNonce:'enroll-longpoll-nonce-00',token:issued.token,agent:{signPublicKey:publicDer(sign.publicKey),boxPublicKey:publicDer(box.publicKey),agentVersion:'0.10.21',capabilities},machine:{hostname:'hk'}}),enrollResponse=response();
+  await api.handle(request('/api/agent/v1/enroll',enrollBody,{'content-type':'application/json'}),enrollResponse);
+  const enrolled=JSON.parse(enrollResponse.raw);let sequence=0;
+  const call=async(method,path,payload,res=response())=>{const body=payload===null?Buffer.alloc(0):Buffer.from(JSON.stringify(payload));await api.handle(request(path,body,signedHeaders({method,path,agentId:enrolled.agentId,privateKey:sign.privateKey,body,nonce:`longpoll-request-nonce-${String(++sequence).padStart(4,'0')}`}),method),res);return res;};
+  const checkIn=async currentRevision=>JSON.parse((await call('POST','/api/agent/v1/check-in',{agentVersion:'0.10.21',currentRevision,applyState:'active',proxyHealthy:true,capabilities})).raw);
+  return {api,data,agentId:enrolled.agentId,box,enrolled,call,checkIn};
+}
+
+test('only agents that follow config over the long poll get the relaxed heartbeat',async()=>{
+  const legacy=await enrolledAgent(['config-v1','proxy-v1']);
+  const pending=await legacy.checkIn(0);
+  assert.equal(pending.desiredRevision,1);
+  assert.equal(pending.heartbeatSeconds,5,'a legacy agent with un-applied config is asked back sooner');
+  assert.equal((await legacy.checkIn(1)).heartbeatSeconds,10,'an idle legacy agent keeps the short beat');
+  const following=await enrolledAgent(['config-v1','proxy-v1','config-longpoll-v1']);
+  assert.equal((await following.checkIn(0)).heartbeatSeconds,30,'a long-polling agent is woken by the change itself');
+});
+
+test('a parked config long poll is released as soon as the machine node set changes',async()=>{
+  const agent=await enrolledAgent(['config-v1','proxy-v1','config-longpoll-v1']);
+  const current=(await agent.checkIn(0)).desiredRevision;
+  const parked=Object.assign(new EventEmitter(),response()),started=Date.now();
+  const polling=agent.call('GET',`/api/agent/v1/config?after=${current}&wait=25`,null,parked);
+  await new Promise(resolve=>setTimeout(resolve,50));
+  assert.equal(parked.status,0,'nothing changed yet, so the poll stays parked');
+  replaceAgentDeployments(agent.data,agent.agentId,[]);agent.api.invalidate();
+  await polling;
+  assert.equal(parked.status,200);
+  assert.ok(Date.now()-started<2_000,'the change is delivered at once, not at the end of the wait');
+  const snapshot=openAgentSnapshot({envelope:JSON.parse(parked.raw),identity:{agentId:agent.agentId,boxPrivateKey:agent.box.privateKey.export({format:'der',type:'pkcs8'}).toString('base64url'),panelKeyId:agent.enrolled.panelKeyId,panelSigningPublicKey:agent.enrolled.panelSigningPublicKey}});
+  assert.equal(snapshot.revision,current+1);
+  assert.deepEqual(snapshot.nodes,[]);
+});
+
+test('shutdown answers every parked long poll at once so the panel can exit inside the stop grace period',async()=>{
+  const agent=await enrolledAgent(['config-v1','proxy-v1','config-longpoll-v1']);
+  const current=(await agent.checkIn(0)).desiredRevision;
+  const parked=Object.assign(new EventEmitter(),response()),started=Date.now();
+  const polling=agent.call('GET',`/api/agent/v1/config?after=${current}&wait=25`,null,parked);
+  await new Promise(resolve=>setTimeout(resolve,50));
+  agent.api.close();
+  await polling;
+  assert.equal(parked.status,204);
+  assert.equal(parked.headers.connection,'close','the freed keep-alive socket must not carry the next poll back in');
+  assert.ok(Date.now()-started<2_000);
+  const late=Object.assign(new EventEmitter(),response());
+  await agent.call('GET',`/api/agent/v1/config?after=${current}&wait=25`,null,late);
+  assert.equal(late.status,204,'a poll that arrives while shutting down is not parked');
 });
