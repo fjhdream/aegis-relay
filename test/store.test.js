@@ -7,7 +7,7 @@ import path from 'node:path';
 import { clientCredentials } from '../src/credentials.js';
 import { LEGACY_ROUTE_AUTH_VERSION, newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest, verifyRouteToken } from '../src/route-auth.js';
 import { deriveKey, tokenDigest } from '../src/security.js';
-import { migrationBackupPath, restoreMigrationBackup, STORE_SCHEMA_VERSION, Store } from '../src/store.js';
+import { coalescedWriter, migrationBackupPath, restoreMigrationBackup, STORE_SCHEMA_VERSION, Store } from '../src/store.js';
 import { routesForAgent } from '../src/agent-registry.js';
 import { compileDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 
@@ -24,13 +24,13 @@ function readEncrypted(file, key) {
   return JSON.parse(Buffer.concat([decipher.update(Buffer.from(env.data,'base64url')),decipher.final()]));
 }
 
-test('encrypted store round trips without plaintext leakage', () => {
+test('encrypted store round trips without plaintext leakage', async () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-')),file=path.join(dir,'db');
   try {
     const key=deriveKey('k'.repeat(32)),s=new Store(file,key);
     s.data.routes.push({upstream:'https://secret.example',accessKey:'client-secret'});
     s.data.sessions.adminSession={csrf:'csrf-secret',expires:Date.now()+60_000};
-    s.save();
+    await s.save();
     const raw=fs.readFileSync(file,'utf8');
     assert.equal(raw.includes('secret.example'),false);
     assert.equal(raw.includes('client-secret'),false);
@@ -104,4 +104,42 @@ test('schema v2 deployment migration keeps the local snapshot byte-for-byte stab
     assert.deepEqual(after,before);
     assert.equal(fs.existsSync(migrationBackupPath(file,2)),true);
   } finally { fs.rmSync(dir,{recursive:true}); }
+});
+
+test('saves are coalesced off the request path and the latest state always reaches disk', async () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-writer-')),file=path.join(dir,'state');
+  try {
+    let value=0,serialized=0;
+    const writer=coalescedWriter(file,()=>{serialized++;return String(value);});
+    value=1;writer.save();value=2;const first=writer.save();
+    assert.equal(fs.existsSync(file),false,'nothing is written on the caller\'s tick');
+    await first;
+    assert.equal(serialized,1,'saves in one tick share a single write');
+    assert.equal(fs.readFileSync(file,'utf8'),'2');
+    value=3;const inflight=writer.save();
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(serialized,2,'the write has started');
+    value=4;writer.save();value=5;writer.save();
+    await inflight;
+    assert.equal(serialized,3,'saves made during a write are folded into one more write');
+    assert.equal(fs.readFileSync(file,'utf8'),'5');
+    assert.equal(fs.statSync(file).mode&0o777,0o600);
+    assert.deepEqual(fs.readdirSync(dir),['state'],'no temp files are left behind');
+    await writer.flush();
+  } finally { fs.rmSync(dir,{recursive:true}); }
+});
+
+test('a failed save is logged instead of thrown and the next save recovers', async () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-writer-fail-')),blocker=path.join(dir,'blocker'),file=path.join(blocker,'state'),logged=[],original=console.error;
+  fs.writeFileSync(blocker,'not a directory');
+  console.error=message=>logged.push(String(message));
+  try {
+    const writer=coalescedWriter(file,()=>'payload');
+    await writer.save();
+    assert.equal(logged.length,1);
+    assert.match(logged[0],/failed to persist state/);
+    fs.rmSync(blocker);
+    await writer.save();
+    assert.equal(fs.readFileSync(file,'utf8'),'payload');
+  } finally { console.error=original; fs.rmSync(dir,{recursive:true}); }
 });

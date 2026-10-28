@@ -61,10 +61,12 @@ test('legacy digest-only nodes cannot enter an agent snapshot', () => {
   assert.throws(()=>compileDesiredSnapshot({nodes:[{id:'legacy',alias:'legacy',upstreams:['https://emby.example.com'],accessMode:'key',authMigrationRequired:true}],signingIdentity:identity}),/requires an access-key rotation/);
 });
 
-test('panel signing identity is generated once and remains encrypted in the store', () => {
+test('panel signing identity is generated once and remains encrypted in the store', async () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-signing-')),file=path.join(dir,'aegis.enc.json');
   try {
-    const store=new Store(file,deriveKey('s'.repeat(32))),first=ensurePanelSigningIdentity(store),raw=fs.readFileSync(file,'utf8');
+    const store=new Store(file,deriveKey('s'.repeat(32))),first=ensurePanelSigningIdentity(store);
+    await store.flush();
+    const raw=fs.readFileSync(file,'utf8');
     assert.equal(raw.includes(first.privateKey),false);
     const second=ensurePanelSigningIdentity(new Store(file,deriveKey('s'.repeat(32))));
     assert.deepEqual(second,first);

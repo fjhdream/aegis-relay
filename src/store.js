@@ -43,6 +43,48 @@ export function writeAtomic(file, payload) {
   }
 }
 
+export async function writeAtomicAsync(file, payload) {
+  const dir = path.dirname(file);
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  let handle;
+  try {
+    handle = await fs.promises.open(tmp, 'wx', 0o600);
+    await handle.writeFile(payload);
+    await handle.sync();
+    await handle.close(); handle = undefined;
+    await fs.promises.rename(tmp, file);
+    await fs.promises.chmod(file, 0o600);
+    let dirHandle;
+    try { dirHandle = await fs.promises.open(dir, 'r'); await dirHandle.sync(); }
+    catch (error) { if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(error.code)) throw error; }
+    finally { await dirHandle?.close(); }
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw error;
+  }
+}
+
+// The panel and every agent persist from the same event loop that streams media, where a synchronous
+// write + fsync stalls playback for as long as the disk takes. Saves are coalesced instead: calls in the
+// same tick share one snapshot, at most one write is in flight, and anything saved during it is written
+// once more right after. A failed write is logged and retried by the next save.
+export function coalescedWriter(file, serialize) {
+  let dirty = false, running = null;
+  const drain = async () => {
+    try {
+      while (dirty) {
+        dirty = false;
+        try { await writeAtomicAsync(file, serialize()); }
+        catch (error) { console.error(`[aegis] failed to persist ${path.basename(file)}: ${error.message}`); }
+      }
+    } finally { running = null; }
+  };
+  const save = () => { dirty = true; return running ||= new Promise(resolve => setImmediate(resolve)).then(drain); };
+  return { save, flush: () => running || Promise.resolve() };
+}
+
 function decryptStore(payload, key) {
   const env = JSON.parse(payload);
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(env.iv, 'base64url'));
@@ -97,7 +139,7 @@ export function restoreMigrationBackup(file, key, sourceVersion=1) {
 }
 
 export class Store {
-  constructor(file, key) { this.file = file; this.key = key; this.data = structuredClone(EMPTY); this.load(); this.migration = this.migrate(); if(!Array.isArray(this.data.enrollmentTokens))this.data.enrollmentTokens=[];if(!this.data.settings||typeof this.data.settings!=='object'||Array.isArray(this.data.settings))this.data.settings={}; }
+  constructor(file, key) { this.file = file; this.key = key; this.data = structuredClone(EMPTY); this.writer = coalescedWriter(file, () => this.seal()); this.load(); this.migration = this.migrate(); if(!Array.isArray(this.data.enrollmentTokens))this.data.enrollmentTokens=[];if(!this.data.settings||typeof this.data.settings!=='object'||Array.isArray(this.data.settings))this.data.settings={}; }
   load() {
     if (!fs.existsSync(this.file)) return;
     this.data = decryptStore(fs.readFileSync(this.file, 'utf8'), this.key);
@@ -121,16 +163,21 @@ export class Store {
     this.data.audit = Array.isArray(this.data.audit) ? this.data.audit : [];
     this.data.audit.unshift({ at:new Date().toISOString(), action:'store.schema_migrated', ip:'local', detail:`schema ${result.sourceVersion} -> ${STORE_SCHEMA_VERSION}; ${result.migrated} routes migrated; ${result.legacy} require rotation; ${result.agents} agents and ${result.deployments} deployments added` });
     this.data.audit = this.data.audit.slice(0, 500);
-    this.save();
+    // Boot-time and nothing else is writing yet: the migrated schema must be on disk before startup goes on.
+    this.saveSync();
     const backup=migrationBackupPath(this.file,result.sourceVersion);
     return { ...result, backup:fs.existsSync(backup) ? backup : null };
   }
-  save() {
+  seal() {
     const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
     const encrypted = Buffer.concat([cipher.update(JSON.stringify(this.data)), cipher.final()]);
-    const payload = JSON.stringify({ v: 1, iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url'), data: encrypted.toString('base64url') });
-    writeAtomic(this.file, payload);
+    return JSON.stringify({ v: 1, iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url'), data: encrypted.toString('base64url') });
   }
+  // Resolves once this change (and any saved alongside it) is on disk; callers on the request path need
+  // not wait for it.
+  save() { return this.writer.save(); }
+  flush() { return this.writer.flush(); }
+  saveSync() { writeAtomic(this.file, this.seal()); }
   audit(action, ip, detail = '') {
     this.data.audit.unshift({ at: new Date().toISOString(), action, ip: String(ip).slice(0, 64), detail: String(detail).replace(/[A-Za-z0-9_-]{32,}/g, '[redacted]').slice(0, 180) });
     this.data.audit = this.data.audit.slice(0, 500); this.save();
