@@ -1,6 +1,6 @@
 # AegisRelay
 
-[![CI](https://github.com/bear4f/aegis-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/bear4f/aegis-relay/actions/workflows/ci.yml)
+[![CI](https://github.com/fjhdream/aegis-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/fjhdream/aegis-relay/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/Node-20%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -78,7 +78,7 @@ https://emby.example.com/family/<访问密钥>/
 支持 Debian / Ubuntu。安装器会准备 Docker、下载仓库到 `/opt/aegis-relay`、生成独立主密钥、Setup Token 和随机管理路径：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bear4f/aegis-relay/main/scripts/bootstrap.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/fjhdream/aegis-relay/main/scripts/bootstrap.sh | sudo sh
 ```
 
 安装末尾会引导两步确认并**自动申请证书**（需要域名已解析到本机、放行 TCP 80/443；用 Cloudflare 时首次签证建议先设为 DNS only）：

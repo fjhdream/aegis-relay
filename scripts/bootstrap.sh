@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
-REPO="bear4f/aegis-relay"
+REPO="fjhdream/aegis-relay"
 BRANCH="main"
 INSTALL_DIR="/opt/aegis-relay"
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行安装命令" >&2; exit 1; }

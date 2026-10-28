@@ -5,7 +5,7 @@ compose(){ cd "$INSTALL_DIR"; if docker compose version >/dev/null 2>&1; then do
 
 do_status(){ compose ps; }
 do_logs(){ compose logs -f --tail=200; }
-do_update(){ sh -c "$(curl -fsSL https://raw.githubusercontent.com/bear4f/aegis-relay/main/scripts/agent-upgrade.sh)"; }
+do_update(){ sh -c "$(curl -fsSL https://raw.githubusercontent.com/fjhdream/aegis-relay/main/scripts/agent-upgrade.sh)"; }
 # Docker leaks the userland `docker-proxy` process that publishes the port when a container dies
 # uncleanly; it keeps holding 8080 with NO container attached, so removing containers does not free it.
 # Only ever kill the proxy bound to this agent's own published address.

@@ -2,7 +2,7 @@
 set -eu
 umask 077
 INSTALL_DIR=/opt/aegis-relay-agent
-REPO=bear4f/aegis-relay
+REPO=fjhdream/aegis-relay
 PANEL= TOKEN= NAME= DOMAIN= EMAIL= MODE=
 while [ "$#" -gt 0 ]; do
   case "$1" in

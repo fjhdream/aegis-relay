@@ -2,7 +2,7 @@
 set -eu
 umask 077
 INSTALL_DIR=/opt/aegis-relay-agent
-REPO=bear4f/aegis-relay
+REPO=fjhdream/aegis-relay
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
 [ -f "$INSTALL_DIR/.env" ] && [ -f "$INSTALL_DIR/data/identity.json" ] || { echo "未找到已注册的 AegisRelay Agent" >&2; exit 1; }
 TMP_DIR=$(mktemp -d /tmp/aegis-agent-upgrade.XXXXXX)

@@ -5,7 +5,7 @@ compose(){ cd "$INSTALL_DIR"; if docker compose version >/dev/null 2>&1; then do
 
 do_status(){ compose ps; }
 do_logs(){ compose logs -f --tail=200; }
-do_update(){ sh -c "$(curl -fsSL https://raw.githubusercontent.com/bear4f/aegis-relay/main/scripts/bootstrap.sh)"; }
+do_update(){ sh -c "$(curl -fsSL https://raw.githubusercontent.com/fjhdream/aegis-relay/main/scripts/bootstrap.sh)"; }
 do_domain(){ "$INSTALL_DIR/scripts/domain-wizard.sh" "$@"; }
 do_proxy_domain(){
   EMAIL=$(sed -n 's/^CERTIFICATE_EMAIL=//p' "$INSTALL_DIR/.env" | head -n1)
