@@ -15,7 +15,8 @@ import { isRouteAuthKey, newRouteAuthKey, ROUTE_AUTH_VERSION, routeChannels, rou
 import { LocalAgent } from './local-agent.js';
 import { agentEntryUrl, deploymentId, ensureLocalDeployment, LOCAL_AGENT_ID, normalizeAgentDomain, publicAgent, removeRouteDeployments, replaceAgentDeployments, routeEntryBaseUrl } from './agent-registry.js';
 import { AgentApi, enrollmentInstallCommand, issueEnrollment, normalizeCertificateEmail } from './agent-api.js';
-import { aggregateTelemetry, sanitizeTelemetry, telemetryFromMetrics } from './telemetry.js';
+import { aggregateTelemetry, indexViewersByNode, nodeChannels, sanitizeTelemetry, telemetryFromMetrics } from './telemetry.js';
+import { createDashboardFeed } from './dashboard-feed.js';
 import { activeLocalDomain, baseHostname, domainRequestRole, readDomainStatus, requestDomainSwitch } from './domain-control.js';
 import { qrRows } from './qr.js';
 import { fetchPanelIcon, MAX_ICON_BYTES, normalizePanelIcon } from './panel-icon.js';
@@ -121,41 +122,23 @@ function machineTelemetryList(){
   for(const agent of store.data.agents.filter(item=>item.id!==LOCAL_AGENT_ID)){const view=publicAgent(agent,store.data);machines.push({...view,telemetry:sanitizeTelemetry(agent.telemetry),lastTelemetryAt:agent.lastTelemetryAt||null})}
   return {localSnapshot,machines};
 }
-// Distinct-viewer badge counts per node, merged across machines (max of each machine's own count — a
-// cheap upper bound good enough for the "被分发" flag; the full viewer union is built in /access).
-function nodeChannels(machines, route, includeViewers){
-  const threshold=Number(route?.accessAlertThreshold||0), byChannel=new Map();
-  for(const m of machines)for(const n of (m.telemetry?.nodes||[])){ if(n.id!==route.id)continue;
-    for(const v of (n.viewers||[])){ const cid=v.channelId||'default'; let cv=byChannel.get(cid); if(!cv){cv=new Map();byChannel.set(cid,cv);}
-      const k=`${v.ip} ${v.deviceId||v.deviceName||v.ua||''}`, cur=cv.get(k);
-      if(!cur)cv.set(k,{ip:v.ip,deviceName:v.deviceName||'',client:v.client||'',deviceId:v.deviceId||'',ua:v.ua||'',firstSeen:Number(v.firstSeen||0),lastSeen:Number(v.lastSeen||0),hits:Number(v.hits||0),machine:m.name});
-      else{cur.hits+=Number(v.hits||0);cur.firstSeen=Math.min(cur.firstSeen||Number(v.firstSeen||0),Number(v.firstSeen||0)||cur.firstSeen);if(Number(v.lastSeen||0)>cur.lastSeen)Object.assign(cur,{lastSeen:Number(v.lastSeen||0),deviceName:v.deviceName||cur.deviceName,client:v.client||cur.client,deviceId:v.deviceId||cur.deviceId,ua:v.ua||cur.ua,machine:m.name});}
-    }
-  }
-  const labels=new Map(channelList(route).map(c=>[c.id,c.label])), ids=new Set([...labels.keys(),...byChannel.keys()]);
-  const channels=[...ids].map(cid=>{
-    const vs=[...(byChannel.get(cid)||new Map()).values()].sort((a,b)=>b.lastSeen-a.lastSeen);
-    const distinctIps=new Set(vs.map(v=>v.ip)).size, distinctDevices=new Set(vs.map(v=>v.deviceId||v.deviceName||v.ua).filter(Boolean)).size;
-    const ch={id:cid,label:labels.get(cid)||(cid==='default'?'默认':'(已删除通道)'),isDefault:cid==='default',distinctIps,distinctDevices,suspicious:threshold>0&&distinctDevices>threshold};
-    if(includeViewers)ch.viewers=vs.slice(0,200);
-    return ch;
-  }).sort((a,b)=>(Number(b.suspicious)-Number(a.suspicious))||(b.distinctDevices-a.distinctDevices)||(a.isDefault?-1:1));
-  return {threshold,distinctIps:channels.reduce((s,c)=>s+c.distinctIps,0),distinctDevices:channels.reduce((s,c)=>s+c.distinctDevices,0),suspicious:channels.some(c=>c.suspicious),channels};
-}
+// Channel id -> label for a node's distribution channels, as nodeChannels expects them.
+function channelLabels(route){return new Map(channelList(route).map(c=>[c.id,c.label]))}
 // Alert on distinct DEVICES, not IPs: mainland dynamic IPs (WiFi/5G/CGNAT) churn one legitimate
 // viewer across many IPs, but an Emby device id is stable per player, and a household has a bounded
 // device count — a redistributed relay is what shows a spike of distinct devices.
 function dashboardSnapshot(){
   const {localSnapshot,machines}=machineTelemetryList();
   const combined=aggregateTelemetry(machines.map(machine=>machine.telemetry));
-  const routeById=new Map(store.data.routes.map(r=>[r.id,r]));
-  const nodes=localSnapshot.nodes.map(n=>{const r=routeById.get(n.id),b=nodeChannels(machines,r||{id:n.id},false);return{...n,distinctIps:b.distinctIps,distinctDevices:b.distinctDevices,accessAlertThreshold:Number(r?.accessAlertThreshold||0),suspicious:b.suspicious}});
+  const routeById=new Map(store.data.routes.map(r=>[r.id,r])),viewers=indexViewersByNode(machines);
+  const nodes=localSnapshot.nodes.map(n=>{const route=routeById.get(n.id)||{id:n.id},b=nodeChannels(viewers,route,channelLabels(route),false);return{...n,distinctIps:b.distinctIps,distinctDevices:b.distinctDevices,accessAlertThreshold:Number(route.accessAlertThreshold||0),suspicious:b.suspicious}});
   return {...localSnapshot,nodes,totalRequests:combined.totalRequests,totalBytes:combined.totalBytes,monthBytes:combined.monthBytes,playbackRequests:combined.playbackRequests,errors:combined.errors,active:combined.active,daily:combined.daily,machines,onlineMachines:machines.filter(machine=>machine.status==='online'&&machine.proxyHealthy).length};
 }
+const dashboardFeed=createDashboardFeed({build:dashboardSnapshot,subscribe:listener=>metrics.subscribe(listener)});
 // Full per-node viewer roster (IP + device), merged and de-duplicated across every machine serving it.
 function accessSnapshot(){
-  const {machines}=machineTelemetryList();
-  return store.data.routes.map(r=>{const b=nodeChannels(machines,r,true);return {id:r.id,alias:r.alias,name:r.name,threshold:b.threshold,distinctIps:b.distinctIps,distinctDevices:b.distinctDevices,suspicious:b.suspicious,status:b.suspicious?'疑似多人共享':'安全',channels:b.channels};});
+  const {machines}=machineTelemetryList(),viewers=indexViewersByNode(machines);
+  return store.data.routes.map(r=>{const b=nodeChannels(viewers,r,channelLabels(r),true);return {id:r.id,alias:r.alias,name:r.name,threshold:b.threshold,distinctIps:b.distinctIps,distinctDevices:b.distinctDevices,suspicious:b.suspicious,status:b.suspicious?'疑似多人共享':'安全',channels:b.channels};});
 }
 
 async function api(req, res, rel, cookiePath = cfg.adminPath) {
@@ -243,13 +226,7 @@ async function api(req, res, rel, cookiePath = cfg.adminPath) {
   if (req.method === 'GET' && rel === '/notifications') return json(res,200,notifier.view());
   if (req.method === 'PUT' && rel === '/notifications') {const b=await body(req),result=notifier.configure(b);store.audit('notifications.updated',ip(req));return json(res,200,result);}
   if (req.method === 'POST' && rel === '/notifications/test') {await notifier.test();store.audit('notifications.tested',ip(req));return json(res,200,{ok:true});}
-  if (req.method === 'GET' && rel === '/events') {res.writeHead(200,headers({'content-type':'text/event-stream','connection':'keep-alive'}));const send=()=>{lastSent=Date.now();if(coalesce){clearTimeout(coalesce);coalesce=null}res.write(`event: dashboard\ndata: ${JSON.stringify(dashboardSnapshot())}\n\n`)};
-    // metrics.emit() fires once per proxied request. Rebuilding and serialising the whole dashboard
-    // that often ran a full aggregation on the event loop that is streaming media, so coalesce
-    // bursts into at most one update every two seconds.
-    let lastSent=0,coalesce=null;
-    const schedule=()=>{if(coalesce)return;coalesce=setTimeout(send,Math.max(0,2000-(Date.now()-lastSent)));coalesce.unref?.()};
-    send();const off=metrics.subscribe(schedule),timer=setInterval(send,15000);req.on('close',()=>{off();clearInterval(timer);if(coalesce)clearTimeout(coalesce)});return;}
+  if (req.method === 'GET' && rel === '/events') {res.writeHead(200,headers({'content-type':'text/event-stream','connection':'keep-alive'}));req.on('close',dashboardFeed.follow(res));return;}
   if (req.method === 'GET' && rel === '/export') return json(res,200,{version:1,exportedAt:new Date().toISOString(),routes:store.data.routes.map(r=>{const x=publicRoute(r);delete x.id;delete x.createdAt;delete x.updatedAt;return x})});
   if (req.method === 'POST' && rel === '/import') {const b=await body(req),items=Array.isArray(b.routes)?b.routes.slice(0,50):[];const credentials=[],errors=[];for(const item of items){try{const alias=checkedAlias(item.alias);if(store.data.routes.some(r=>r.alias===alias))throw new Error('alias already exists');const allowPrivate=item.allowPrivate===true,upstreams=await validateUpstreamList(item.upstreams||item.upstream,allowPrivate),accessMode=item.accessMode==='alias_only'?'alias_only':'key',accessKey=accessMode==='key'?randomToken(24):'',now=new Date().toISOString();const r={id:randomToken(12),alias,name:String(item.name||alias).slice(0,80),upstreams,allowPrivate,tlsVerify:item.tlsVerify!==false,enabled:item.enabled!==false,accessMode,showOnHome:item.showOnHome===true,clientProfile:cleanProfile(item.clientProfile),streamRewrite:cleanStreamRewrite(item.streamRewrite),tags:cleanTags(item.tags),notes:String(item.notes||'').slice(0,500),favorite:item.favorite===true,sortOrder:numeric(item.sortOrder,-10000,10000),speedLimitMbps:numeric(item.speedLimitMbps,0,100000),monthlyQuotaGB:numeric(item.monthlyQuotaGB,0,1000000),reminderDays:numeric(item.reminderDays,0,365),accessAlertThreshold:numeric(item.accessAlertThreshold,0,100000),...routeAuthFields(accessKey),createdAt:now,updatedAt:now};store.data.routes.push(r);ensureLocalDeployment(store.data,r.id,now);credentials.push({alias,...credentialsFor(r,accessKey)})}catch(e){errors.push({alias:String(item?.alias||''),error:e.message})}}store.audit('routes.imported',ip(req),`${credentials.length} imported`);(localAgent.reconcile(),agentApi.invalidate());return json(res,200,{imported:credentials.length,credentials,errors});}
   if (req.method === 'GET' && rel === '/diagnostics') return json(res,200,{nodes:getRuntimeStatus(localAgent.routeSource.getRoutes())});

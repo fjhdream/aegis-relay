@@ -123,6 +123,9 @@ function baseHeaders(extra={}) { return {'cache-control':'no-store','content-typ
 export class AgentApi {
   constructor({store,version='0.0.0'}) {
     this.store=store;this.version=version;this.panelIdentity=ensurePanelSigningIdentity(store);this.nonces=new Map();
+    // Every response is signed and every request verified; parsing the DER keys each time was pure
+    // overhead on the media event loop. The panel key is fixed for the process, agent keys per record.
+    this.panelPrivateKey=importPanelPrivate(this.panelIdentity);this.agentKeys=new WeakMap();
     // Enrollment is the only unauthenticated agent endpoint. Tokens are 32-byte digests so guessing
     // is hopeless, but without a limiter the endpoint is still free CPU and audit-log spam.
     this.enrollLimiter=new RateLimiter(12,10*60_000);
@@ -169,7 +172,7 @@ export class AgentApi {
   send(res,status,payload,requestNonce='enroll') {
     if(res.writableEnded||res.destroyed)return;
     const raw=status===204?Buffer.alloc(0):Buffer.from(JSON.stringify(payload)),timestamp=nowSeconds(),contentHash=sha256(raw);
-    const signature=b64u(crypto.sign(null,Buffer.from(panelResponseInput({status,requestNonce,timestamp,contentHash})),importPanelPrivate(this.panelIdentity)));
+    const signature=b64u(crypto.sign(null,Buffer.from(panelResponseInput({status,requestNonce,timestamp,contentHash})),this.panelPrivateKey));
     const responseHeaders=baseHeaders({'x-aegis-panel-key-id':this.panelIdentity.keyId,'x-aegis-timestamp':String(timestamp),'x-aegis-content-sha256':contentHash,'x-aegis-signature':signature});if(status===204)delete responseHeaders['content-type'];if(this.closing)responseHeaders.connection='close';
     res.writeHead(status,responseHeaders);res.end(raw);
   }
@@ -182,7 +185,9 @@ export class AgentApi {
     if(!agent||agent.state==='revoked')throw Object.assign(new Error('unknown agent'),{status:401,nonce});
     if(!Number.isSafeInteger(timestamp)||Math.abs(nowSeconds()-timestamp)>300)throw Object.assign(new Error('request timestamp rejected'),{status:401,nonce});
     const expected=sha256(raw);if(!timingEqual(contentHash,expected))throw Object.assign(new Error('request body hash mismatch'),{status:401,nonce});
-    let publicKey;try{publicKey=crypto.createPublicKey({key:Buffer.from(agent.signPublicKey,'base64url'),format:'der',type:'spki'});}catch{throw Object.assign(new Error('agent key invalid'),{status:401,nonce});}
+    let cached=this.agentKeys.get(agent);
+    if(!cached||cached.encoded!==agent.signPublicKey){try{cached={encoded:agent.signPublicKey,key:crypto.createPublicKey({key:Buffer.from(agent.signPublicKey,'base64url'),format:'der',type:'spki'})};}catch{throw Object.assign(new Error('agent key invalid'),{status:401,nonce});}this.agentKeys.set(agent,cached);}
+    const publicKey=cached.key;
     const input=agentRequestInput({method:req.method,path:canonicalQuery(url),agentId:id,timestamp,nonce,contentHash});
     if(!signature||!crypto.verify(null,Buffer.from(input),publicKey,Buffer.from(signature,'base64url')))throw Object.assign(new Error('request signature rejected'),{status:401,nonce});
     const at=Date.now();for(const [key,seen] of this.nonces)if(at-seen>10*60_000)this.nonces.delete(key);

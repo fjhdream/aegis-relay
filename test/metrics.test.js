@@ -41,3 +41,29 @@ test('deleting a node drops its counters from the store and active table',()=>{
   assert.deepEqual(Object.keys(store.data.metrics.routes),[]);
   assert.equal(metrics.active.size,0);
 });
+
+test('the viewer roster is trimmed at the same point with a running count as with a recount',()=>{
+  const store={data:{},save(){}},metrics=new Metrics(store),route={id:'roster',alias:'roster'};
+  const roster=()=>Object.keys(store.data.metrics.routes.roster.viewers).length;
+  for(let i=0;i<232;i++)metrics.recordAccess(route,{ip:`10.0.${i>>8}.${i&255}`,deviceId:`d${i}`});
+  assert.equal(roster(),232,'up to 32 over the cap is tolerated before an amortized prune');
+  metrics.recordAccess(route,{ip:'10.0.0.0',deviceId:'d0'});
+  assert.equal(roster(),232,'a repeat viewer never grows the roster');
+  metrics.recordAccess(route,{ip:'10.9.9.9',deviceId:'new'});
+  assert.equal(roster(),200,'the first new viewer past the slack trims to the cap');
+  for(let i=0;i<32;i++)metrics.recordAccess(route,{ip:`10.1.0.${i}`,deviceId:`e${i}`});
+  assert.equal(roster(),232);
+  metrics.snapshot([route]); // expiry pass: nothing is old enough, but the count must stay right after it
+  metrics.recordAccess(route,{ip:'10.2.0.1',deviceId:'f1'});
+  assert.equal(roster(),200);
+});
+
+test('a roster loaded from disk above the slack is trimmed on its first access, as before',()=>{
+  const now=Date.now(),viewers={};
+  for(let i=0;i<300;i++)viewers[`10.3.${i>>8}.${i&255} d${i} default`]={ip:`10.3.${i>>8}.${i&255}`,deviceId:`d${i}`,channelId:'default',firstSeen:now-i,lastSeen:now-i,hits:1};
+  const store={data:{metrics:{startedAt:new Date().toISOString(),daily:{},routes:{disk:{requests:0,playbackRequests:0,errors:0,bytesIn:0,bytesOut:0,month:new Date().toISOString().slice(0,7),monthBytes:0,viewers}}}},save(){}};
+  const metrics=new Metrics(store),route={id:'disk',alias:'disk'};
+  metrics.recordAccess(route,{ip:'10.3.0.0',deviceId:'d0'});
+  assert.equal(Object.keys(viewers).length,200);
+  assert.ok(viewers['10.3.0.0 d0 default'],'the most recent viewers are the ones kept');
+});

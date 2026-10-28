@@ -65,3 +65,38 @@ export function aggregateTelemetry(items) {
     active:valid.reduce((sum,item)=>sum+counter(item.active),0),daily
   };
 }
+
+// Every machine's viewer rows grouped by node id, built once per snapshot: looking a node up used to
+// rescan every node of every machine, once for each node.
+export function indexViewersByNode(machines) {
+  const index=new Map();
+  for(const machine of machines)for(const node of (machine.telemetry?.nodes||[])){
+    let rows=index.get(node.id);if(!rows)index.set(node.id,rows=[]);
+    rows.push({machine:machine.name,viewers:node.viewers||[]});
+  }
+  return index;
+}
+
+// Distinct viewers of one node per distribution channel, merged across every machine serving it. The
+// counts come straight off the rows — a viewer is IP + (deviceId → deviceName → UA), the very identity
+// the merge key is made of — so the merged roster, which only /access shows, is built only on request.
+export function nodeChannels(index, route, labels, includeViewers) {
+  const threshold=Number(route?.accessAlertThreshold||0), byChannel=new Map();
+  for(const {machine,viewers} of index.get(route.id)||[])for(const v of viewers){
+    const cid=v.channelId||'default', device=v.deviceId||v.deviceName||v.ua;
+    let cv=byChannel.get(cid);if(!cv)byChannel.set(cid,cv={ips:new Set(),devices:new Set(),roster:includeViewers?new Map():null});
+    cv.ips.add(v.ip);if(device)cv.devices.add(device);
+    if(!cv.roster)continue;
+    const k=`${v.ip} ${device||''}`, cur=cv.roster.get(k);
+    if(!cur)cv.roster.set(k,{ip:v.ip,deviceName:v.deviceName||'',client:v.client||'',deviceId:v.deviceId||'',ua:v.ua||'',firstSeen:Number(v.firstSeen||0),lastSeen:Number(v.lastSeen||0),hits:Number(v.hits||0),machine});
+    else{cur.hits+=Number(v.hits||0);cur.firstSeen=Math.min(cur.firstSeen||Number(v.firstSeen||0),Number(v.firstSeen||0)||cur.firstSeen);if(Number(v.lastSeen||0)>cur.lastSeen)Object.assign(cur,{lastSeen:Number(v.lastSeen||0),deviceName:v.deviceName||cur.deviceName,client:v.client||cur.client,deviceId:v.deviceId||cur.deviceId,ua:v.ua||cur.ua,machine});}
+  }
+  const ids=new Set([...labels.keys(),...byChannel.keys()]);
+  const channels=[...ids].map(cid=>{
+    const cv=byChannel.get(cid), distinctIps=cv?cv.ips.size:0, distinctDevices=cv?cv.devices.size:0;
+    const ch={id:cid,label:labels.get(cid)||(cid==='default'?'默认':'(已删除通道)'),isDefault:cid==='default',distinctIps,distinctDevices,suspicious:threshold>0&&distinctDevices>threshold};
+    if(includeViewers)ch.viewers=[...(cv?.roster||new Map()).values()].sort((a,b)=>b.lastSeen-a.lastSeen).slice(0,200);
+    return ch;
+  }).sort((a,b)=>(Number(b.suspicious)-Number(a.suspicious))||(b.distinctDevices-a.distinctDevices)||(a.isDefault?-1:1));
+  return {threshold,distinctIps:channels.reduce((s,c)=>s+c.distinctIps,0),distinctDevices:channels.reduce((s,c)=>s+c.distinctDevices,0),suspicious:channels.some(c=>c.suspicious),channels};
+}
