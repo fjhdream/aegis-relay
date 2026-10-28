@@ -32,3 +32,27 @@ test('malformed route authentication keys are rejected', () => {
   assert.equal(isRouteAuthKey('short'),false);
   assert.throws(()=>routeTokenDigest('client-key','short'),/invalid routeAuthKey/);
 });
+
+test('every channel of a full node is matched to its own key and nothing else', () => {
+  const primary=newRouteAuthKey(),channels=Array.from({length:32},(_,i)=>{const k=newRouteAuthKey();return {id:`ch-${i}`,authVersion:ROUTE_AUTH_VERSION,routeAuthKey:k,keyDigest:routeTokenDigest(`user-${i}`,k)}});
+  const route={authVersion:ROUTE_AUTH_VERSION,routeAuthKey:primary,keyDigest:routeTokenDigest('owner',primary),channels};
+  for(let round=0;round<2;round++){ // the second round runs entirely on remembered key bytes
+    assert.equal(matchRouteChannel(route,'owner').id,'default');
+    for(let i=0;i<32;i++)assert.equal(matchRouteChannel(route,`user-${i}`).id,`ch-${i}`);
+    assert.equal(matchRouteChannel(route,'user-32'),null);
+    assert.equal(matchRouteChannel(route,''),null);
+  }
+});
+
+test('a malformed key or a non-canonical digest never unlocks a channel', () => {
+  const key=newRouteAuthKey(),digest=routeTokenDigest('client',key);
+  assert.equal(verifyRouteToken({authVersion:ROUTE_AUTH_VERSION,routeAuthKey:'short',keyDigest:digest},'client'),false);
+  assert.equal(verifyRouteToken({authVersion:ROUTE_AUTH_VERSION,routeAuthKey:`${key}A`,keyDigest:digest},'client'),false);
+  // The last base64url character carries two padding bits; a sloppy decoder maps several spellings to
+  // the same bytes. The stored digest must match exactly as it always did, not merely decode alike.
+  const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const lookalike=[...alphabet].map(ch=>digest.slice(0,-1)+ch).find(v=>v!==digest&&Buffer.from(v,'base64url').equals(Buffer.from(digest,'base64url')));
+  assert.ok(lookalike,'a non-canonical spelling of the digest exists');
+  assert.equal(verifyRouteToken({authVersion:ROUTE_AUTH_VERSION,routeAuthKey:key,keyDigest:lookalike},'client'),false);
+  assert.equal(verifyRouteToken({authVersion:ROUTE_AUTH_VERSION,routeAuthKey:key,keyDigest:digest},'client'),true);
+});

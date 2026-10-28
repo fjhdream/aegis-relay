@@ -121,7 +121,7 @@ async function enrolledAgent(capabilities){
   const enrollBody=JSON.stringify({protocolVersion:1,requestNonce:'enroll-longpoll-nonce-00',token:issued.token,agent:{signPublicKey:publicDer(sign.publicKey),boxPublicKey:publicDer(box.publicKey),agentVersion:'0.10.21',capabilities},machine:{hostname:'hk'}}),enrollResponse=response();
   await api.handle(request('/api/agent/v1/enroll',enrollBody,{'content-type':'application/json'}),enrollResponse);
   const enrolled=JSON.parse(enrollResponse.raw);let sequence=0;
-  const call=async(method,path,payload,res=response())=>{const body=payload===null?Buffer.alloc(0):Buffer.from(JSON.stringify(payload));await api.handle(request(path,body,signedHeaders({method,path,agentId:enrolled.agentId,privateKey:sign.privateKey,body,nonce:`longpoll-request-nonce-${String(++sequence).padStart(4,'0')}`}),method),res);return res;};
+  const call=async(method,path,payload,res=response(),privateKey=sign.privateKey)=>{const body=payload===null?Buffer.alloc(0):Buffer.from(JSON.stringify(payload));await api.handle(request(path,body,signedHeaders({method,path,agentId:enrolled.agentId,privateKey,body,nonce:`longpoll-request-nonce-${String(++sequence).padStart(4,'0')}`}),method),res);return res;};
   const checkIn=async currentRevision=>JSON.parse((await call('POST','/api/agent/v1/check-in',{agentVersion:'0.10.21',currentRevision,applyState:'active',proxyHealthy:true,capabilities})).raw);
   return {api,data,agentId:enrolled.agentId,box,enrolled,call,checkIn};
 }
@@ -166,4 +166,17 @@ test('shutdown answers every parked long poll at once so the panel can exit insi
   const late=Object.assign(new EventEmitter(),response());
   await agent.call('GET',`/api/agent/v1/config?after=${current}&wait=25`,null,late);
   assert.equal(late.status,204,'a poll that arrives while shutting down is not parked');
+});
+
+test('agent signatures are checked against a cached key that follows the agent record',async()=>{
+  const agent=await enrolledAgent(['config-v1']),record=agent.data.agents[0],path='/api/agent/v1/check-in',beat={agentVersion:'0.10.22',currentRevision:0,applyState:'active',proxyHealthy:true};
+  assert.equal((await agent.call('POST',path,beat)).status,200);
+  assert.equal((await agent.call('POST',path,beat)).status,200,'a second request reuses the parsed key');
+  const replacement=crypto.generateKeyPairSync('ed25519');record.signPublicKey=publicDer(replacement.publicKey);
+  const stale=await agent.call('POST',path,beat);
+  assert.equal(stale.status,401);assert.match(stale.raw.toString(),/signature rejected/,'the old key must stop working once the record changes');
+  assert.equal((await agent.call('POST',path,beat,response(),replacement.privateKey)).status,200);
+  delete record.signPublicKey;
+  const missing=await agent.call('POST',path,beat);
+  assert.equal(missing.status,401);assert.match(missing.raw.toString(),/agent key invalid/);
 });

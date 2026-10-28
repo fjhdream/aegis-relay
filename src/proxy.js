@@ -212,8 +212,8 @@ function accessPrefix(route, suppliedKey = '') {
   return route.accessMode === 'alias_only' ? `/${route.alias}` : `/${route.alias}/${suppliedKey}`;
 }
 
-function routeFor(req, routes, key) {
-  const parts = new URL(req.url, 'http://relay.invalid').pathname.split('/').filter(Boolean);
+function routeFor(pathname, routes, key) {
+  const parts = pathname.split('/').filter(Boolean);
   const offset = parts[0] === 'r' ? 1 : 0;
   const route = routes.find(r => r.enabled && r.alias === parts[offset]);
   if (!route) return null;
@@ -322,24 +322,43 @@ function vodTarget(found, search) {
   target.pathname='/'+seg.slice(2).join('/'); target.search=search||'';
   return {target,token};
 }
+// What the request path derives from a route: the origins that may receive the client's credentials,
+// and the stream-URL pattern (null when the feature is off). Snapshot routes (AtomicRouteSource) are
+// deep-frozen and replaced wholesale on every apply, so a frozen route is derived once instead of on
+// every request; a mutable route object is derived afresh each time.
+const derivedRoutes=new WeakMap();
+function routeDerived(route) {
+  let derived=derivedRoutes.get(route);
+  if(derived)return derived;
+  // Declared stream hosts are trusted parts of the same deployment, so keep credentials flowing to
+  // them just like the configured upstreams (the /.aegis-vod/ proxy target lives on one of these).
+  const domains=streamRewriteDomains(route);
+  const origins=new Set([...normalizedUpstreams(route),...domains.flatMap(h=>[`https://${h}`,`http://${h}`])].map(value=>{try{return new URL(value).origin}catch{return''}}).filter(Boolean));
+  let rewrite=null;
+  if(domains.length){
+    const alt=domains.map(d=>d.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|');
+    // Longest possible match: scheme + longest declared host + ":65535". Carry this many trailing chars
+    // between chunks so a URL split across chunk boundaries is never mis-emitted.
+    rewrite={regex:new RegExp('(https?|wss?):\\/\\/('+alt+')(:\\d+)?(?=[/"\'?#\\\\]|$)','g'),keep:Math.max(...domains.map(d=>d.length))+16};
+  }
+  derived={origins,rewrite};
+  if(Object.isFrozen(route))derivedRoutes.set(route,derived);
+  return derived;
+}
 // A text/manifest rewriter that turns absolute stream-domain URLs into paths on this relay, or null
 // when the feature is off or the public host is unknown. Scheme-qualified and boundary-guarded so a
 // declared host is never matched as a suffix of a lookalike domain (e.g. vod.example inside
 // vod.example.evil). The upstream scheme is preserved in the path; ws/wss map to the relay's own
 // websocket scheme so live sockets stay on our domain too.
-function buildStreamRewriter(route, publicContext, prefix) {
-  const domains=streamRewriteDomains(route);
-  if(!domains.length||!publicContext.host)return null;
+function buildStreamRewriter(pattern, publicContext, prefix) {
+  if(!pattern||!publicContext.host)return null;
   const base=`${publicContext.proto}://${publicContext.host}${prefix}/${RELAY_VOD_SEGMENT}/`;
   const wsBase=`${publicContext.proto==='https'?'wss':'ws'}://${publicContext.host}${prefix}/${RELAY_VOD_SEGMENT}/`;
-  const alt=domains.map(d=>d.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|');
-  const regex=new RegExp('(https?|wss?):\\/\\/('+alt+')(:\\d+)?(?=[/"\'?#\\\\]|$)','g');
   const replacer=m=>{ const s=m[1].toLowerCase(), secure=s==='https'||s==='wss', ws=s==='ws'||s==='wss';
     return (ws?wsBase:base)+(secure?'https':'http')+'/'+m[2]+(m[3]||''); };
-  // Longest possible match: scheme + longest declared host + ":65535". Carry this many trailing chars
-  // between chunks so a URL split across chunk boundaries is never mis-emitted.
-  const keep=Math.max(...domains.map(d=>d.length))+16;
-  return { regex, replacer, keep };
+  // One global regex serves every response on the route. Sharing it is safe: each use runs to completion
+  // synchronously from lastIndex 0 (StreamRewrite resets it; String#replace does so itself).
+  return { regex:pattern.regex, replacer, keep:pattern.keep };
 }
 function isRewritableType(contentType) {
   const ct=String(contentType||'').toLowerCase();
@@ -465,7 +484,7 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
       res.writeHead(200, { 'content-type':'text/html; charset=utf-8','cache-control':'no-store','referrer-policy':'no-referrer','x-frame-options':'DENY','content-security-policy':"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'" });
       return res.end(publicIndex(routesFrom(routeSource)));
     }
-    const found=routeFor(req,routesFrom(routeSource),key);
+    const found=routeFor(incoming.pathname,routesFrom(routeSource),key);
     if (!found) { res.writeHead(404,{'cache-control':'no-store'}); return res.end('not found'); }
     let continuation, vod;
     try { continuation=continuationTarget(found,key); vod=vodTarget(found,incoming.search); }
@@ -490,7 +509,7 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
     // Prepared only when the node opts into stream-URL rewriting; null (no effect) otherwise. We do
     // NOT touch Accept-Encoding here — the media path and every non-rewritten response keep their
     // normal compression, so playback speed on a rewrite-enabled node matches one without it.
-    const rewriter=buildStreamRewriter(route,publicContext,found.prefix);
+    const derived=routeDerived(route),rewriter=buildStreamRewriter(derived.rewrite,publicContext,found.prefix);
     const relaySearch=incoming.search;
     const canRetry=safeMethod(req.method); let finished=false, clientGone=false, activeUp=null;
     // Emby clients abort constantly (seeking, stopping, backgrounding). Nginx tears the upstream
@@ -501,9 +520,7 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
     res.on('error',()=>{});
     req.on('error',()=>{});
 
-    // Declared stream hosts are trusted parts of the same deployment, so keep credentials flowing to
-    // them just like the configured upstreams (the /.aegis-vod/ proxy target lives on one of these).
-    const routeOrigins=new Set([...normalizedUpstreams(route),...streamRewriteDomains(route).flatMap(h=>[`https://${h}`,`http://${h}`])].map(value=>{try{return new URL(value).origin}catch{return''}}).filter(Boolean));
+    const routeOrigins=derived.origins;
     const attempt=(targetValue,index,freshSocket=false)=>{
       if (finished || clientGone) return;
       const directTarget=(continuation&&index===0&&continuation.target)||(vod&&index===0&&vod.target)||null;
@@ -712,8 +729,8 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
 }
 
 export function handleUpgrade(req, socket, head, routeSource, key) {
-  const found=routeFor(req,routesFrom(routeSource),key); if(!found)return socket.destroy();
-  const relaySearch=new URL(req.url,'http://relay.invalid').search;
+  const incoming=new URL(req.url,'http://relay.invalid'),found=routeFor(incoming.pathname,routesFrom(routeSource),key); if(!found)return socket.destroy();
+  const relaySearch=incoming.search;
   // A rewritten live socket (wss://…/.aegis-vod/<host>/…) tunnels straight to the declared stream
   // host; otherwise use the node's primary upstream. An unknown/blocked stream host is dropped.
   let vod; try { vod=vodTarget(found,relaySearch); } catch { return socket.destroy(); }

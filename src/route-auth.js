@@ -34,10 +34,28 @@ export function routeChannels(route) {
   if (Array.isArray(route?.channels)) for (const ch of route.channels) if (ch?.keyDigest) list.push(ch);
   return list;
 }
+// matchRouteChannel runs on every proxied request and tries every channel. Decoding each stored key
+// and digest from base64url (and re-encoding to validate it) cost more there than the HMAC itself, yet
+// an encoded value always decodes to the same bytes, so the result is remembered. Only stored config
+// values are ever looked up, never anything a client sends.
+const DECODED_MAX = 16_384;
+const decoded = new Map();
+function decode32(value) {
+  let bytes = decoded.get(value);
+  if (bytes === undefined) {
+    const raw = typeof value === 'string' ? Buffer.from(value, 'base64url') : null;
+    bytes = raw?.length === 32 && raw.toString('base64url') === value ? raw : null;
+    if (decoded.size >= DECODED_MAX) decoded.clear();
+    decoded.set(value, bytes);
+  }
+  return bytes;
+}
 function channelAccepts(channel, suppliedToken, legacyMasterKey) {
   if (!channel?.keyDigest) return false;
-  if (channel.authVersion === ROUTE_AUTH_VERSION && isRouteAuthKey(channel.routeAuthKey)) {
-    return timingEqual(routeTokenDigest(suppliedToken, channel.routeAuthKey), channel.keyDigest);
+  const routeKey = channel.authVersion === ROUTE_AUTH_VERSION ? decode32(channel.routeAuthKey) : null;
+  if (routeKey) {
+    const digest = crypto.createHmac('sha256', routeKey).update(String(suppliedToken)).digest(), expected = decode32(channel.keyDigest);
+    return expected ? crypto.timingSafeEqual(digest, expected) : timingEqual(b64u(digest), channel.keyDigest);
   }
   if ((!channel.authVersion || channel.authVersion === LEGACY_ROUTE_AUTH_VERSION) && legacyMasterKey) {
     return timingEqual(tokenDigest(String(suppliedToken), legacyMasterKey), channel.keyDigest);

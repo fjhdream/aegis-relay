@@ -466,3 +466,26 @@ test('a WebSocket 101 keeps each Set-Cookie on its own line, tunnels both ways a
   await originGone;
   await close(relay);await close(upstream);
 });
+test('snapshot routes reuse their derived rewrite pattern and credential origins across requests and follow an apply',async()=>{
+  let streamAuth,streamHost='';
+  const stream=http.createServer((q,s)=>{streamAuth=q.headers.authorization;s.setHeader('content-type','video/mp4');s.end('stream-bytes')}),sp=await listen(stream);streamHost=`127.0.0.1:${sp}`;
+  const api=http.createServer((_q,s)=>{s.setHeader('content-type','application/json');s.end(JSON.stringify({DirectStreamUrl:`http://${streamHost}/videos/9/stream.mp4`}))}),ap=await listen(api);
+  const route=rewrite=>({id:'snap',alias:'snap',enabled:true,accessMode:'alias_only',upstreams:[`http://127.0.0.1:${ap}`],allowPrivate:true,streamRewrite:{enabled:rewrite,domains:[streamHost]}});
+  const source=new AtomicRouteSource([route(true)]),key=deriveKey('f'.repeat(32));
+  assert.equal(Object.isFrozen(source.getRoutes()[0]),true);
+  const relay=http.createServer(makeProxyHandler(source,key)),port=await listen(relay);
+  // One shared pattern, but every response is rewritten onto the host that particular client used.
+  for(const host of ['one.test','two.test','one.test']){
+    const body=(await request(port,'/snap/Items/1/PlaybackInfo',{headers:{host,'x-forwarded-proto':'https'}})).body.toString();
+    assert.ok(body.includes(`https://${host}/snap/.aegis-vod/http/${streamHost}/videos/9/stream.mp4`),body);
+  }
+  // The declared stream host stays a trusted origin, so the client's credentials still reach it.
+  const media=await request(port,`/snap/.aegis-vod/http/${streamHost}/videos/9/stream.mp4`,{headers:{host:'one.test',authorization:'MediaBrowser Token="abc"'}});
+  assert.equal(media.body.toString(),'stream-bytes');
+  assert.equal(streamAuth,'MediaBrowser Token="abc"');
+  // A new snapshot is a new frozen object: nothing derived from the previous one survives the apply.
+  source.apply([route(false)]);
+  assert.equal((await request(port,`/snap/.aegis-vod/http/${streamHost}/videos/9/stream.mp4`,{headers:{host:'one.test'}})).status,404);
+  assert.ok((await request(port,'/snap/Items/1/PlaybackInfo',{headers:{host:'one.test'}})).body.toString().includes(`http://${streamHost}/videos/9`),'rewriting is off after the apply');
+  await close(relay);await close(api);await close(stream);
+});
