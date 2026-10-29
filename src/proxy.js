@@ -10,7 +10,7 @@ import { isPrivateIP } from './security.js';
 import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-auth.js';
 import { ThrottleTransform } from './metrics.js';
 import { guardedLookup } from './lookup.js';
-import { stripSteerParam } from './steering.js';
+import { EGRESS_HEADER, EGRESS_HOST_HEADER, egressToken, relayedEgress, stripSteerParam } from './steering.js';
 
 // SNI carries host names only. Node 22 merely warns about an IP address there (DEP0123); newer Node
 // rejects the request outright, which broke every HTTPS upstream configured by IP.
@@ -498,38 +498,51 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     }
     const found=routeFor(incoming.pathname,routesFrom(routeSource),key);
     if (!found) { res.writeHead(404,{'cache-control':'no-store'}); return res.end('not found'); }
+    const {route}=found;
+    // Unified egress: this machine hands the client's own path, untouched, to the node's egress machine,
+    // which serves the same node and checks the same key; the upstream only ever sees that machine. The
+    // egress machine resolves .aegis-relay/.aegis-vod links itself, so they are passed on unread here.
+    const egress=route.egress?.base?route.egress:null;
+    // Or the other way round: this is the egress machine, and another machine relayed the request.
+    const relayed=egress?null:relayedEgress(route,req.headers,Date.now());
     // The steering token is addressed to this relay; it never reaches an upstream.
     const search=stripSteerParam(incoming.search);
     let continuation, vod;
-    try { continuation=continuationTarget(found,key); vod=vodTarget(found,search); }
-    catch { res.writeHead(404,{'cache-control':'no-store'});return res.end('not found'); }
-    const {route}=found, playback=continuation?.playback===true||!!vod||isPlaybackPath(found.rest);
-    const configured=continuation?[continuation.target.href]:vod?[vod.target.href]:orderedTargets(route);
-    if(metrics&&!metrics.canServe(route)){res.writeHead(509,{'cache-control':'no-store','retry-after':'3600'});return res.end('monthly traffic quota exceeded');}
-    const metricDone=metrics?.begin(route,{playback,bytesIn:Number(req.headers['content-length']||0)});
+    if(!egress){
+      try { continuation=continuationTarget(found,key); vod=vodTarget(found,search); }
+      catch { res.writeHead(404,{'cache-control':'no-store'});return res.end('not found'); }
+    }
+    const playback=continuation?.playback===true||!!vod||isPlaybackPath(found.rest)||(!!egress&&/\/\.aegis-(?:relay|vod)\//.test(found.rest));
+    const configured=egress?[egress.base]:continuation?[continuation.target.href]:vod?[vod.target.href]:orderedTargets(route);
+    // A relayed request was counted, logged and quota-checked by the machine the client talks to.
+    if(!relayed&&metrics&&!metrics.canServe(route)){res.writeHead(509,{'cache-control':'no-store','retry-after':'3600'});return res.end('monthly traffic quota exceeded');}
+    const metricDone=relayed?null:metrics?.begin(route,{playback,bytesIn:Number(req.headers['content-length']||0)});
     // Log the viewer (IP + device) once per identifiable request, before the client IP is stripped.
-    if (metrics && (playback || hasViewerIdentity(req,incoming))) { const info=accessInfoFrom(req,incoming); if(info){ info.channelId=found.channelId||'default'; metrics.recordAccess(route,info); } }
+    if (!relayed && metrics && (playback || hasViewerIdentity(req,incoming))) { const info=accessInfoFrom(req,incoming); if(info){ info.channelId=found.channelId||'default'; metrics.recordAccess(route,info); } }
     if (!configured.length) { metricDone?.(502,0,true);res.writeHead(502,{'cache-control':'no-store'}); return res.end('no upstream available'); }
     // Mirror the proven Nginx gateway: advertise the public host/scheme so the upstream builds
-    // correct redirects, but strip the client IP for privacy.
-    const publicContext=publicRequestContext(req);
+    // correct redirects, but strip the client IP for privacy. A relayed request is answered for the
+    // host the client actually used, so every link it carries leads back to that machine.
+    const publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req);
     // Automatic steering: serve here, or send this playback request to a peer machine's direct domain.
-    const steer=playback&&route.steering&&steering?steering.plan({route,found,req,incoming,publicContext}):null;
+    const steer=playback&&!relayed&&route.steering&&steering?steering.plan({route,found,req,incoming,publicContext}):null;
     if (steer?.redirect) { metricDone?.(302,0,false); res.writeHead(302,{location:steer.redirect,'cache-control':'no-store','referrer-policy':'no-referrer'}); return res.end(); }
     const track=steer?.track||null;
     track?.attach(res);
     const originalHeaders=stripAdminCredentials(strip(req.headers));
     delete originalHeaders['x-forwarded-for']; delete originalHeaders.forwarded; delete originalHeaders['x-real-ip'];
+    delete originalHeaders[EGRESS_HEADER]; delete originalHeaders[EGRESS_HOST_HEADER];
     if(publicContext.host)originalHeaders['x-forwarded-host']=publicContext.host;
     originalHeaders['x-forwarded-proto']=publicContext.proto;
     // Apply the optional client-compat header hint (owned/authorized upstreams only). Query string
-    // is relayed verbatim — we never rewrite the authenticated identity or tokens.
-    applyClientProfile(originalHeaders,route.clientProfile);
+    // is relayed verbatim — we never rewrite the authenticated identity or tokens. Through an egress
+    // machine, that machine applies it.
+    if(!egress)applyClientProfile(originalHeaders,route.clientProfile);
     if(steer?.range)originalHeaders.range=steer.range;
     // Prepared only when the node opts into stream-URL rewriting; null (no effect) otherwise. We do
     // NOT touch Accept-Encoding here — the media path and every non-rewritten response keep their
     // normal compression, so playback speed on a rewrite-enabled node matches one without it.
-    const derived=routeDerived(route),rewriter=buildStreamRewriter(derived.rewrite,publicContext,found.prefix);
+    const derived=routeDerived(route),rewriter=egress?null:buildStreamRewriter(derived.rewrite,publicContext,found.prefix);
     const relaySearch=search;
     const canRetry=safeMethod(req.method); let finished=false, clientGone=false, activeUp=null;
     // Emby clients abort constantly (seeking, stopping, backgrounding). Nginx tears the upstream
@@ -540,11 +553,12 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     res.on('error',()=>{});
     req.on('error',()=>{});
 
-    const routeOrigins=derived.origins;
+    const routeOrigins=egress?new Set([egress.base]):derived.origins,upstreamRest=egress?`${found.prefix}${found.rest}`:found.rest;
     const attempt=(targetValue,index,freshSocket=false)=>{
       if (finished || clientGone) return;
       const directTarget=(continuation&&index===0&&continuation.target)||(vod&&index===0&&vod.target)||null;
-      const target=directTarget||joinTarget(targetValue,found.rest,relaySearch), base=new URL(targetValue), requestHeaders={...originalHeaders};
+      const target=directTarget||joinTarget(targetValue,upstreamRest,relaySearch), base=new URL(targetValue), requestHeaders={...originalHeaders};
+      if(egress){requestHeaders[EGRESS_HEADER]=egressToken(route,Date.now());if(publicContext.host)requestHeaders[EGRESS_HOST_HEADER]=publicContext.host;}
       requestHeaders.host=target.host;
       if (!routeOrigins.has(target.origin)) { delete requestHeaders.authorization; delete requestHeaders.cookie; delete requestHeaders['x-emby-token']; }
       const secure=target.protocol==='https:';
@@ -555,7 +569,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
       const usesPool=!!pool;
       requestHeaders.connection=usesPool?'keep-alive':'close';
       const tlsKey=secure?tlsSessionKey(target):'';
-      const options={protocol:target.protocol,hostname:target.hostname,port:target.port,method:req.method,path:target.pathname+target.search,headers:requestHeaders,servername:tlsServername(target.hostname),rejectUnauthorized:route.tlsVerify!==false,lookup:guardedLookup(route.allowPrivate),highWaterMark:RELAY_HIGH_WATER_MARK,agent:pool||false};
+      const options={protocol:target.protocol,hostname:target.hostname,port:target.port,method:req.method,path:target.pathname+target.search,headers:requestHeaders,servername:tlsServername(target.hostname),rejectUnauthorized:egress?true:route.tlsVerify!==false,lookup:guardedLookup(egress?false:route.allowPrivate),highWaterMark:RELAY_HIGH_WATER_MARK,agent:pool||false};
       // Pooled agents handle TLS resumption themselves. The one-shot recovery/failover sockets fall
       // back to the shared session cache so even a fresh connection skips the full handshake.
       if(secure&&!usesPool){ const sess=tlsSessions.get(tlsKey); if(sess)options.session=sess; }
@@ -566,7 +580,8 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
         const status=upRes.statusCode||502;
         if (canRetry && RETRY_STATUS.has(status) && index+1<configured.length) { markFailure(route,targetValue,`HTTP ${status}`); upRes.resume(); return attempt(configured[index+1],index+1); }
         if(RETRY_STATUS.has(status))markFailure(route,targetValue,`HTTP ${status}`);else markSuccess(route,targetValue); const out=cleanResponseHeaders(upRes.headers);
-        if (out.location) {
+        // The egress machine already built its links for this machine's public host.
+        if (out.location && !egress) {
           try {
             const loc=new URL(out.location,target);
             if(!['http:','https:'].includes(loc.protocol)||loc.username||loc.password)delete out.location;
@@ -609,6 +624,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
         };
         const openResume=(plan,next)=>new Promise((resolve,reject)=>{
           const resumeHeaders={...requestHeaders,range:`bytes=${next}-${plan.end}`,connection:'close'};
+          if(egress)resumeHeaders[EGRESS_HEADER]=egressToken(route,Date.now());
           delete resumeHeaders['if-none-match'];delete resumeHeaders['if-modified-since'];
           if(plan.validator)resumeHeaders['if-range']=plan.validator;
           const resumeOptions={...options,method:'GET',headers:resumeHeaders,agent:false};
@@ -754,17 +770,21 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
 export function handleUpgrade(req, socket, head, routeSource, key) {
   const incoming=new URL(req.url,'http://relay.invalid'),found=routeFor(incoming.pathname,routesFrom(routeSource),key); if(!found)return socket.destroy();
   const relaySearch=incoming.search;
+  // Through the node's egress machine, like every other request of the node (see makeProxyHandler).
+  const egress=found.route.egress?.base?found.route.egress:null,relayed=egress?null:relayedEgress(found.route,req.headers,Date.now());
   // A rewritten live socket (wss://…/.aegis-vod/<host>/…) tunnels straight to the declared stream
   // host; otherwise use the node's primary upstream. An unknown/blocked stream host is dropped.
-  let vod; try { vod=vodTarget(found,relaySearch); } catch { return socket.destroy(); }
-  const targets=vod?[vod.target.href]:orderedTargets(found.route); if(!targets.length)return socket.destroy();
-  const target=vod?vod.target:joinTarget(targets[0],found.rest,relaySearch), publicContext=publicRequestContext(req), headers=stripAdminCredentials(strip(req.headers));
-  delete headers['x-forwarded-for']; delete headers.forwarded; delete headers['x-real-ip']; applyClientProfile(headers,found.route.clientProfile);
+  let vod; if(!egress){ try { vod=vodTarget(found,relaySearch); } catch { return socket.destroy(); } }
+  const targets=egress?[egress.base]:vod?[vod.target.href]:orderedTargets(found.route); if(!targets.length)return socket.destroy();
+  const target=vod?vod.target:joinTarget(targets[0],egress?`${found.prefix}${found.rest}`:found.rest,relaySearch), publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req), headers=stripAdminCredentials(strip(req.headers));
+  delete headers['x-forwarded-for']; delete headers.forwarded; delete headers['x-real-ip']; delete headers[EGRESS_HEADER]; delete headers[EGRESS_HOST_HEADER];
+  if(egress){headers[EGRESS_HEADER]=egressToken(found.route,Date.now());if(publicContext.host)headers[EGRESS_HOST_HEADER]=publicContext.host;}
+  else applyClientProfile(headers,found.route.clientProfile);
   if(publicContext.host)headers['x-forwarded-host']=publicContext.host; headers['x-forwarded-proto']=publicContext.proto;
   headers.host=target.host; headers.connection='Upgrade'; headers.upgrade=req.headers.upgrade;
   const transport=target.protocol==='https:'?https:http;
   // agent:false — an upgraded socket is hijacked for the WebSocket and must never return to a pool.
-  const up=transport.request({protocol:target.protocol,hostname:target.hostname,port:target.port,path:target.pathname+target.search,headers,servername:tlsServername(target.hostname),rejectUnauthorized:found.route.tlsVerify!==false,lookup:guardedLookup(found.route.allowPrivate),agent:false});
+  const up=transport.request({protocol:target.protocol,hostname:target.hostname,port:target.port,path:target.pathname+target.search,headers,servername:tlsServername(target.hostname),rejectUnauthorized:egress?true:found.route.tlsVerify!==false,lookup:guardedLookup(egress?false:found.route.allowPrivate),agent:false});
   // Unhandled socket errors on either leg would surface as an uncaught exception and restart the
   // whole relay, and a client that vanished used to leave the upstream socket open forever.
   let clientGone=false;

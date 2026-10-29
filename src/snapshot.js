@@ -50,7 +50,14 @@ function steering(value) {
     if(!id||url.protocol!=='https:'||url.username||url.password||url.pathname!=='/'||url.search||url.hash||url.origin!==base)throw new Error('invalid steering peer');
     return {id,base};
   });
-  return {mode:value.mode==='on'?'on':'shadow',peers,params:{minRateMbps:Math.max(0,Number(value.params?.minRateMbps||0))}};
+  return {mode:value.mode==='on'?'on':'shadow',peers,params:{minRateMbps:Math.max(0,Number(value.params?.minRateMbps||0)),...(value.params?.anyLine===true?{anyLine:true}:{})}};
+}
+
+function egress(value) {
+  const id=String(value?.id||''),base=String(value?.base||'');
+  let url;try{url=new URL(base)}catch{throw new Error('invalid egress machine')}
+  if(!id||url.protocol!=='https:'||url.username||url.password||url.pathname!=='/'||url.search||url.hash||url.origin!==base)throw new Error('invalid egress machine');
+  return {id,base};
 }
 
 function normalizeNode(route) {
@@ -80,7 +87,8 @@ function normalizeNode(route) {
     allowPrivate:route.allowPrivate===true,tlsVerify:route.tlsVerify!==false,
     showOnHome:route.showOnHome===true,clientProfile:clientProfile(route.clientProfile),streamRewrite:streamRewrite(route.streamRewrite),
     speedLimitMbps:Number(route.speedLimitMbps||0),monthlyQuotaGB:Number(route.monthlyQuotaGB||0),access,
-    ...(route.steering?{steering:steering(route.steering)}:{})
+    ...(route.steering?{steering:steering(route.steering)}:{}),
+    ...(route.egress?{egress:egress(route.egress)}:{})
   };
 }
 

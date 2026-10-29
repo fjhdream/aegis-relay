@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SteeringHub } from '../src/steering-hub.js';
 import { SteeringEngine } from '../src/steering.js';
-import { agentSnapshotNodes, agentSteeringIssues, cleanEntryRequest, desiredEntry, entryAttempt, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
+import { agentSnapshotNodes, agentSteeringIssues, cleanEntryRequest, desiredEntry, egressIssues, egressTopology, entryAttempt, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
 import { compileAgentDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
 
@@ -248,4 +248,30 @@ test('an entry setup is filed once per configuration and a failure is retried wi
   assert.equal(entryAttempt(desired,status('failed',2,9),now),3);
   assert.equal(entryAttempt(desired,status('failed',9,59),now),0);
   assert.equal(entryAttempt(desired,status('failed',9,60),now),10);
+});
+
+test('an egress machine is compiled into every other machine serving the node, and only when all of them can relay',()=>{
+  const {data,route}=fixture(),identity=generatePanelSigningIdentity();
+  data.agents[1].capabilities.push('egress-v1');
+  data.deployments=data.deployments.filter(item=>item.agentId!=='c');
+  route.egressAgentId='b';
+  assert.deepEqual(egressIssues(data,route),[]);
+  assert.deepEqual(egressTopology(data,route),{id:'b',base:'https://s2.example.com'});
+  assert.deepEqual(agentSnapshotNodes(data,'local')[0].egress,{id:'b',base:'https://s2.example.com'});
+  assert.equal(agentSnapshotNodes(data,'b')[0].egress,undefined,'the egress machine goes upstream itself');
+  assert.equal(agentSnapshotNodes(data,'local')[0].steering.params.anyLine,true,'line matching is moot through one egress');
+  // also in force with steering switched off: the point is a single upstream address
+  const off=structuredClone(data);off.settings.steering.mode='off';
+  assert.equal(compileAgentDesiredSnapshot({data:off,agentId:'local',signingIdentity:identity}).snapshot.nodes[0].egress.base,'https://s2.example.com');
+  // a machine serving the node that cannot relay would bring a second address back: not in force
+  data.deployments.push({agentId:'c',routeId:'n1',enabled:true});
+  assert.match(egressIssues(data,route).join(),/jp 的探针版本不支持统一出口/);
+  assert.equal(agentSnapshotNodes(data,'local')[0].egress,undefined);
+  data.deployments.pop();
+  assert.match(egressIssues(data,{...route,egressAgentId:'c'}).join(),/没有部署该节点/);
+  assert.match(egressIssues(data,{...route,egressAgentId:'gone'}).join(),/不存在/);
+  assert.match(egressIssues({...data,agents:data.agents.map(agent=>agent.id==='b'?{...agent,proxyMode:'ip'}:agent)},route).join(),/HTTPS/);
+  assert.match(egressIssues(data,{...route,accessMode:'alias_only',routeAuthKey:null}).join(),/连接密码/);
+  off.agents=off.agents.map(agent=>agent.id==='b'?{...agent,domain:'s2.example.com/x'}:agent);
+  assert.throws(()=>compileAgentDesiredSnapshot({data:off,agentId:'local',signingIdentity:identity}),/invalid egress machine/);
 });

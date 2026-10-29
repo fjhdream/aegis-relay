@@ -5,7 +5,7 @@ import { compileAgentDesiredSnapshot } from './snapshot.js';
 import { LOCAL_AGENT_ID, normalizeAgentDomain, replaceAgentDeployments } from './agent-registry.js';
 import { sealAgentSnapshot } from './agent-config.js';
 import { sanitizeTelemetry } from './telemetry.js';
-import { STEERING_CAPABILITY } from './steering.js';
+import { EGRESS_CAPABILITY, STEERING_CAPABILITY } from './steering.js';
 import { cleanEntryStatus, desiredEntry, ENTRY_CAPABILITY, readSteeringSettings } from './steering-topology.js';
 
 export const AGENT_PROTOCOL_VERSION=1;
@@ -62,7 +62,7 @@ export function consumeEnrollment(data,token,agentInput,now=Date.now()) {
 }
 
 // The parts of a machine record that feed the steering topology compiled into every snapshot.
-const steeringTopologyKey=agent=>`${Array.isArray(agent.capabilities)&&agent.capabilities.includes(STEERING_CAPABILITY)?1:0}|${agent.domain||''}|${agent.proxyMode||''}`;
+const steeringTopologyKey=agent=>{const has=name=>Array.isArray(agent.capabilities)&&agent.capabilities.includes(name)?1:0;return `${has(STEERING_CAPABILITY)}|${has(EGRESS_CAPABILITY)}|${agent.domain||''}|${agent.proxyMode||''}`};
 
 function cleanCapabilities(value) {
   return [...new Set((Array.isArray(value)?value:[]).map(item=>String(item)).filter(item=>/^[a-z0-9-]{1,32}$/.test(item)))].slice(0,16);
@@ -229,7 +229,7 @@ export class AgentApi {
         const agent=verified.agent,at=new Date().toISOString(),topologyBefore=steeringTopologyKey(agent);agent.lastSeen=at;agent.updatedAt=at;agent.agentVersion=String(parsed.agentVersion||agent.agentVersion||'unknown').slice(0,32);agent.applyState=['active','waiting','error'].includes(parsed.applyState)?parsed.applyState:'waiting';agent.proxyHealthy=parsed.proxyHealthy===true;agent.appliedRevision=Number.isSafeInteger(parsed.currentRevision)?Math.max(0,parsed.currentRevision):Number(agent.appliedRevision||0);agent.capabilities=cleanCapabilities(parsed.capabilities);agent.reportedDomain=normalizeAgentDomain(parsed.domain||'');agent.proxyMode=cleanProxyMode(parsed.proxyMode)||agent.proxyMode||(agent.domain?'domain':'ip');if(parsed.domainStatus&&typeof parsed.domainStatus==='object'){const d=parsed.domainStatus,mode=cleanProxyMode(d.mode)||'domain';agent.domainStatus={requestId:String(d.requestId||'').slice(0,80),state:['pending','applying','active','failed'].includes(d.state)?d.state:'failed',mode,desiredDomain:normalizeAgentDomain(d.desiredDomain||''),currentDomain:normalizeAgentDomain(d.currentDomain||''),message:String(d.message||'').slice(0,500),updatedAt:String(d.updatedAt||'').slice(0,40)};if(agent.domainStatus.state==='active'){agent.proxyMode=mode;agent.domain=agent.domainStatus.currentDomain||(mode==='ip'?agent.reportedDomain:agent.domain)||'';if(mode==='ip'){if(agent.desiredMode==='ip')delete agent.desiredMode;}else if(agent.desiredDomain===agent.domain){delete agent.desiredDomain;delete agent.desiredMode;}}}else if(agent.reportedDomain&&!agent.desiredDomain&&!agent.desiredMode)agent.domain=agent.reportedDomain;
         // An upgraded machine (new capability) or a changed domain reshapes which machines may steer a
         // node between them; recompile everyone's snapshot so the new peer list goes out right away.
-        if(steeringTopologyKey(agent)!==topologyBefore&&readSteeringSettings(this.store.data).mode!=='off'){this.invalidate();this.onTopologyChange?.();}
+        if(steeringTopologyKey(agent)!==topologyBefore&&(readSteeringSettings(this.store.data).mode!=='off'||this.store.data.routes.some(route=>route.egressAgentId))){this.invalidate();this.onTopologyChange?.();}
         if(parsed.entryStatus!==undefined)agent.entryStatus=cleanEntryStatus(parsed.entryStatus);
         if(parsed.telemetry!==undefined){const telemetry=sanitizeTelemetry(parsed.telemetry);if(!telemetry)throw Object.assign(new Error('invalid agent telemetry'),{status:400,nonce:requestNonce});agent.telemetry=telemetry;agent.lastTelemetryAt=at;}
         // Heartbeat state is disposable; the panel's periodic flush persists it. Writing the whole

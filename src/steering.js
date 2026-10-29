@@ -11,6 +11,10 @@ import { b64u } from './security.js';
 export const STEER_PARAM='aegis_steer';
 export const STEERING_CAPABILITY='steering-v1';
 export const STEERING_MODES=Object.freeze(['off','shadow','on']);
+// egress-v1: this machine relays a node's upstream traffic through the node's egress machine, and
+// recognises such relayed requests when it is the egress machine itself.
+export const EGRESS_CAPABILITY='egress-v1';
+export const EGRESS_HEADER='x-aegis-egress',EGRESS_HOST_HEADER='x-aegis-egress-host';
 export const VERDICTS=Object.freeze(['ok','starved_down','starved_up','unknown']);
 export const STEER_DEFAULTS=Object.freeze({
   hlsWindowMs:20_000,minHlsSegments:4,progressiveWindowTicks:120,verdictTtlMs:60_000,dwellMs:120_000,
@@ -113,6 +117,23 @@ export function clientIpOf(req) {
 export function prefixKeyFor(route, ip) {
   const key=steerKey(route),prefix=clientPrefix(ip);
   return key&&prefix?b64u(mac(key,'prefix',prefix).subarray(0,12)):'';
+}
+
+// A request one machine relays to the node's egress machine carries a short-lived proof derived from
+// the node key (which only the machines serving the node hold), plus the host the client used. The
+// egress machine then builds every link for that host and leaves steering and accounting to the relay.
+export function egressToken(route, nowMs) {
+  const key=steerKey(route);
+  return key?b64u(mac(key,'egress',String(Math.floor(nowMs/60_000))).subarray(0,16)):'';
+}
+
+export function relayedEgress(route, headers, nowMs) {
+  const key=steerKey(route),token=String(headers?.[EGRESS_HEADER]||''),host=String(headers?.[EGRESS_HOST_HEADER]||'').trim().toLowerCase();
+  if(!key||!/^[A-Za-z0-9_-]{22}$/.test(token)||!/^[a-z0-9.-]{1,253}(?::\d{1,5})?$/.test(host))return null;
+  const raw=Buffer.from(token,'base64url'),minute=Math.floor(nowMs/60_000);
+  // Machine clocks drift a little; a captured proof is stale within minutes.
+  for(let skew=-2;skew<=2;skew++)if(crypto.timingSafeEqual(raw,mac(key,'egress',String(minute+skew)).subarray(0,16)))return {host};
+  return null;
 }
 
 export function sealSteerToken(route, {epoch, issuedAtMs, target, sessionKey}) {
@@ -312,7 +333,10 @@ export class SteeringEngine {
     for(const peer of route.steering.peers||[]){
       if(peer.id===this.selfId){candidates.set(peer.id,{eligible:true,base:peer.base});continue;}
       const health=this.health.get(peer.id),routeHealth=health?.routes?.[route.id];
-      const eligible=!!(health&&health.healthy&&routeHealth&&!routeHealth.quotaExhausted&&Number(routeHealth.line)===line&&nowMs-health.at<=this.params.peerStaleMs);
+      // Same upstream line, so a seek lands on the Emby server holding the transcode — unless every
+      // machine reaches the upstream through the node's egress machine anyway.
+      const sameLine=route.steering.params?.anyLine===true||Number(routeHealth?.line)===line;
+      const eligible=!!(health&&health.healthy&&routeHealth&&!routeHealth.quotaExhausted&&sameLine&&nowMs-health.at<=this.params.peerStaleMs);
       candidates.set(peer.id,{eligible,base:peer.base});
     }
     if(!candidates.has(this.selfId))candidates.set(this.selfId,{eligible:true,base:''});

@@ -796,6 +796,8 @@ v1 必须保留协议字段，但可以暂不提供 UI。安全轮换需要：
 - 控制面根据 Agent `capabilities` 禁止发布其无法执行的配置；
 - v1 初始能力：`proxy-v1`、`metrics-v1`、`dual-key-v1`。
 - `steering-v1`（0.11.0）：机器运行自动切流引擎，可作为切流目标。只有声明该能力的机器才会在快照的节点里收到 `steering` 拓扑块，旧探针的快照内容与 hash 保持不变。
+- `entry-v1`（0.12.0）：机器自己配置自动切流的入口域名。面板在 check-in 响应里下发 `entry`（`{"domain","email","peers":[…]}`，不参与时为 `null`），探针在 check-in 请求里回报 `entryStatus`（`{"requestId","state","entryDomain","peers","attempt","message","updatedAt"}`）。见 [AUTO_STEERING.md](AUTO_STEERING.md) §4.2。
+- `egress-v1`（0.12.0）：机器能经节点的统一出口机器访问上游，并识别其他机器转发来的请求。快照节点里的 `egress` 块（`{"id","base"}`）只在所有部署该节点的机器都声明了该能力时下发。见 [AUTO_STEERING.md](AUTO_STEERING.md) §13.7。
 
 ## 25. 存储建议
 

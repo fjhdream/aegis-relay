@@ -229,6 +229,14 @@ test('automatic steering settings are validated before anything is written',asyn
   assert.equal((await call('GET',`/routes/${quiet.id}/channels`)).body.publicBaseUrl,direct);
   const steered=(await call('GET','/steering')).body.routes.find(r=>r.id===quiet.id);
   assert.deepEqual([steered.entryAddress,steered.issues.some(i=>/两台/.test(i))],[false,true]);
+  // An egress machine must exist; a rejected one leaves the node as it was.
+  assert.equal((await call('PATCH',`/routes/${quiet.id}`,{name:'renamed',egressAgentId:'nope'})).status,400);
+  assert.notEqual((await call('GET','/routes')).body.routes.find(r=>r.id===quiet.id).name,'renamed');
+  assert.equal((await call('PATCH',`/routes/${quiet.id}`,{egressAgentId:'local'})).body.route.egressAgentId,'local');
+  // quiet has no connection password, so there is no node key to prove a relayed request with.
+  const egress=(await call('GET','/steering')).body.routes.find(r=>r.id===quiet.id);
+  assert.deepEqual([egress.egressActive,egress.egressIssues.some(i=>/连接密码/.test(i))],[false,true]);
+  assert.equal((await call('PATCH',`/routes/${quiet.id}`,{egressAgentId:''})).body.route.egressAgentId,'');
   assert.equal((await call('PATCH','/agents/local',{steerTarget:false})).status,200);
   assert.match((await call('GET','/steering')).body.machines.find(m=>m.id==='local').issues.join(),/已关闭/);
 });

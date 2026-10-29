@@ -1,6 +1,6 @@
 import { isRouteAuthKey } from './route-auth.js';
 import { LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
-import { STEERING_CAPABILITY, STEERING_MODES } from './steering.js';
+import { EGRESS_CAPABILITY, STEERING_CAPABILITY, STEERING_MODES } from './steering.js';
 
 // Which machines may steer a node between them, and the settings behind it. Compiled into each
 // machine's signed snapshot, so only static topology lives here; liveness travels over the steering sync.
@@ -94,18 +94,50 @@ function steeringPeers(data, route, settings) {
 
 export function steeringTopology(data, route, settings=readSteeringSettings(data)) {
   if(settings.mode==='off'||routeSteeringIssues(data,route,settings).length)return null;
-  return {mode:settings.mode,peers:steeringPeers(data,route,settings),params:{minRateMbps:Math.max(0,Number(route.autoSteer.minRateMbps||0))}};
+  const params={minRateMbps:Math.max(0,Number(route.autoSteer.minRateMbps||0)),...(egressTopology(data,route)?{anyLine:true}:{})};
+  return {mode:settings.mode,peers:steeringPeers(data,route,settings),params};
+}
+
+const deployingAgents=(data,route)=>{
+  const deployed=new Set((Array.isArray(data.deployments)?data.deployments:[]).filter(item=>item.routeId===route.id&&item.enabled!==false).map(item=>item.agentId));
+  return (Array.isArray(data.agents)?data.agents:[]).filter(agent=>deployed.has(agent.id)&&agent.state!=='revoked');
+};
+const knowsEgress=agent=>agent.id===LOCAL_AGENT_ID||(Array.isArray(agent.capabilities)&&agent.capabilities.includes(EGRESS_CAPABILITY));
+
+// A unified upstream egress: every machine serving the node relays its upstream traffic through one of
+// them, so the upstream sees a single address however clients are spread or steered. It is only in
+// force when every machine serving the node can take part — a single older machine fetching on its
+// own would quietly bring the second address back.
+export function egressIssues(data, route) {
+  const id=String(route?.egressAgentId||'');
+  if(!id)return [];
+  const machines=deployingAgents(data,route),egress=machines.find(agent=>agent.id===id),issues=[];
+  if(!egress)return [(Array.isArray(data.agents)?data.agents:[]).some(agent=>agent.id===id&&agent.state!=='revoked')?'统一出口机器没有部署该节点':'统一出口机器不存在或已撤销'];
+  const domain=String(egress.domain||'');
+  if(!domain||(egress.id!==LOCAL_AGENT_ID&&egress.proxyMode==='ip'))issues.push('统一出口机器没有 HTTPS 直连域名');
+  if(route.accessMode==='alias_only'||!isRouteAuthKey(route.routeAuthKey))issues.push('统一出口需要开启连接密码');
+  const old=machines.filter(agent=>!knowsEgress(agent)).map(agent=>agent.name||agent.id);
+  if(old.length)issues.push(`${old.join('、')} 的探针版本不支持统一出口，需要升级`);
+  return issues;
+}
+
+export function egressTopology(data, route) {
+  if(!route?.egressAgentId||egressIssues(data,route).length)return null;
+  const egress=(data.agents||[]).find(agent=>agent.id===route.egressAgentId);
+  return {id:egress.id,base:`https://${String(egress.domain).toLowerCase()}`};
 }
 
 // The node list compiled into a machine's snapshot. A node only carries a steering block on machines
-// that are themselves part of its topology; everything else compiles exactly as before, so enabling
-// nothing changes no snapshot hash.
+// that are themselves part of its topology, and an egress block on every machine but the egress
+// itself; everything else compiles exactly as before, so enabling nothing changes no snapshot hash.
 export function agentSnapshotNodes(data, agentId) {
   const routes=routesForAgent(data,agentId),settings=readSteeringSettings(data);
-  if(settings.mode==='off')return routes;
   return routes.map(route=>{
-    const topology=steeringTopology(data,route,settings);
-    return topology&&topology.peers.some(peer=>peer.id===agentId)?{...route,steering:topology}:route;
+    const topology=settings.mode==='off'?null:steeringTopology(data,route,settings),egress=egressTopology(data,route);
+    let node=route;
+    if(topology&&topology.peers.some(peer=>peer.id===agentId))node={...node,steering:topology};
+    if(egress&&egress.id!==agentId)node={...node,egress};
+    return node;
   });
 }
 
