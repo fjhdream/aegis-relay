@@ -5,12 +5,16 @@ import zlib from 'node:zlib';
 import { pipeline, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import dnsPromises from 'node:dns/promises';
+import net from 'node:net';
 import { isPrivateIP } from './security.js';
 import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-auth.js';
 import { ThrottleTransform } from './metrics.js';
 import { guardedLookup } from './lookup.js';
 import { stripSteerParam } from './steering.js';
 
+// SNI carries host names only. Node 22 merely warns about an IP address there (DEP0123); newer Node
+// rejects the request outright, which broke every HTTPS upstream configured by IP.
+function tlsServername(hostname){const host=String(hostname||'').replace(/^\[|\]$/g,'');return net.isIP(host)?undefined:host;}
 const HOP = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
 const RETRY_STATUS = new Set([502, 503, 504]);
 const RELAY_REDIRECT_SEGMENT = '.aegis-relay';
@@ -551,7 +555,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
       const usesPool=!!pool;
       requestHeaders.connection=usesPool?'keep-alive':'close';
       const tlsKey=secure?tlsSessionKey(target):'';
-      const options={protocol:target.protocol,hostname:target.hostname,port:target.port,method:req.method,path:target.pathname+target.search,headers:requestHeaders,servername:target.hostname,rejectUnauthorized:route.tlsVerify!==false,lookup:guardedLookup(route.allowPrivate),highWaterMark:RELAY_HIGH_WATER_MARK,agent:pool||false};
+      const options={protocol:target.protocol,hostname:target.hostname,port:target.port,method:req.method,path:target.pathname+target.search,headers:requestHeaders,servername:tlsServername(target.hostname),rejectUnauthorized:route.tlsVerify!==false,lookup:guardedLookup(route.allowPrivate),highWaterMark:RELAY_HIGH_WATER_MARK,agent:pool||false};
       // Pooled agents handle TLS resumption themselves. The one-shot recovery/failover sockets fall
       // back to the shared session cache so even a fresh connection skips the full handshake.
       if(secure&&!usesPool){ const sess=tlsSessions.get(tlsKey); if(sess)options.session=sess; }
@@ -760,7 +764,7 @@ export function handleUpgrade(req, socket, head, routeSource, key) {
   headers.host=target.host; headers.connection='Upgrade'; headers.upgrade=req.headers.upgrade;
   const transport=target.protocol==='https:'?https:http;
   // agent:false — an upgraded socket is hijacked for the WebSocket and must never return to a pool.
-  const up=transport.request({protocol:target.protocol,hostname:target.hostname,port:target.port,path:target.pathname+target.search,headers,servername:target.hostname,rejectUnauthorized:found.route.tlsVerify!==false,lookup:guardedLookup(found.route.allowPrivate),agent:false});
+  const up=transport.request({protocol:target.protocol,hostname:target.hostname,port:target.port,path:target.pathname+target.search,headers,servername:tlsServername(target.hostname),rejectUnauthorized:found.route.tlsVerify!==false,lookup:guardedLookup(found.route.allowPrivate),agent:false});
   // Unhandled socket errors on either leg would surface as an uncaught exception and restart the
   // whole relay, and a client that vanished used to leave the upstream socket open forever.
   let clientGone=false;

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SteeringHub } from '../src/steering-hub.js';
 import { SteeringEngine } from '../src/steering.js';
-import { agentSnapshotNodes, agentSteeringIssues, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
+import { agentSnapshotNodes, agentSteeringIssues, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
 import { compileAgentDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
 
@@ -64,6 +64,22 @@ test('entry domains are validated and only steered nodes are handed out on them'
   const {data,route}=fixture();
   assert.equal(steeringEntryBaseUrl(data,route),'https://entry.example.com');
   assert.equal(steeringEntryBaseUrl(data,{...route,autoSteer:{enabled:false}}),'');
+  assert.equal(steeringEntryBaseUrl({...data,settings:{steering:{mode:'off',entryDomain:'entry.example.com'}}},route),'','not while steering is off');
+  assert.equal(steeringEntryBaseUrl(data,{...route,speedLimitMbps:5}),'','not for a node that cannot steer');
+});
+
+test('the entry address is only handed out when every machine behind the entry domain serves the node',()=>{
+  const {data,route}=fixture();
+  // A third participating machine serves the entry domain but not this node: a client sent there would get 404.
+  data.agents.push({id:'d',name:'sg',domain:'s4.example.com',proxyMode:'domain',state:'active',capabilities:['steering-v1']});
+  assert.deepEqual(entryCoverageGaps(data,route).map(agent=>agent.id),['d']);
+  assert.equal(steeringEntryBaseUrl(data,route),'');
+  data.deployments.push({agentId:'d',routeId:'n1',enabled:true});
+  assert.deepEqual(entryCoverageGaps(data,route),[]);
+  assert.equal(steeringEntryBaseUrl(data,route),'https://entry.example.com');
+  // A machine that opted out does not serve the entry domain, so it leaves no gap.
+  data.deployments.pop();data.agents.at(-1).steerTarget=false;
+  assert.equal(steeringEntryBaseUrl(data,route),'https://entry.example.com');
 });
 
 test('the hub keeps each machine to its own score and arbitrates reassignments by epoch',()=>{
