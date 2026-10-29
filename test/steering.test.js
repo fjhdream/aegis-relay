@@ -25,6 +25,8 @@ test('requests are classified so only the stream itself is steered',()=>{
   assert.equal(requestKind('/LiveTV/LiveStreamFiles/x/stream.ts'),'other');
   assert.equal(itemOf('/emby/Videos/ABC123/stream'),'abc123');
   assert.equal(itemOf('/Items/77/Download'),'77');
+  assert.equal(itemOf('/emby/play/video/ABC123'),'abc123');
+  assert.equal(itemOf('/play/audio/ABC123/stream'),'abc123');
 });
 
 test('session keys are stable per playback, differ per device and need a playback identity',()=>{

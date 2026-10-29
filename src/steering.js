@@ -26,6 +26,7 @@ export const STEER_DEFAULTS=Object.freeze({
 
 const SESSION_KEY_RE=/^[A-Za-z0-9_-]{22}$/,PREFIX_KEY_RE=/^[A-Za-z0-9_-]{16}$/;
 const ITEM_RE=/\/(?:emby\/)?(?:videos|audio)\/([^/]+)\//i;
+const PLAY_RE=/\/(?:emby\/)?play\/(?:video|audio)\/([^/]+)(?:\/|$)/i;
 const DOWNLOAD_RE=/\/items\/([^/]+)\/download/i;
 // Side files of a playback (subtitles, images, trickplay) are tiny, parallel and not the stream itself:
 // steering them would only scramble the timing the measurements rely on.
@@ -77,7 +78,7 @@ export function playIdentity(req, incoming) {
 }
 
 export function itemOf(rest) {
-  const match=ITEM_RE.exec(rest)||DOWNLOAD_RE.exec(rest);
+  const match=ITEM_RE.exec(rest)||PLAY_RE.exec(rest)||DOWNLOAD_RE.exec(rest);
   return match?clip(match[1]).toLowerCase():'';
 }
 
@@ -345,15 +346,15 @@ export class SteeringEngine {
 
   // Decide where a playback request is served. Returns null when steering does not apply at all,
   // {redirect} to send the client to a peer, or {track, range} to serve it here.
-  plan({route, found, req, incoming, publicContext}) {
+  plan({route, found, req, incoming, publicContext, source}) {
     const topology=route?.steering;
     if(!topology||(topology.mode!=='shadow'&&topology.mode!=='on'))return null;
     if(req.method!=='GET'||publicContext?.proto!=='https'||req.headers.authorization)return null;
-    const kind=requestKind(found.rest);
+    const streamPath=source?.pathname||found.rest,kind=requestKind(streamPath);
     if(kind==='other')return null;
-    const identity=playIdentity(req,incoming);
+    const identity=playIdentity(req,source||incoming);
     if(this.clientExcluded(identity))return null;
-    const nowMs=this.now(),item=itemOf(found.rest),token=steerTokenOf(incoming.search),itemKey=item?`${route.id}\n${item}`:'';
+    const nowMs=this.now(),item=itemOf(streamPath),token=steerTokenOf(incoming.search),itemKey=item?`${route.id}\n${item}`:'';
     const landed=token?openSteerToken(route,token,{self:this.selfId,nowMs,ttlMs:this.params.tokenTtlMs}):null;
     const key=landed?.sessionKey||sessionKeyFor(route,item,identity)||(itemKey&&this.items.get(itemKey)?.key)||'';
     if(!key)return null;

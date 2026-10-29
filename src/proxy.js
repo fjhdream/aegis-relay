@@ -10,7 +10,7 @@ import { isPrivateIP } from './security.js';
 import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-auth.js';
 import { ThrottleTransform } from './metrics.js';
 import { guardedLookup } from './lookup.js';
-import { EGRESS_HEADER, EGRESS_HOST_HEADER, egressToken, relayedEgress, stripSteerParam } from './steering.js';
+import { EGRESS_HEADER, EGRESS_HOST_HEADER, egressToken, itemOf, relayedEgress, stripSteerParam } from './steering.js';
 
 // SNI carries host names only. Node 22 merely warns about an IP address there (DEP0123); newer Node
 // rejects the request outright, which broke every HTTPS upstream configured by IP.
@@ -151,7 +151,7 @@ function normalizedUpstreams(route) {
 }
 
 function isPlaybackPath(pathname) {
-  return /\/(?:emby\/)?(?:Videos|Audio|LiveTV)\//i.test(pathname) || /\/Items\/[^/]+\/Download/i.test(pathname);
+  return /\/(?:emby\/)?(?:Videos|Audio|LiveTV)\//i.test(pathname) || !!itemOf(pathname);
 }
 
 function contentRange(value) {
@@ -442,10 +442,10 @@ function redirectAad(route) {
   return Buffer.from(`AegisRelay:redirect:v1:${route.id||route.alias}`,'utf8');
 }
 
-function sealRedirectTarget(route, target, appKey, playback) {
+function sealRedirectTarget(route, target, appKey, playback, source) {
   const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',redirectSecret(route,appKey),iv);
   cipher.setAAD(redirectAad(route));
-  const encrypted=Buffer.concat([cipher.update(JSON.stringify({target:target.href,playback:playback===true}),'utf8'),cipher.final()]);
+  const encrypted=Buffer.concat([cipher.update(JSON.stringify({target:target.href,playback:playback===true,...(playback&&source?{source}:{})}),'utf8'),cipher.final()]);
   return Buffer.concat([iv,cipher.getAuthTag(),encrypted]).toString('base64url');
 }
 
@@ -457,7 +457,7 @@ function openRedirectTarget(route, token, appKey) {
   const decoded=JSON.parse(Buffer.concat([decipher.update(payload.subarray(28)),decipher.final()]).toString('utf8'));
   const target=new URL(decoded.target);
   if(!['http:','https:'].includes(target.protocol)||target.username||target.password)throw new Error('invalid redirect relay target');
-  return {target,playback:decoded.playback===true};
+  return {target,playback:decoded.playback===true,source:typeof decoded.source==='string'?decoded.source:null};
 }
 
 function continuationTarget(found, appKey) {
@@ -467,8 +467,8 @@ function continuationTarget(found, appKey) {
   return openRedirectTarget(found.route,parts[1],appKey);
 }
 
-function publicRelayLocation(found, target, context, appKey, playback) {
-  const token=sealRedirectTarget(found.route,target,appKey,playback),path=`${found.prefix}/${RELAY_REDIRECT_SEGMENT}/${token}`;
+function publicRelayLocation(found, target, context, appKey, playback, source) {
+  const token=sealRedirectTarget(found.route,target,appKey,playback,source),path=`${found.prefix}/${RELAY_REDIRECT_SEGMENT}/${token}`;
   return context.host?`${context.proto}://${context.host}${path}`:path;
 }
 
@@ -513,6 +513,9 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
       catch { res.writeHead(404,{'cache-control':'no-store'});return res.end('not found'); }
     }
     const playback=continuation?.playback===true||!!vod||isPlaybackPath(found.rest)||(!!egress&&/\/\.aegis-(?:relay|vod)\//.test(found.rest));
+    // CDN URLs often contain no item/session identifiers. Keep the original stream URL inside the
+    // encrypted continuation so range requests and peer redirects remain one playback session.
+    const playbackSource=continuation?.source||`${found.rest}${search}`;
     const configured=egress?[egress.base]:continuation?[continuation.target.href]:vod?[vod.target.href]:orderedTargets(route);
     // A relayed request was counted, logged and quota-checked by the machine the client talks to.
     if(!relayed&&metrics&&!metrics.canServe(route)){res.writeHead(509,{'cache-control':'no-store','retry-after':'3600'});return res.end('monthly traffic quota exceeded');}
@@ -525,7 +528,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     // host the client actually used, so every link it carries leads back to that machine.
     const publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req);
     // Automatic steering: serve here, or send this playback request to a peer machine's direct domain.
-    const steer=playback&&!relayed&&route.steering&&steering?steering.plan({route,found,req,incoming,publicContext}):null;
+    const steer=playback&&!relayed&&route.steering&&steering?steering.plan({route,found,req,incoming,publicContext,source:continuation?.source?new URL(continuation.source,'http://relay.invalid'):undefined}):null;
     if (steer?.redirect) { metricDone?.(302,0,false); res.writeHead(302,{location:steer.redirect,'cache-control':'no-store','referrer-policy':'no-referrer'}); return res.end(); }
     const track=steer?.track||null;
     track?.attach(res);
@@ -589,9 +592,9 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
               const redirectedPath=externalRedirectPath(loc,base);
               // Keep ordinary login/navigation redirects readable. A redirect outside the configured
               // upstream base is wrapped below so the client must return through this relay.
-              out.location=redirectedPath===null?publicRelayLocation(found,loc,publicContext,key,playback):(publicContext.host?`${publicContext.proto}://${publicContext.host}${found.prefix}${redirectedPath}${loc.search}${loc.hash}`:`${found.prefix}${redirectedPath}${loc.search}${loc.hash}`);
+              out.location=redirectedPath===null?publicRelayLocation(found,loc,publicContext,key,playback,playbackSource):(publicContext.host?`${publicContext.proto}://${publicContext.host}${found.prefix}${redirectedPath}${loc.search}${loc.hash}`:`${found.prefix}${redirectedPath}${loc.search}${loc.hash}`);
             }
-            else out.location=publicRelayLocation(found,loc,publicContext,key,playback);
+            else out.location=publicRelayLocation(found,loc,publicContext,key,playback,playbackSource);
           }
           catch { delete out.location; }
         }

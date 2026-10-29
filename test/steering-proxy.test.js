@@ -70,6 +70,54 @@ test('a VidHub direct-play session appears in the hub before its first speed ver
   } finally { await cleanup(); }
 });
 
+test('Rex custom video paths retain their steering identity through encrypted CDN redirects',async()=>{
+  let relayA,relayB,a,b;
+  const seen=[];
+  const cdn=http.createServer((req,res)=>{
+    seen.push(req.headers.range);
+    const match=/^bytes=(\d+)-(\d*)$/.exec(req.headers.range||'');
+    const start=Number(match?.[1]||0),end=match?.[2]?Number(match[2]):31;
+    const body=Buffer.alloc(end-start+1,0x41);
+    res.writeHead(206,{'content-type':'video/mp4','content-range':`bytes ${start}-${end}/32`,'content-length':body.length});res.end(body);
+  });
+  const origin=http.createServer((_req,res)=>{res.writeHead(302,{location:`http://127.0.0.1:${cdn.address().port}/opaque.mp4?sig=private`});res.end()});
+  try{
+    await listen(cdn);const up=await listen(origin),routeAuthKey=newRouteAuthKey();
+    const route={id:'rex',alias:'movie',enabled:true,accessMode:'key',authVersion:ROUTE_AUTH_VERSION,routeAuthKey,keyDigest:routeTokenDigest('key123',routeAuthKey),upstreams:[`http://127.0.0.1:${up}`],allowPrivate:true,
+      steering:{mode:'on',peers:[{id:'a',base:'https://a.example.com'},{id:'b',base:'https://b.example.com'}],params:{minRateMbps:0}}};
+    a=new SteeringEngine({selfId:'a'});b=new SteeringEngine({selfId:'b'});
+    for(const engine of [a,b]){engine.bounded.add('rex');engine.boundBytes=8;}
+    relayA=http.createServer(makeProxyHandler({getRoutes:()=>[route]},deriveKey('s'.repeat(32)),null,a));
+    relayB=http.createServer(makeProxyHandler({getRoutes:()=>[route]},deriveKey('t'.repeat(32)),null,b));
+    const portA=await listen(relayA),portB=await listen(relayB);
+    const headers={'user-agent':'Rex-Standard/1.0.2','x-emby-authorization':'MediaBrowser Client="Rex", DeviceId="rex-device"','x-emby-token':'test',range:'bytes=0-'};
+    const first=await get(portA,'/movie/key123/emby/play/video/abc?api_key=test&MediaSourceId=source1',headers);
+    assert.equal(first.status,302);
+    assert.equal(a.sessions.size,1,'the actual Rex video path must establish a steering session');
+    const session=[...a.sessions.values()][0],location=new URL(first.headers.location),path=location.pathname+location.search;
+    assert(!first.headers.location.includes('private'),'upstream credentials stay encrypted');
+    const streamed=await get(portA,path,headers);
+    assert.equal(streamed.status,206);assert.equal(streamed.headers['content-range'],'bytes 0-7/32');
+    assert.equal(a.sessions.size,1,'the CDN continuation belongs to the original playback');
+    await get(portA,path,{...headers,range:'bytes=8-'});
+    assert(a.syncPayload([route]).bounds.some(result=>result.client==='Rex'&&result.continued));
+    session.scores.a={verdict:'starved_down',rateBps:1,at:a.now()};
+    a.health.set('b',{healthy:true,at:a.now(),routes:{rex:{line:0,quotaExhausted:false}}});
+    const moved=await get(portA,path,{...headers,range:'bytes=16-'});
+    assert.equal(moved.status,302);
+    const target=new URL(moved.headers.location);
+    assert.equal(target.origin,'https://b.example.com');
+    const landed=await get(portB,target.pathname+target.search,{...headers,range:'bytes=16-'});
+    assert.equal(landed.status,206);assert.equal(landed.headers['content-range'],'bytes 16-23/32');
+    assert.deepEqual(seen,['bytes=0-7','bytes=8-15','bytes=16-23']);
+    assert.equal([...b.sessions.values()][0].key,session.key);
+    assert.equal(b.syncPayload([route]).landings.length,1);
+  }finally{
+    a?.stop();b?.stop();
+    await Promise.all([relayA&&close(relayA),relayB&&close(relayB),close(origin),close(cdn)]);
+  }
+});
+
 test('a node without steering still strips a stray steer token and is never redirected',async()=>{
   const {seen,route,portA,cleanup}=await setup();
   try {
