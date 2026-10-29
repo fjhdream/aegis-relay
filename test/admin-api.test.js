@@ -205,3 +205,23 @@ test('a rejected update leaves the node and the machine exactly as they were',as
   const applied=await call('PATCH',`/routes/${edge.id}`,{name:'renamed',allowPrivate:true,alias:'edge-2'});
   assert.deepEqual([applied.status,applied.body.route.name,applied.body.route.alias],[200,'renamed','edge-2']);
 });
+
+test('automatic steering settings are validated before anything is written',async()=>{
+  const initial=(await call('GET','/steering')).body;
+  assert.equal(initial.settings.mode,'off');
+  assert.equal((await call('PUT','/steering',{mode:'fast'})).status,400);
+  assert.equal((await call('PUT','/steering',{mode:'shadow',entryDomain:'panel.example.com'})).status,409);
+  assert.equal((await call('PUT','/steering',{mode:'shadow',entryDomain:'entry.example.com:8443'})).status,400);
+  assert.equal((await call('GET','/steering')).body.settings.mode,'off','a rejected request leaves the mode alone');
+  const saved=await call('PUT','/steering',{mode:'shadow',entryDomain:'https://Entry.Example.com/',boundMB:4});
+  assert.equal(saved.status,200);
+  assert.deepEqual([saved.body.settings.mode,saved.body.settings.entryDomain,saved.body.settings.boundMB],['shadow','entry.example.com',8]);
+  assert.deepEqual(saved.body.entryCommands.map(item=>item.command),[`sudo aegis-relay entry entry.example.com ${saved.body.certificateEmail}`]);
+  // A node opted in is handed out on the entry domain; the machine toggle shows up as an issue.
+  const quiet=(await call('GET','/routes')).body.routes.find(r=>r.alias==='quiet');
+  const patched=await call('PATCH',`/routes/${quiet.id}`,{autoSteer:{enabled:true,minRateMbps:-1}});
+  assert.deepEqual(patched.body.route.autoSteer,{enabled:true,minRateMbps:0});
+  assert.equal((await call('GET',`/routes/${quiet.id}/channels`)).body.publicBaseUrl,'https://entry.example.com');
+  assert.equal((await call('PATCH','/agents/local',{steerTarget:false})).status,200);
+  assert.match((await call('GET','/steering')).body.machines.find(m=>m.id==='local').issues.join(),/已关闭/);
+});

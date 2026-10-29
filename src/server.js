@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cleanAlias, deriveKey, hashPassword, newTotpSecret, randomToken, RateLimiter, requestIp, tokenDigest, verifyPassword, verifyTotp, timingEqual } from './security.js';
 import { Store } from './store.js';
-import { dropRouteRuntime, getRuntimeStatus, handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS, validateUpstreamList } from './proxy.js';
+import { activeUpstreamLine, dropRouteRuntime, getRuntimeStatus, handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS, validateUpstreamList } from './proxy.js';
 import { Metrics } from './metrics.js';
 import { diagnoseRoute } from './diagnostics.js';
 import { Notifier } from './notifier.js';
@@ -20,6 +20,9 @@ import { createDashboardFeed } from './dashboard-feed.js';
 import { activeLocalDomain, baseHostname, domainRequestRole, readDomainStatus, requestDomainSwitch } from './domain-control.js';
 import { qrRows } from './qr.js';
 import { fetchPanelIcon, MAX_ICON_BYTES, normalizePanelIcon } from './panel-icon.js';
+import { SteeringEngine, STEERING_MODES } from './steering.js';
+import { SteeringHub } from './steering-hub.js';
+import { agentSteeringIssues, normalizeClientList, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const APP_VERSION=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8')).version;
@@ -36,7 +39,12 @@ const configuredLocalDomain=activeLocalDomain(cfg);
 const localRecord=store.data.agents.find(agent=>agent.id===LOCAL_AGENT_ID);
 if(localRecord&&configuredLocalDomain&&localRecord.domain!==configuredLocalDomain){localRecord.domain=configuredLocalDomain;localRecord.updatedAt=new Date().toISOString();store.save();}
 const localAgent = new LocalAgent({store}); localAgent.start();
-const agentApi = new AgentApi({store,version:APP_VERSION});
+// Automatic steering: the hub arbitrates sessions across machines; a client type that keeps failing to
+// follow steering redirects is excluded for good (until the operator clears it).
+const steeringHub = new SteeringHub({store,onAutoExclude:client=>{const settings=steeringSettings(store.data);if(Object.keys(settings.autoExcluded).some(item=>item.toLowerCase()===client.toLowerCase()))return;settings.autoExcluded[client]=new Date().toISOString();store.audit('steering.client_auto_excluded','system',client);store.save();}});
+// A machine's capabilities or domain feed every node's steering topology, so a change there recompiles
+// the local snapshot too (remote ones are recompiled by the API itself).
+const agentApi = new AgentApi({store,version:APP_VERSION,steering:steeringHub,onTopologyChange:()=>localAgent.reconcile()});
 const metrics = new Metrics(store);
 // Stats for nodes deleted by earlier versions were never removed; sweep them once at boot.
 metrics.retainOnly(store.data.routes.map(route=>route.id||route.alias));
@@ -100,7 +108,8 @@ function newChannel(label,accessKey){const key=connectionKey(accessKey),routeAut
 function channelList(r){return routeChannels(r).map(ch=>({id:ch.id,label:ch.label||(ch.id==='default'?'默认':''),createdAt:ch.createdAt||r.createdAt||null,isDefault:ch.id==='default'}));}
 // Channel list WITH each channel's client URL (for the operator to copy and hand out).
 function channelCredentials(r){return routeChannels(r).map(ch=>({id:ch.id,label:ch.label||(ch.id==='default'?'默认':''),isDefault:ch.id==='default',clientPath:ch.accessKey?`/${r.alias}/${ch.accessKey}/`:`/${r.alias}/`}));}
-function publicRoute(r) { return { id:r.id, alias:r.alias, name:r.name, enabled:r.enabled, upstreams:routeUpstreams(r), allowPrivate:r.allowPrivate, tlsVerify:r.tlsVerify, accessMode:r.accessMode||'key', authMigrationRequired:r.authMigrationRequired===true, showOnHome:r.showOnHome===true, clientProfile:r.clientProfile||{enabled:false},streamRewrite:r.streamRewrite||{enabled:false,domains:[]},tags:r.tags||[],notes:r.notes||'',favorite:r.favorite===true,sortOrder:Number(r.sortOrder||0),speedLimitMbps:Number(r.speedLimitMbps||0),monthlyQuotaGB:Number(r.monthlyQuotaGB||0),reminderDays:Number(r.reminderDays||0),accessAlertThreshold:Number(r.accessAlertThreshold||0),channels:channelList(r),reminderLastAt:r.reminderLastAt||null,createdAt:r.createdAt,updatedAt:r.updatedAt }; }
+function cleanAutoSteer(value={}){if(!value||typeof value!=='object')return{enabled:false,minRateMbps:0};return{enabled:value.enabled===true,minRateMbps:numeric(value.minRateMbps,0,100000)}}
+function publicRoute(r) { return { id:r.id, alias:r.alias, name:r.name, enabled:r.enabled, upstreams:routeUpstreams(r), allowPrivate:r.allowPrivate, tlsVerify:r.tlsVerify, accessMode:r.accessMode||'key', authMigrationRequired:r.authMigrationRequired===true, showOnHome:r.showOnHome===true, clientProfile:r.clientProfile||{enabled:false},streamRewrite:r.streamRewrite||{enabled:false,domains:[]},autoSteer:r.autoSteer||{enabled:false,minRateMbps:0},tags:r.tags||[],notes:r.notes||'',favorite:r.favorite===true,sortOrder:Number(r.sortOrder||0),speedLimitMbps:Number(r.speedLimitMbps||0),monthlyQuotaGB:Number(r.monthlyQuotaGB||0),reminderDays:Number(r.reminderDays||0),accessAlertThreshold:Number(r.accessAlertThreshold||0),channels:channelList(r),reminderLastAt:r.reminderLastAt||null,createdAt:r.createdAt,updatedAt:r.updatedAt }; }
 function localDomainStatus(){const status=readDomainStatus(cfg.dataFile);if(!status)return null;if(status.state==='active'&&status.currentDomain&&status.currentDomain!==configuredLocalDomain)return{...status,state:'applying',message:'Nginx 已切换，面板服务正在重新载入配置'};return status}
 // A switch that finished and already matches the live endpoint is not news: the "当前生效域名"
 // field and the sync pill already show it, so surfacing a permanent green "已生效" banner is just
@@ -114,7 +123,18 @@ function agentView(agent){const view=publicAgent(agent,store.data,agent.id===LOC
 function clientBaseUrl(){return cfg.localProxyBaseUrl||cfg.publicBaseUrl}
 // A node deployed to a remote agent is distributed on that agent's own domain/IP, not the panel's, so
 // its shown client address must reflect that entry (falling back to the panel when served locally).
-function routeBaseUrl(route){return routeEntryBaseUrl(store.data,route.id,clientBaseUrl())}
+// A steered node is handed out on the shared entry domain, which every participating machine serves.
+function routeBaseUrl(route){return steeringEntryBaseUrl(store.data,route)||routeEntryBaseUrl(store.data,route.id,clientBaseUrl())}
+// What the 自动切流 page needs: settings, per-machine/per-node readiness, the entry-domain command each
+// machine has to run once, and the live view from the hub.
+function steeringView(){
+  const settings=steeringSettings(store.data),agents=store.data.agents.map(agentView).sort((a,b)=>a.sortOrder-b.sortOrder);
+  const machines=store.data.agents.filter(agent=>agent.state!=='revoked').map(agent=>{const view=agents.find(item=>item.id===agent.id)||{};return{id:agent.id,name:agent.name||agent.id,domain:view.domain||agent.domain||'',local:agent.id===LOCAL_AGENT_ID,status:view.status,agentVersion:view.agentVersion||'',steerTarget:agent.steerTarget!==false,issues:agentSteeringIssues({...agent,domain:view.domain||agent.domain},settings)}});
+  const ready=machines.filter(machine=>!machine.issues.length),email=store.data.settings.certificateEmail||'';
+  const entryCommands=settings.entryDomain&&email?ready.map(machine=>{const peers=ready.filter(other=>other.id!==machine.id).map(other=>other.domain);return{id:machine.id,name:machine.name,command:`sudo ${machine.local?'aegis-relay':'aegis-relay-agent'} entry ${settings.entryDomain} ${email}${peers.length?` ${peers.join(' ')}`:''}`}}):[];
+  const routes=store.data.routes.map(route=>({id:route.id,alias:route.alias,name:route.name,enabled:route.autoSteer?.enabled===true,issues:routeSteeringIssues(store.data,route,settings)}));
+  return {settings:{mode:settings.mode,entryDomain:settings.entryDomain,excludedClients:settings.excludedClients,autoExcluded:settings.autoExcluded,boundedClients:settings.boundedClients,boundMB:settings.boundMB},certificateEmail:email,machines,routes,entryCommands,live:steeringHub.view()};
+}
 function credentialsFor(route,accessKey){return{...clientCredentials(route,accessKey),publicBaseUrl:routeBaseUrl(route)}}
 function checkedAlias(value){const alias=cleanAlias(value);if(['r','api','gateway','app','index','index.html','favicon.ico'].includes(alias))throw new Error('alias is reserved');return alias;}
 function machineTelemetryList(){
@@ -152,13 +172,13 @@ function publishRoutes(){localAgent.reconcile();agentApi.invalidate();}
 function buildRoute(input,{alias,upstreams,accessMode,accessKey,enabled}){
   const now=new Date().toISOString();
   return {id:randomToken(12),alias,name:String(input.name||alias).slice(0,80),upstreams,allowPrivate:input.allowPrivate===true,tlsVerify:input.tlsVerify!==false,enabled,accessMode,
-    showOnHome:input.showOnHome===true,clientProfile:cleanProfile(input.clientProfile),streamRewrite:cleanStreamRewrite(input.streamRewrite),tags:cleanTags(input.tags),notes:String(input.notes||'').slice(0,500),favorite:input.favorite===true,
+    showOnHome:input.showOnHome===true,clientProfile:cleanProfile(input.clientProfile),streamRewrite:cleanStreamRewrite(input.streamRewrite),autoSteer:cleanAutoSteer(input.autoSteer),tags:cleanTags(input.tags),notes:String(input.notes||'').slice(0,500),favorite:input.favorite===true,
     sortOrder:numeric(input.sortOrder,-10000,10000),speedLimitMbps:numeric(input.speedLimitMbps,0,100000),monthlyQuotaGB:numeric(input.monthlyQuotaGB,0,1000000),reminderDays:numeric(input.reminderDays,0,365),accessAlertThreshold:numeric(input.accessAlertThreshold,0,100000),
     ...routeAuthFields(accessKey),createdAt:now,updatedAt:now};
 }
 // Node fields a PATCH sets directly, applied in this order.
 const ROUTE_PATCH_FIELDS={
-  name:v=>String(v).slice(0,80),enabled:v=>v===true,tlsVerify:v=>v===true,showOnHome:v=>v===true,clientProfile:cleanProfile,streamRewrite:cleanStreamRewrite,tags:cleanTags,notes:v=>String(v).slice(0,500),favorite:v=>v===true,
+  name:v=>String(v).slice(0,80),enabled:v=>v===true,tlsVerify:v=>v===true,showOnHome:v=>v===true,clientProfile:cleanProfile,streamRewrite:cleanStreamRewrite,autoSteer:cleanAutoSteer,tags:cleanTags,notes:v=>String(v).slice(0,500),favorite:v=>v===true,
   sortOrder:v=>numeric(v,-10000,10000),speedLimitMbps:v=>numeric(v,0,100000),monthlyQuotaGB:v=>numeric(v,0,1000000),reminderDays:v=>numeric(v,0,365),accessAlertThreshold:v=>numeric(v,0,100000)
 };
 
@@ -288,8 +308,10 @@ async function updateAgent(req,res,agent){
   if(name!==undefined)agent.name=name;
   if(routeIds)replaceAgentDeployments(store.data,agent.id,routeIds,now);
   if(b.sortOrder!==undefined)agent.sortOrder=numeric(b.sortOrder,-10000,10000);
+  if(b.steerTarget!==undefined)agent.steerTarget=b.steerTarget===true;
   agent.updatedAt=now;
-  if(local)localAgent.reconcile();
+  // Another machine's deployments or participation reshape the steering peers in this machine's snapshot too.
+  if(local||routeIds||b.steerTarget!==undefined)localAgent.reconcile();
   agentApi.invalidate();
   store.audit(localDomainRequested?'agent.local_domain_requested':'agent.updated',ip(req),agent.id);
   return json(res,200,{agent:agentView(agent)});
@@ -300,7 +322,7 @@ async function agentResource(req,res,[,id]){
   if(req.method==='DELETE'){
     if(agent.id===LOCAL_AGENT_ID)return json(res,409,{error:'the local agent cannot be deleted'});
     store.data.agents=store.data.agents.filter(item=>item!==agent);store.data.deployments=store.data.deployments.filter(item=>item.agentId!==agent.id);
-    store.audit('agent.deleted',ip(req),agent.id);agentApi.invalidate();
+    store.audit('agent.deleted',ip(req),agent.id);publishRoutes();
     return json(res,200,{ok:true});
   }
   return notFound(res);
@@ -427,6 +449,22 @@ async function diagnose(req,res,[,id]){
 async function updateDeployment(req,res){const b=await body(req);store.data.settings.certificateEmail=normalizeCertificateEmail(b.certificateEmail);store.audit('deployment.certificate_email_updated',ip(req));return json(res,200,{ok:true,certificateEmail:store.data.settings.certificateEmail});}
 async function updateNotifications(req,res){const b=await body(req),result=notifier.configure(b);store.audit('notifications.updated',ip(req));return json(res,200,result);}
 async function testNotifications(req,res){await notifier.test();store.audit('notifications.tested',ip(req));return json(res,200,{ok:true});}
+async function updateSteering(req,res){
+  const b=await body(req);
+  // Validate everything before writing (see updateRoute).
+  if(b.mode!==undefined&&!STEERING_MODES.includes(b.mode))return json(res,400,{error:'invalid steering mode'});
+  const entry=b.entryDomain===undefined?undefined:normalizeEntryDomain(b.entryDomain);
+  if(entry&&entry===baseHostname(cfg.publicBaseUrl))return json(res,409,{error:'入口域名不能与面板域名相同'});
+  const settings=steeringSettings(store.data);
+  if(b.mode!==undefined)settings.mode=b.mode;
+  if(entry!==undefined)settings.entryDomain=entry;
+  if(b.excludedClients!==undefined)settings.excludedClients=normalizeClientList(b.excludedClients);
+  if(b.boundedClients!==undefined)settings.boundedClients=normalizeClientList(b.boundedClients);
+  if(b.boundMB!==undefined)settings.boundMB=Math.round(numeric(b.boundMB,8,1024));
+  if(b.clearAutoExcluded===true)settings.autoExcluded={};
+  store.audit('steering.updated',ip(req),settings.mode);store.save();publishRoutes();
+  return json(res,200,steeringView());
+}
 
 const adminApi={
   'GET /account':(req,res)=>json(res,200,{username:adminAccount().username,totpEnabled:!!adminAccount().totpSecret,recoveryRemaining:(adminAccount().recoveryDigests||[]).length}),
@@ -449,6 +487,8 @@ const adminApi={
   'GET /audit':(req,res)=>json(res,200,{audit:store.data.audit.slice(0,100)}),
   'GET /deployment':(req,res,cookiePath)=>json(res,200,{adminPath:cookiePath,secureCookies:cfg.secureCookies,publicBaseUrl:cfg.publicBaseUrl,localProxyBaseUrl:clientBaseUrl(),splitDomains:!!cfg.localProxyBaseUrl&&baseHostname(cfg.localProxyBaseUrl)!==baseHostname(cfg.publicBaseUrl),httpsReady:cfg.secureCookies&&cfg.publicBaseUrl.startsWith('https://'),certificateEmail:store.data.settings.certificateEmail||'',domainChange:localDomainStatus()}),
   'PUT /deployment':updateDeployment,
+  'GET /steering':(req,res)=>json(res,200,steeringView()),
+  'PUT /steering':updateSteering,
   'GET /notifications':(req,res)=>json(res,200,notifier.view()),
   'PUT /notifications':updateNotifications,
   'POST /notifications/test':testNotifications
@@ -492,16 +532,20 @@ async function serveAdmin(req,res,prefix){
 }
 const admin=http.createServer((req,res)=>serveAdmin(req,res,cfg.adminPath));
 admin.requestTimeout=35_000;admin.headersTimeout=10_000;admin.listen(cfg.adminPort,cfg.adminHost,()=>console.log(`AegisRelay admin listening on http://${cfg.adminHost}:${cfg.adminPort}${cfg.adminPath}`));
-const relay=makeProxyHandler(localAgent.routeSource,key,metrics);
+const steering=new SteeringEngine({selfId:LOCAL_AGENT_ID,lineOf:activeUpstreamLine,canServe:route=>metrics.canServe(route)});
+steering.start(async payload=>steeringHub.exchange(LOCAL_AGENT_ID,payload),()=>localAgent.routeSource.getRoutes());
+const relay=makeProxyHandler(localAgent.routeSource,key,metrics,steering);
 const panelHostname=baseHostname(cfg.publicBaseUrl),proxyHostname=baseHostname(cfg.localProxyBaseUrl)||panelHostname,splitDomains=!!panelHostname&&!!proxyHostname&&panelHostname!==proxyHostname;
 function requestHostname(req){try{return new URL(`http://${String(req.headers.host||'')}`).hostname.toLowerCase()}catch{return''}}
+// The steering entry domain is a second public name of this machine's data plane.
+function isEntryHost(hostname){const entry=steeringSettings(store.data).entryDomain;return !!entry&&hostname===entry}
 // A single bad request must never take the relay down mid-playback; nginx keeps serving, so do we.
 function relayFailed(res,err){console.error('[aegis] relay error',err&&err.stack||err);if(res.headersSent||res.destroyed||res.writableEnded)return;try{res.writeHead(502,{'cache-control':'no-store'});res.end('bad gateway')}catch{}}
 const proxy=http.createServer(RELAY_SERVER_OPTIONS,(req,res)=>{
   res.on('error',()=>{});
   let pathname; try{pathname=new URL(req.url,'http://relay.invalid').pathname}catch{return relayFailed(res,new Error('invalid request target'))}
   try{
-    const role=domainRequestRole({panelHostname,proxyHostname,requestHostname:requestHostname(req)});
+    const hostname=requestHostname(req),role=isEntryHost(hostname)?'proxy':domainRequestRole({panelHostname,proxyHostname,requestHostname:hostname});
     if(role==='reject')return json(res,421,{error:'misdirected request'});
     if(role==='proxy'){const out=relay(req,res);if(out&&typeof out.catch==='function')out.catch(err=>relayFailed(res,err));return}
     if(pathname==='/agent-install.sh'&&req.method==='GET'){res.writeHead(200,headers({'content-type':'text/x-shellscript; charset=utf-8'}));return res.end(agentInstaller)}
@@ -514,10 +558,10 @@ const proxy=http.createServer(RELAY_SERVER_OPTIONS,(req,res)=>{
 proxy.requestTimeout=0;proxy.keepAliveTimeout=75_000;proxy.keepAliveTimeoutBuffer=5_000;proxy.headersTimeout=80_000;
 proxy.on('connection',socket=>{socket.setNoDelay(true);socket.setKeepAlive(true,15_000)});
 proxy.on('clientError',(err,socket)=>{if(!socket.destroyed)socket.destroy()});
-proxy.on('upgrade',(req,socket,head)=>{socket.on('error',()=>socket.destroy());try{if(splitDomains&&requestHostname(req)!==proxyHostname)return socket.destroy();handleUpgrade(req,socket,head,localAgent.routeSource,key)}catch(err){console.error('[aegis] upgrade error',err&&err.stack||err);socket.destroy()}});
+proxy.on('upgrade',(req,socket,head)=>{socket.on('error',()=>socket.destroy());try{if(splitDomains&&requestHostname(req)!==proxyHostname&&!isEntryHost(requestHostname(req)))return socket.destroy();handleUpgrade(req,socket,head,localAgent.routeSource,key)}catch(err){console.error('[aegis] upgrade error',err&&err.stack||err);socket.destroy()}});
 proxy.listen(cfg.proxyPort,cfg.proxyHost,()=>console.log(`AegisRelay proxy listening on ${cfg.proxyHost}:${cfg.proxyPort}`));
 process.on('uncaughtException',err=>console.error('[aegis] uncaught exception',err&&err.stack||err));
 process.on('unhandledRejection',err=>console.error('[aegis] unhandled rejection',err&&err.stack||err));
 const flushTimer=setInterval(()=>store.save(),60_000);flushTimer.unref();
 const reminderTimer=setInterval(()=>notifier.tick(store.data.routes),60*60_000);reminderTimer.unref();
-for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{clearInterval(flushTimer);clearInterval(reminderTimer);const saved=store.save();agentApi.close();admin.close();proxy.close(()=>saved.then(()=>process.exit(0)));setTimeout(()=>process.exit(1),10_000).unref();});
+for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{clearInterval(flushTimer);clearInterval(reminderTimer);steering.stop();const saved=store.save();agentApi.close();admin.close();proxy.close(()=>saved.then(()=>process.exit(0)));setTimeout(()=>process.exit(1),10_000).unref();});

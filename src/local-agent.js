@@ -4,6 +4,7 @@ import { compileDesiredSnapshot, ensurePanelSigningIdentity, verifySnapshot } fr
 import { b64u, randomToken, timingEqual } from './security.js';
 import { writeAtomic } from './store.js';
 import { ensureAgentRegistry, LOCAL_AGENT_ID, routeIdsForAgent, routesForAgent } from './agent-registry.js';
+import { agentSnapshotNodes } from './steering-topology.js';
 
 function freeze(value) {
   if(value&&typeof value==='object'&&!Object.isFrozen(value)){
@@ -46,7 +47,7 @@ export function runtimeRoutes(nodes) {
     id:node.id,alias:node.alias,name:node.name,enabled:node.enabled,upstreams:node.upstreams,
     allowPrivate:node.allowPrivate,tlsVerify:node.tlsVerify,showOnHome:node.showOnHome,
     clientProfile:node.clientProfile,streamRewrite:node.streamRewrite,speedLimitMbps:node.speedLimitMbps,monthlyQuotaGB:node.monthlyQuotaGB,
-    accessMode:node.access.mode,
+    accessMode:node.access.mode,...(node.steering?{steering:node.steering}:{}),
     ...(node.access.mode==='key'?{authVersion:node.access.algorithm,routeAuthKey:node.access.routeAuthKey,keyDigest:node.access.digest,...(Array.isArray(node.access.channels)&&node.access.channels.length?{channels:node.access.channels.map(c=>({id:c.id,routeAuthKey:c.routeAuthKey,keyDigest:c.digest,authVersion:node.access.algorithm}))}:{})}:{})
   }));
 }
@@ -113,7 +114,7 @@ export class LocalAgent {
     if(agent){agent.lastSeen=this.lastSeen;agent.applyState=status==='applied'?'active':'error';agent.desiredRevision=snapshot?.revision||0;agent.appliedRevision=status==='applied'?(snapshot?.revision||0):(this.record.appliedRevision||0);agent.proxyHealthy=status==='applied';agent.updatedAt=this.lastSeen;}
   }
 
-  reconcile(nodes=routesForAgent(this.store.data,LOCAL_AGENT_ID)) {
+  reconcile(nodes=agentSnapshotNodes(this.store.data,LOCAL_AGENT_ID)) {
     let snapshot;
     try {
       snapshot=this.pull(nodes);

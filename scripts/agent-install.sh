@@ -136,6 +136,7 @@ install -m 0755 "$TMP_DIR/source/scripts/aegis-relay-agent" /usr/local/bin/aegis
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-domain.sh" "$INSTALL_DIR/agent-configure-domain.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-ip.sh" "$INSTALL_DIR/agent-configure-ip.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-host-domain-apply.sh" "$INSTALL_DIR/agent-host-domain-apply.sh"
+install -m 0755 "$TMP_DIR/source/scripts/configure-entry-domain.sh" "$INSTALL_DIR/configure-entry-domain.sh"
 # The agent container is unprivileged, so a narrowly scoped host unit performs domain switches for it.
 if command -v systemctl >/dev/null 2>&1; then
   cat > /etc/systemd/system/aegis-relay-agent-domain.service <<EOF
