@@ -79,6 +79,13 @@ test('two-factor enrolment, recovery-code login and disable',async()=>{
   const recovered=await call('POST','/login',{password:'first-password',recovery:enabled.body.recovery[0]},{auth:false});
   assert.equal(recovered.status,200);session={cookie:recovered.headers.get('set-cookie').split(';')[0],csrf:recovered.body.csrf};
   assert.equal((await call('GET','/account')).body.recoveryRemaining,7);
+  // A wrong password must not spend a valid recovery code. (These are the file's 5th and 6th logins —
+  // the limiter allows six per window.)
+  const kept=enabled.body.recovery[1];
+  assert.equal((await call('POST','/login',{password:'wrong',recovery:kept},{auth:false})).status,401);
+  const again=await call('POST','/login',{password:'first-password',recovery:kept},{auth:false});
+  assert.equal(again.status,200,'the code survived the failed attempt');session={cookie:again.headers.get('set-cookie').split(';')[0],csrf:again.body.csrf};
+  assert.equal((await call('GET','/account')).body.recoveryRemaining,6);
   assert.equal((await call('POST','/account/totp/disable',{password:'first-password',code:'000000'})).status,401);
   assert.equal((await call('POST','/account/totp/disable',{password:'first-password',code:totp(begun.body.secret)})).status,200);
   assert.equal((await call('GET','/account')).body.totpEnabled,false);
@@ -171,4 +178,30 @@ test('dashboard feed, settings and the static shell',async()=>{
   assert.match((await call('GET','/',undefined,{auth:false,prefix:''})).text,/<html/i);
   assert.equal((await call('POST','/',{},{auth:false,prefix:''})).status,405);
   assert.equal((await call('GET','/missing.js',undefined,{auth:false,prefix:''})).status,404);
+});
+
+test('a rejected update leaves the node and the machine exactly as they were',async()=>{
+  const node=async alias=>(await call('GET','/routes')).body.routes.find(r=>r.alias===alias);
+  const edge=await node('edge'),path=(await call('GET',`/routes/${edge.id}/credentials`)).body.clientPath;
+  // Rejected after the access mode and name were read: neither may stick, and the key must not rotate.
+  assert.equal((await call('PATCH',`/routes/${edge.id}`,{accessMode:'alias_only',name:'renamed',alias:'quiet'})).status,409);
+  assert.deepEqual([(await node('edge')).accessMode,(await node('edge')).name],[edge.accessMode,edge.name]);
+  assert.equal((await call('GET',`/routes/${edge.id}/credentials`)).body.clientPath,path,'the client address still works');
+  // Rejected by the upstream check, which runs last.
+  assert.equal((await call('PATCH',`/routes/${edge.id}`,{name:'renamed',allowPrivate:false})).status,400);
+  assert.deepEqual([(await node('edge')).allowPrivate,(await node('edge')).name],[true,edge.name]);
+  const nullProfile=await call('PATCH',`/routes/${edge.id}`,{name:'renamed',clientProfile:null});
+  assert.equal(nullProfile.status,400);assert.equal(nullProfile.body.error,'invalid client profile');
+  assert.equal((await node('edge')).name,edge.name);
+  // Machines: a bad route list arrives after the name and the domain; nothing may be applied or filed.
+  const local=async()=>(await call('GET','/agents')).body.agents.find(a=>a.id==='local');
+  const before=await local();
+  assert.equal((await call('PATCH','/agents/local',{name:'renamed',domain:'proxy.example.com',routeIds:['missing']})).status,400);
+  assert.equal((await local()).name,before.name);
+  assert.equal((await call('GET','/deployment')).body.domainChange,null,'no domain switch was requested');
+  assert.equal((await call('PATCH','/agents/local',{name:'renamed',domain:''})).status,400);
+  assert.equal((await local()).name,before.name);
+  // A valid request still applies all of it.
+  const applied=await call('PATCH',`/routes/${edge.id}`,{name:'renamed',allowPrivate:true,alias:'edge-2'});
+  assert.deepEqual([applied.status,applied.body.route.name,applied.body.route.alias],[200,'renamed','edge-2']);
 });

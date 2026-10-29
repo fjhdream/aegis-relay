@@ -66,6 +66,7 @@ function auth(req) { const sid = cookies(req).aegis_session, s = Object.prototyp
 function requireAuth(req) { const s = auth(req); if (!s) throw Object.assign(new Error('登录已失效，请重新登录'), { status: 401 }); if (!timingEqual(req.headers['x-csrf-token'] || '', s.csrf)) throw Object.assign(new Error('安全校验已失效，请重新登录'), { status: 403 }); return s; }
 function routeUpstreams(r) { return r.upstreams?.length?r.upstreams:(r.upstream?[r.upstream]:[]); }
 function cleanProfile(value = {}) {
+  if(!value||typeof value!=='object')throw new Error('invalid client profile');
   const out={enabled:value.enabled===true};
   for(const field of ['userAgent','client','deviceName','deviceId']){
     const v=String(value[field]||'').trim(); if(/[\r\n]/.test(v)||v.length>160)throw new Error(`invalid client profile field: ${field}`); if(v)out[field]=v;
@@ -172,10 +173,12 @@ async function setupAdmin(req,res){
 }
 async function login(req,res,cookiePath){
   if (!store.data.admin || !loginLimiter.take(ip(req))) { store.audit('login.denied', ip(req)); return json(res, 429, { error:'try again later' }); }
-  const b = await body(req), a = store.data.admin, totpOn = !!a.totpSecret;
+  const b = await body(req), a = store.data.admin, totpOn = !!a.totpSecret, passwordOk = verifyPassword(b.password || '', a.passwordHash);
   let second = !totpOn || verifyTotp(a.totpSecret, b.code);
-  if (totpOn && !second && b.recovery) { const d=tokenDigest(String(b.recovery),key), idx=(a.recoveryDigests||[]).findIndex(x=>timingEqual(x,d)); if(idx>=0){a.recoveryDigests.splice(idx,1);store.save();second=true;} }
-  if (!verifyPassword(b.password || '', a.passwordHash) || !second) { store.audit('login.failed', ip(req)); return json(res, 401, { error:'invalid credentials' }); }
+  // A recovery code is spent only once the password has proven who is signing in: checked the other way
+  // round, a wrong password burned a valid code.
+  if (passwordOk && totpOn && !second && b.recovery) { const d=tokenDigest(String(b.recovery),key), idx=(a.recoveryDigests||[]).findIndex(x=>timingEqual(x,d)); if(idx>=0){a.recoveryDigests.splice(idx,1);store.save();second=true;} }
+  if (!passwordOk || !second) { store.audit('login.failed', ip(req)); return json(res, 401, { error:'invalid credentials' }); }
   const sid=randomToken(), csrf=randomToken(24); sessions[sid]={csrf,expires:Date.now()+30*60_000};pruneSessions();store.audit('login.success',ip(req));
   const cookie=`aegis_session=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=${cookiePath}; Max-Age=604800${cfg.secureCookies?'; Secure':''}`; return json(res,200,{csrf},{'set-cookie':cookie});
 }
@@ -250,35 +253,43 @@ async function createEnrollment(req,res){
   return json(res,201,{expiresAt:issued.record.expiresAt,command,uninstallCommand:'sudo aegis-relay-agent uninstall'});
 }
 async function updateAgent(req,res,agent){
-  const b=await body(req),now=new Date().toISOString(),localDomainRequested=agent.id===LOCAL_AGENT_ID&&b.domain!==undefined;
-  if(b.name!==undefined){const name=String(b.name||'').trim();if(!name||name.length>80)return json(res,400,{error:'invalid agent name'});agent.name=name;}
+  const b=await body(req),now=new Date().toISOString(),local=agent.id===LOCAL_AGENT_ID,localDomainRequested=local&&b.domain!==undefined;
+  // Validate the whole request before changing anything (see updateRoute): a domain or route-list error
+  // used to arrive after the name had changed, and a local domain switch could already have been filed.
+  let name,domain,routeIds,switching=false;
+  if(b.name!==undefined){name=String(b.name||'').trim();if(!name||name.length>80)return json(res,400,{error:'invalid agent name'});}
   if(b.domain!==undefined){
-    const domain=normalizeAgentDomain(b.domain);
-    if(agent.id===LOCAL_AGENT_ID){
+    domain=normalizeAgentDomain(b.domain);
+    if(local){
       if(!domain)return json(res,400,{error:'本机代理域名不能为空，请填写与面板不同的子域名'});
       if(!cfg.publicBaseUrl.startsWith('https://'))return json(res,409,{error:'请先在部署向导完成面板 HTTPS 配置'});
       if(domain===baseHostname(cfg.publicBaseUrl))return json(res,409,{error:'代理域名不能与面板域名相同'});
-      const existing=localDomainStatus(),switching=existing&&['pending','applying'].includes(existing.state);
+      const existing=localDomainStatus();switching=!!existing&&['pending','applying'].includes(existing.state);
       if(switching&&existing.desiredDomain!==domain)return json(res,409,{error:`正在切换到 ${existing.desiredDomain}，完成后再提交新域名`});
+    }else if(domain&&!store.data.settings.certificateEmail)return json(res,409,{error:'请先在部署向导保存统一证书邮箱'});
+  }
+  if(b.routeIds!==undefined){
+    if(!Array.isArray(b.routeIds))return json(res,400,{error:'routeIds must be an array'});
+    routeIds=[...new Set(b.routeIds.map(String))];
+    if(routeIds.some(id=>!store.data.routes.some(route=>route.id===id)))return json(res,400,{error:'unknown route id'});
+  }
+  // Apply. The local domain switch goes first: it is the one step that can still fail, and it checks its
+  // input before writing anything.
+  if(domain!==undefined){
+    if(local){
       if(domain!==configuredLocalDomain&&!switching)requestDomainSwitch({dataFile:cfg.dataFile,domain,email:store.data.settings.certificateEmail,currentDomain:configuredLocalDomain});
       else if(domain===configuredLocalDomain)agent.domain=domain;
     }else{
       const currentMode=agent.proxyMode||(agent.domain?'domain':'ip');
-      if(domain){
-        if(!store.data.settings.certificateEmail)return json(res,409,{error:'请先在部署向导保存统一证书邮箱'});
-        if(currentMode!=='domain'||domain!==agent.domain){agent.desiredMode='domain';agent.desiredDomain=domain;agent.domainStatus={requestId:'',state:'pending',mode:'domain',desiredDomain:domain,currentDomain:agent.domain||'',message:'等待机器申请证书并切换 Nginx',updatedAt:new Date().toISOString()};}
-      }else if(currentMode!=='ip'){agent.desiredMode='ip';delete agent.desiredDomain;agent.domainStatus={requestId:'',state:'pending',mode:'ip',desiredDomain:'',currentDomain:agent.domain||'',message:'等待机器切换为 IP 反代（HTTP）',updatedAt:new Date().toISOString()};}
+      if(domain){if(currentMode!=='domain'||domain!==agent.domain){agent.desiredMode='domain';agent.desiredDomain=domain;agent.domainStatus={requestId:'',state:'pending',mode:'domain',desiredDomain:domain,currentDomain:agent.domain||'',message:'等待机器申请证书并切换 Nginx',updatedAt:new Date().toISOString()};}}
+      else if(currentMode!=='ip'){agent.desiredMode='ip';delete agent.desiredDomain;agent.domainStatus={requestId:'',state:'pending',mode:'ip',desiredDomain:'',currentDomain:agent.domain||'',message:'等待机器切换为 IP 反代（HTTP）',updatedAt:new Date().toISOString()};}
     }
   }
-  if(b.routeIds!==undefined){
-    if(!Array.isArray(b.routeIds))return json(res,400,{error:'routeIds must be an array'});
-    const routeIds=[...new Set(b.routeIds.map(String))];
-    if(routeIds.some(id=>!store.data.routes.some(route=>route.id===id)))return json(res,400,{error:'unknown route id'});
-    replaceAgentDeployments(store.data,agent.id,routeIds,now);
-  }
+  if(name!==undefined)agent.name=name;
+  if(routeIds)replaceAgentDeployments(store.data,agent.id,routeIds,now);
   if(b.sortOrder!==undefined)agent.sortOrder=numeric(b.sortOrder,-10000,10000);
   agent.updatedAt=now;
-  if(agent.id===LOCAL_AGENT_ID)localAgent.reconcile();
+  if(local)localAgent.reconcile();
   agentApi.invalidate();
   store.audit(localDomainRequested?'agent.local_domain_requested':'agent.updated',ip(req),agent.id);
   return json(res,200,{agent:agentView(agent)});
@@ -328,17 +339,27 @@ async function importRoutes(req,res){
   return json(res,200,{imported:credentials.length,credentials,errors});
 }
 async function updateRoute(req,res,r){
-  const b=await body(req);let switchedKey=null;
-  if(b.accessMode!==undefined){
-    const mode=b.accessMode==='alias_only'?'alias_only':'key';
-    if(mode!==r.accessMode){
-      if(mode==='alias_only'){r.accessMode='alias_only';r.keyDigest=null;r.accessKey=null;delete r.routeAuthKey;delete r.authVersion;delete r.authMigrationRequired;switchedKey='';}
-      else{const accessKey=connectionKey(b.accessKey);r.accessMode='key';Object.assign(r,routeAuthFields(accessKey));delete r.authMigrationRequired;switchedKey=accessKey;}
-    }
-  }
-  for(const [field,clean] of Object.entries(ROUTE_PATCH_FIELDS))if(b[field]!==undefined)r[field]=clean(b[field]);
-  if(b.alias!==undefined){const a=checkedAlias(b.alias);if(store.data.routes.some(x=>x!==r&&x.alias===a))return json(res,409,{error:'alias already exists'});r.alias=a;}
-  if(b.upstreams!==undefined||b.upstream!==undefined||b.allowPrivate!==undefined){r.allowPrivate=b.allowPrivate===undefined?r.allowPrivate:b.allowPrivate===true;r.upstreams=await validateUpstreamList(b.upstreams||b.upstream||routeUpstreams(r),r.allowPrivate);delete r.upstream;}
+  const b=await body(req);
+  // Work out and validate every change before touching the node. Fields used to be written as they were
+  // read, so a request rejected half-way (an alias conflict, a blocked upstream) still left the earlier
+  // ones applied in memory — unpublished, yet persisted by the next flush — including a freshly switched
+  // access key the operator was never shown. Nothing is written until the request is known to succeed,
+  // and the write itself has no await in it, so no other request can interleave with it.
+  let mode=null,accessKey;
+  if(b.accessMode!==undefined){const wanted=b.accessMode==='alias_only'?'alias_only':'key';if(wanted!==r.accessMode){mode=wanted;if(mode==='key')accessKey=connectionKey(b.accessKey);}}
+  const fields={};
+  for(const [field,clean] of Object.entries(ROUTE_PATCH_FIELDS))if(b[field]!==undefined)fields[field]=clean(b[field]);
+  const alias=b.alias===undefined?undefined:checkedAlias(b.alias);
+  let allowPrivate=r.allowPrivate,upstreams;
+  if(b.upstreams!==undefined||b.upstream!==undefined||b.allowPrivate!==undefined){allowPrivate=b.allowPrivate===undefined?r.allowPrivate:b.allowPrivate===true;upstreams=await validateUpstreamList(b.upstreams||b.upstream||routeUpstreams(r),allowPrivate);}
+  // After the await: another request may have taken the alias meanwhile.
+  if(alias!==undefined&&store.data.routes.some(x=>x!==r&&x.alias===alias))return json(res,409,{error:'alias already exists'});
+  let switchedKey=null;
+  if(mode==='alias_only'){r.accessMode='alias_only';r.keyDigest=null;r.accessKey=null;delete r.routeAuthKey;delete r.authVersion;delete r.authMigrationRequired;switchedKey='';}
+  else if(mode==='key'){r.accessMode='key';Object.assign(r,routeAuthFields(accessKey));delete r.authMigrationRequired;switchedKey=accessKey;}
+  Object.assign(r,fields);
+  if(alias!==undefined)r.alias=alias;
+  if(upstreams){r.allowPrivate=allowPrivate;r.upstreams=upstreams;delete r.upstream;}
   r.updatedAt=new Date().toISOString();
   store.audit(switchedKey===null?'route.updated':'route.access_mode_changed',ip(req),r.alias);publishRoutes();
   return json(res,200,{route:publicRoute(r),...(switchedKey===null?{}:clientCredentials(r,switchedKey))});
