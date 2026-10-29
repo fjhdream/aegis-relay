@@ -234,7 +234,7 @@ export class SteeringEngine {
   }
 
   localOf(session) {
-    session.local||={hls:{open:null,samples:[]},prog:{ticks:[],tickBytes:0,active:new Set(),lastServedAt:0},lastVerdict:'',lastReportAt:0};
+    session.local||={hls:{open:null,samples:[]},prog:{ticks:[],tickBytes:0,active:new Set(),lastServedAt:0},lastVerdict:'',lastReportAt:null};
     return session.local;
   }
 
@@ -316,6 +316,8 @@ export class SteeringEngine {
 
   serve(session, kind, req, identity, topology, nowMs) {
     const track=new SteerTrack(this,session,kind,nowMs);
+    // Playback must be visible even when a fast player finishes buffering before a verdict exists.
+    if(session.local.lastReportAt===null)this.queueReport(session,true);
     // Phase 3 (opt-in per client): cap an open-ended Range so a long direct play is cut into requests,
     // each of which is a chance to move the session. Only for clients proven to continue on their own.
     let range=null;

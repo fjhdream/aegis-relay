@@ -4,6 +4,7 @@ import http from 'node:http';
 import zlib from 'node:zlib';
 import { makeProxyHandler } from '../src/proxy.js';
 import { SteeringEngine } from '../src/steering.js';
+import { SteeringHub } from '../src/steering-hub.js';
 import { deriveKey } from '../src/security.js';
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
 
@@ -46,6 +47,26 @@ test('a steered request is redirected to the peer, served there, and the token n
     assert.equal(landed.status,200);assert.equal(landed.body.toString(),'media');
     assert.ok(seen.every(url=>!url.includes('aegis_steer')),'the steering token is stripped before the upstream');
     assert.equal(seen.at(-1),'/Videos/abc/stream.mkv?api_key=k%20x&DeviceId=d1&Static=true');
+  } finally { await cleanup(); }
+});
+
+test('a VidHub direct-play session appears in the hub before its first speed verdict',async()=>{
+  const {route,a,portA,cleanup}=await setup();
+  const hub=new SteeringHub({store:{data:{agents:[],deployments:[{agentId:'a',routeId:route.id,enabled:true}]}}});
+  try {
+    const path='/movie/key123/videos/abc/original.mkv?api_key=test&DeviceId=d1&PlaySessionId=p1';
+    const headers={'user-agent':'VidHub/3.0.9','x-emby-authorization':'MediaBrowser Client="VidHub", DeviceId="d1"','x-emby-token':'test',range:'bytes=0-'};
+    const response=await get(portA,path,headers);
+    assert.equal(response.status,200);
+    assert.equal(a.sessions.size,1,'the real VidHub request shape is accepted by the engine');
+    hub.exchange('a',a.syncPayload([route]));
+    const sessions=hub.view().sessions;
+    assert.equal(sessions.length,1,'playback must be visible without waiting for 120 seconds of samples');
+    assert.equal(sessions[0].client,'VidHub');
+    assert.equal(sessions[0].scores.a.verdict,'unknown');
+    assert.equal(hub.view().events.length,0,'announcing playback must not trigger a switch');
+    await get(portA,path,headers);
+    assert.equal(a.syncPayload([route]).reports.length,0,'repeated requests must not announce the same session again');
   } finally { await cleanup(); }
 });
 
