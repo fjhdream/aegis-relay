@@ -280,15 +280,30 @@ test('a capped range is judged by whether the player comes back for the next byt
   call('bytes=1000-');
   assert.deepEqual(a.bounds.map(item=>[item.client,item.continued,item.trial]),[['Infuse',true,false]]);
   // the player never comes back
-  serve(call('bytes=0-',undefined,'d2'));clock+=31_000;a.tick();
+  serve(call('bytes=0-',undefined,'d2'));clock+=121_000;a.tick();
   assert.deepEqual(a.bounds.map(item=>item.continued),[true,false]);
   // nothing was cut (end of file, origin ignored Range, client left early): no verdict at all
   serve(call('bytes=0-',undefined,'d3'),{contentRange:'bytes 0-999/1000'});
   serve(call('bytes=0-',undefined,'d4'),{status:200,contentRange:''});
   serve(call('bytes=0-',undefined,'d5'),{sent:10});
-  clock+=31_000;a.tick();
+  clock+=121_000;a.tick();
   assert.equal(a.bounds.length,2);
   a.stop();
+});
+
+test('Rex can pause prefetching for a minute and still successfully continue a capped range',()=>{
+  let clock=12_000_000_000;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.bounded.add('rex');a.boundBytes=8;
+  const url='/movie/key123/emby/play/video/abc';
+  const call=range=>{const q=request(url,{range,'x-emby-client':'Rex','x-emby-device-id':'rex-device'});return a.plan({route:r,found:found(r,url),req:q.req,incoming:q.incoming,publicContext:https})};
+  try{
+    const first=call('bytes=0-');
+    first.track.headers(206,{'content-range':'bytes 0-7/800'});first.track.bytes(8);first.track.close();
+    clock+=60_000;a.tick();
+    assert.equal(a.bounds.length,0,'a normal prefetch pause must not be reported as a failure');
+    call('bytes=8-');
+    assert.deepEqual(a.bounds.map(result=>result.continued),[true]);
+  }finally{a.stop();}
 });
 
 test('a client on trial gets one capped range per session and one session at a time',()=>{

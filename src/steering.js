@@ -21,7 +21,8 @@ export const STEER_DEFAULTS=Object.freeze({
   switchWindowMs:600_000,maxSwitches:3,improve:1.3,penaltyMs:600_000,tokenTtlMs:30_000,sessionTtlMs:30*60_000,
   peerStaleMs:60_000,landingTimeoutMs:15_000,detachMs:15_000,reportEveryMs:5_000,
   syncActiveMs:5_000,syncIdleMs:30_000,syncDebounceMs:500,syncMaxBackoffMs:300_000,boundBytes:64*1024*1024,
-  historyMinSamples:3,historyBadShare:0.34,historyGoodShare:0.75,boundContinueMs:30_000
+  // Prefetching players can wait a minute before requesting the next range while buffered video plays.
+  historyMinSamples:3,historyBadShare:0.34,historyGoodShare:0.75,boundContinueMs:120_000
 });
 
 const SESSION_KEY_RE=/^[A-Za-z0-9_-]{22}$/,PREFIX_KEY_RE=/^[A-Za-z0-9_-]{16}$/;
