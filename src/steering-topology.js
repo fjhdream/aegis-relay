@@ -99,9 +99,17 @@ export function agentSnapshotNodes(data, agentId) {
   });
 }
 
-// Address handed to clients for a steered node: the shared entry domain, which every participating
-// machine serves next to its own direct domain.
+// Participating machines that do not serve the node. The panel has every participating machine serve
+// the entry domain, and DNS may send a client to any of them: one without the node would answer 404.
+export function entryCoverageGaps(data, route, settings=readSteeringSettings(data)) {
+  const peers=new Set(steeringPeers(data,route,settings).map(peer=>peer.id));
+  return (Array.isArray(data.agents)?data.agents:[]).filter(agent=>steerableAgent(agent,settings)&&!peers.has(agent.id));
+}
+
+// Address handed to clients for a node: the shared entry domain only while the node is actually steered
+// and served by every machine behind that domain; otherwise its machine's direct address as before.
 export function steeringEntryBaseUrl(data, route) {
   const settings=readSteeringSettings(data);
-  return settings.entryDomain&&route?.autoSteer?.enabled===true?`https://${settings.entryDomain}`:'';
+  if(!settings.entryDomain||!route||!steeringTopology(data,route,settings)||entryCoverageGaps(data,route,settings).length)return '';
+  return `https://${settings.entryDomain}`;
 }

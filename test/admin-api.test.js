@@ -217,11 +217,14 @@ test('automatic steering settings are validated before anything is written',asyn
   assert.equal(saved.status,200);
   assert.deepEqual([saved.body.settings.mode,saved.body.settings.entryDomain,saved.body.settings.boundMB],['shadow','entry.example.com',8]);
   assert.deepEqual(saved.body.entryCommands.map(item=>item.command),[`sudo aegis-relay entry entry.example.com ${saved.body.certificateEmail}`]);
-  // A node opted in is handed out on the entry domain; the machine toggle shows up as an issue.
+  // A node opted in on a single machine cannot steer, so it keeps its direct address and says why.
   const quiet=(await call('GET','/routes')).body.routes.find(r=>r.alias==='quiet');
+  const direct=(await call('GET',`/routes/${quiet.id}/channels`)).body.publicBaseUrl;
   const patched=await call('PATCH',`/routes/${quiet.id}`,{autoSteer:{enabled:true,minRateMbps:-1}});
   assert.deepEqual(patched.body.route.autoSteer,{enabled:true,minRateMbps:0});
-  assert.equal((await call('GET',`/routes/${quiet.id}/channels`)).body.publicBaseUrl,'https://entry.example.com');
+  assert.equal((await call('GET',`/routes/${quiet.id}/channels`)).body.publicBaseUrl,direct);
+  const steered=(await call('GET','/steering')).body.routes.find(r=>r.id===quiet.id);
+  assert.deepEqual([steered.entryAddress,steered.issues.some(i=>/两台/.test(i))],[false,true]);
   assert.equal((await call('PATCH','/agents/local',{steerTarget:false})).status,200);
   assert.match((await call('GET','/steering')).body.machines.find(m=>m.id==='local').issues.join(),/已关闭/);
 });

@@ -22,7 +22,7 @@ import { qrRows } from './qr.js';
 import { fetchPanelIcon, MAX_ICON_BYTES, normalizePanelIcon } from './panel-icon.js';
 import { SteeringEngine, STEERING_MODES } from './steering.js';
 import { SteeringHub } from './steering-hub.js';
-import { agentSteeringIssues, normalizeClientList, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
+import { agentSteeringIssues, entryCoverageGaps, normalizeClientList, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const APP_VERSION=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8')).version;
@@ -132,7 +132,7 @@ function steeringView(){
   const machines=store.data.agents.filter(agent=>agent.state!=='revoked').map(agent=>{const view=agents.find(item=>item.id===agent.id)||{};return{id:agent.id,name:agent.name||agent.id,domain:view.domain||agent.domain||'',local:agent.id===LOCAL_AGENT_ID,status:view.status,agentVersion:view.agentVersion||'',steerTarget:agent.steerTarget!==false,issues:agentSteeringIssues({...agent,domain:view.domain||agent.domain},settings)}});
   const ready=machines.filter(machine=>!machine.issues.length),email=store.data.settings.certificateEmail||'';
   const entryCommands=settings.entryDomain&&email?ready.map(machine=>{const peers=ready.filter(other=>other.id!==machine.id).map(other=>other.domain);return{id:machine.id,name:machine.name,command:`sudo ${machine.local?'aegis-relay':'aegis-relay-agent'} entry ${settings.entryDomain} ${email}${peers.length?` ${peers.join(' ')}`:''}`}}):[];
-  const routes=store.data.routes.map(route=>({id:route.id,alias:route.alias,name:route.name,enabled:route.autoSteer?.enabled===true,issues:routeSteeringIssues(store.data,route,settings)}));
+  const routes=store.data.routes.map(route=>{const issues=routeSteeringIssues(store.data,route,settings),gaps=settings.entryDomain&&!issues.length?entryCoverageGaps(store.data,route,settings):[];return{id:route.id,alias:route.alias,name:route.name,enabled:route.autoSteer?.enabled===true,issues,entryGaps:gaps.map(agent=>agent.name||agent.id),entryAddress:!!steeringEntryBaseUrl(store.data,route)}});
   return {settings:{mode:settings.mode,entryDomain:settings.entryDomain,excludedClients:settings.excludedClients,autoExcluded:settings.autoExcluded,boundedClients:settings.boundedClients,boundMB:settings.boundMB},certificateEmail:email,machines,routes,entryCommands,live:steeringHub.view()};
 }
 function credentialsFor(route,accessKey){return{...clientCredentials(route,accessKey),publicBaseUrl:routeBaseUrl(route)}}
