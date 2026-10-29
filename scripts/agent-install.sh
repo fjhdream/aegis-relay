@@ -137,6 +137,7 @@ install -m 0755 "$TMP_DIR/source/scripts/agent-configure-domain.sh" "$INSTALL_DI
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-ip.sh" "$INSTALL_DIR/agent-configure-ip.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-host-domain-apply.sh" "$INSTALL_DIR/agent-host-domain-apply.sh"
 install -m 0755 "$TMP_DIR/source/scripts/configure-entry-domain.sh" "$INSTALL_DIR/configure-entry-domain.sh"
+install -m 0755 "$TMP_DIR/source/scripts/host-entry-apply.sh" "$INSTALL_DIR/host-entry-apply.sh"
 # The agent container is unprivileged, so a narrowly scoped host unit performs domain switches for it.
 if command -v systemctl >/dev/null 2>&1; then
   cat > /etc/systemd/system/aegis-relay-agent-domain.service <<EOF
@@ -159,8 +160,29 @@ Unit=aegis-relay-agent-domain.service
 [Install]
 WantedBy=multi-user.target
 EOF
+  cat > /etc/systemd/system/aegis-relay-agent-entry.service <<EOF
+[Unit]
+Description=AegisRelay agent constrained steering entry domain setup
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh $INSTALL_DIR/host-entry-apply.sh $INSTALL_DIR
+EOF
+  cat > /etc/systemd/system/aegis-relay-agent-entry.path <<EOF
+[Unit]
+Description=Watch AegisRelay agent steering entry domain requests
+
+[Path]
+PathExists=$INSTALL_DIR/data/host-entry-request.json
+Unit=aegis-relay-agent-entry.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
   systemctl daemon-reload
   systemctl enable --now aegis-relay-agent-domain.path
+  systemctl enable --now aegis-relay-agent-entry.path
 fi
 if [ "$MODE" = ip ]; then
   # IP 反代模式：配置明文 HTTP 入口，再重建容器以读取新写入的 AGENT_PROXY_MODE / AGENT_PROXY_IP。

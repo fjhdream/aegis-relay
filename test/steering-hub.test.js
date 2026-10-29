@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SteeringHub } from '../src/steering-hub.js';
 import { SteeringEngine } from '../src/steering.js';
-import { agentSnapshotNodes, agentSteeringIssues, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
+import { agentSnapshotNodes, agentSteeringIssues, cleanEntryRequest, desiredEntry, egressIssues, egressTopology, entryAttempt, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
 import { compileAgentDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
 
@@ -154,4 +154,124 @@ test('two engines converge through the hub: a landing at the target confirms the
   assert.ok(plan(a).redirect,'still steered after the landing timeout because the landing was confirmed');
   assert.equal(a.failures.length,0);
   a.stop();b.stop();
+});
+
+test('switch outcomes: a real switch is judged at its target, a shadow one by whether the line recovered',()=>{
+  let now=5_000_000;
+  const {store}=fixture(),hub=new SteeringHub({store,clock:()=>now}),at=ms=>{now=5_000_000+ms;return now};
+  const [s1,s2,s3,s4]=['D','E','F','G'].map(c=>c.repeat(22));
+  hub.exchange('local',{decisions:[{s:s1,r:'n1',assigned:'b',epoch:1,switched:true,from:'local',reason:'explore',fromRateBps:1e6,at:at(0)}]});
+  hub.exchange('b',{reports:[{s:s1,r:'n1',verdict:'unknown',rateBps:0,at:at(1000)}]});
+  assert.equal(hub.view().effects.on.total,0,'still waiting for a verdict');
+  hub.exchange('b',{reports:[{s:s1,r:'n1',verdict:'ok',rateBps:3e6,at:at(2000)}]});
+  // a redirect that never lands
+  hub.exchange('local',{decisions:[{s:s2,r:'n1',assigned:'b',epoch:1,switched:true,from:'local',at:at(3000)}]});
+  hub.exchange('local',{failures:[{s:s2,r:'n1',epoch:1,target:'b',client:'X',at:at(19_000)}],decisions:[{s:s2,r:'n1',assigned:'',epoch:2,switched:false,reason:'landing_timeout',at:now}]});
+  const on=hub.view().effects.on;
+  assert.deepEqual([on.total,on.better,on.notLanded,on.medianGain],[2,1,1,3]);
+  assert.deepEqual(on.pairs.map(pair=>[pair.from,pair.to,pair.total,pair.better]),[['local','b',2,1]]);
+  // shadow: one line recovers by itself, one stays stuck
+  hub.exchange('local',{shadow:[{s:s3,r:'n1',to:'b',reason:'explore',at:at(20_000)}],reports:[{s:s3,r:'n1',verdict:'starved_down',rateBps:1,at:now}]});
+  hub.exchange('local',{reports:[{s:s3,r:'n1',verdict:'ok',rateBps:1,at:at(80_000)}]});
+  hub.exchange('local',{shadow:[{s:s4,r:'n1',to:'b',reason:'explore',at:now}]});
+  hub.exchange('local',{reports:[{s:s4,r:'n1',verdict:'starved_down',rateBps:1,at:at(140_000)}]});
+  hub.exchange('local',{reports:[{s:s4,r:'n1',verdict:'starved_down',rateBps:1,at:at(210_000)}]});
+  assert.deepEqual(hub.view().effects.shadow,{total:2,recovered:1,persisted:1,unmeasured:0});
+  // an outcome nobody reports on is closed as unmeasured
+  hub.exchange('local',{decisions:[{s:'H'.repeat(22),r:'n1',assigned:'b',epoch:1,switched:true,from:'local',at:now}]});
+  at(900_000);hub.exchange('local',{});
+  assert.equal(hub.view().effects.on.unmeasured,1);
+});
+
+test('history is kept per node and client network, at most one sample a minute per session and machine',()=>{
+  let now=6_000_000;
+  const {store}=fixture(),hub=new SteeringHub({store,clock:()=>now}),p='N'.repeat(16);
+  for(let i=0;i<3;i++){
+    const s=String.fromCharCode(75+i).repeat(22);
+    hub.exchange('local',{reports:[{s,r:'n1',verdict:'starved_down',rateBps:1,at:now,p},{s,r:'n1',verdict:'starved_down',rateBps:1,at:now,p}]});
+    hub.exchange('b',{reports:[{s,r:'n1',verdict:'ok',rateBps:1,at:now,p}]});
+    now+=120_000;
+    hub.exchange('local',{reports:[{s,r:'n1',verdict:'starved_up',rateBps:1,at:now,p}]});
+  }
+  const fresh='Q'.repeat(22),response=hub.exchange('local',{reports:[{s:fresh,r:'n1',verdict:'unknown',rateBps:0,at:now,p}]});
+  assert.deepEqual(response.sessions.find(item=>item.s===fresh).prior,{local:{ok:0,n:3},b:{ok:1,n:3}});
+  assert.equal(hub.view().networks,1);
+  assert.equal(response.sessions.find(item=>item.s==='R'.repeat(22)),undefined);
+  const other=hub.exchange('local',{reports:[{s:'S'.repeat(22),r:'n1',verdict:'unknown',rateBps:0,at:now,p:'M'.repeat(16)}]});
+  assert.equal(other.sessions.find(item=>item.s==='S'.repeat(22)).prior,undefined);
+});
+
+test('capped ranges: a failed continuation switches a client off, a clean trial switches it on',()=>{
+  const {store,data}=fixture(),verdicts=[];
+  data.settings.steering.boundedClients=['Infuse'];
+  const hub=new SteeringHub({store,onBoundVerdict:(client,works)=>{verdicts.push([client,works]);(works?data.settings.steering.autoBounded||={}:data.settings.steering.autoUnbounded||={})[client]='now'}});
+  const send=items=>hub.exchange('local',{bounds:items.map(([client,continued,trial])=>({s:'T'.repeat(22),r:'n1',client,continued,trial,at:1}))});
+  send([['Infuse',true,false],['Infuse',false,false]]);
+  assert.deepEqual(verdicts,[]);
+  assert.deepEqual(send([['Infuse',false,false]]).boundedClients,[],'2 of 3 failed: off, even though the operator listed it');
+  // trials only run with automatic detection on, in active mode, for clients that follow redirects
+  assert.deepEqual(hub.exchange('local',{}).trialClients,[]);
+  data.settings.steering.boundAuto=true;
+  for(let i=0;i<5;i++)hub.exchange('b',{landings:[{s:String.fromCharCode(97+i).repeat(22),r:'n1',epoch:1,client:'VLC',at:1}]});
+  assert.deepEqual(hub.exchange('local',{}).trialClients,['VLC']);
+  send([['VLC',true,true],['VLC',true,true]]);
+  assert.equal(verdicts.length,1);
+  const after=send([['VLC',true,true]]);
+  assert.deepEqual(verdicts.at(-1),['VLC',true]);
+  assert.deepEqual([after.boundedClients,after.trialClients],[['VLC'],[]]);
+  send([['Kodi',false,true]]);
+  assert.deepEqual(verdicts.at(-1),['Kodi',false],'one failed trial is enough');
+  assert.deepEqual(hub.view().ranges.find(item=>item.client==='VLC').state,'on');
+});
+
+test('each participating machine is told to serve the entry domain and forward ACME challenges to the others',()=>{
+  const {data}=fixture();
+  assert.equal(desiredEntry(data,'local'),null,'no certificate email yet');
+  data.settings.certificateEmail='Ops@Example.com';
+  assert.deepEqual(desiredEntry(data,'local'),{domain:'entry.example.com',email:'ops@example.com',peers:['s2.example.com']});
+  assert.deepEqual(desiredEntry(data,'b').peers,['s1.example.com']);
+  assert.equal(desiredEntry(data,'c'),null,'a machine that cannot steer does not serve the entry domain');
+  assert.deepEqual(cleanEntryRequest({domain:'Entry.Example.com',email:'a@b',peers:['s2.example.com','s2.example.com']}),{domain:'entry.example.com',email:'a@b',peers:['s2.example.com']});
+  for(const bad of [{domain:'entry.example.com;reboot',email:'a@b',peers:[]},{domain:'entry.example.com',email:'a b@c',peers:[]},{domain:'entry.example.com',email:'a@b',peers:['x y']},{domain:'entry.example.com',email:'a@b',peers:['entry.example.com']},{domain:'entry.example.com',email:'a@b'}])assert.equal(cleanEntryRequest(bad),null);
+});
+
+test('an entry setup is filed once per configuration and a failure is retried with growing pauses',()=>{
+  const desired={domain:'entry.example.com',email:'a@b',peers:['s2.example.com']},now=Date.parse('2026-10-29T00:00:00Z');
+  const status=(state,attempt,minutesAgo,extra={})=>({requestId:'r',state,entryDomain:'entry.example.com',peers:['s2.example.com'],attempt,message:'',updatedAt:new Date(now-minutesAgo*60_000).toISOString(),...extra});
+  assert.equal(entryAttempt(desired,null,now),1);
+  assert.equal(entryAttempt(desired,status('active',1,0),now),0);
+  assert.equal(entryAttempt(desired,status('applying',1,0),now),0);
+  assert.equal(entryAttempt(desired,status('active',1,0,{peers:[]}),now),1,'a new machine joined');
+  assert.equal(entryAttempt(desired,status('failed',1,2),now),0);
+  assert.equal(entryAttempt(desired,status('failed',1,3),now),2);
+  assert.equal(entryAttempt(desired,status('failed',2,8),now),0);
+  assert.equal(entryAttempt(desired,status('failed',2,9),now),3);
+  assert.equal(entryAttempt(desired,status('failed',9,59),now),0);
+  assert.equal(entryAttempt(desired,status('failed',9,60),now),10);
+});
+
+test('an egress machine is compiled into every other machine serving the node, and only when all of them can relay',()=>{
+  const {data,route}=fixture(),identity=generatePanelSigningIdentity();
+  data.agents[1].capabilities.push('egress-v1');
+  data.deployments=data.deployments.filter(item=>item.agentId!=='c');
+  route.egressAgentId='b';
+  assert.deepEqual(egressIssues(data,route),[]);
+  assert.deepEqual(egressTopology(data,route),{id:'b',base:'https://s2.example.com'});
+  assert.deepEqual(agentSnapshotNodes(data,'local')[0].egress,{id:'b',base:'https://s2.example.com'});
+  assert.equal(agentSnapshotNodes(data,'b')[0].egress,undefined,'the egress machine goes upstream itself');
+  assert.equal(agentSnapshotNodes(data,'local')[0].steering.params.anyLine,true,'line matching is moot through one egress');
+  // also in force with steering switched off: the point is a single upstream address
+  const off=structuredClone(data);off.settings.steering.mode='off';
+  assert.equal(compileAgentDesiredSnapshot({data:off,agentId:'local',signingIdentity:identity}).snapshot.nodes[0].egress.base,'https://s2.example.com');
+  // a machine serving the node that cannot relay would bring a second address back: not in force
+  data.deployments.push({agentId:'c',routeId:'n1',enabled:true});
+  assert.match(egressIssues(data,route).join(),/jp 的探针版本不支持统一出口/);
+  assert.equal(agentSnapshotNodes(data,'local')[0].egress,undefined);
+  data.deployments.pop();
+  assert.match(egressIssues(data,{...route,egressAgentId:'c'}).join(),/没有部署该节点/);
+  assert.match(egressIssues(data,{...route,egressAgentId:'gone'}).join(),/不存在/);
+  assert.match(egressIssues({...data,agents:data.agents.map(agent=>agent.id==='b'?{...agent,proxyMode:'ip'}:agent)},route).join(),/HTTPS/);
+  assert.match(egressIssues(data,{...route,accessMode:'alias_only',routeAuthKey:null}).join(),/连接密码/);
+  off.agents=off.agents.map(agent=>agent.id==='b'?{...agent,domain:'s2.example.com/x'}:agent);
+  assert.throws(()=>compileAgentDesiredSnapshot({data:off,agentId:'local',signingIdentity:identity}),/invalid egress machine/);
 });

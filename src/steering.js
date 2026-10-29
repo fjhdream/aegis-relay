@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import net from 'node:net';
 import zlib from 'node:zlib';
 import { isRouteAuthKey } from './route-auth.js';
 import { b64u } from './security.js';
@@ -10,15 +11,20 @@ import { b64u } from './security.js';
 export const STEER_PARAM='aegis_steer';
 export const STEERING_CAPABILITY='steering-v1';
 export const STEERING_MODES=Object.freeze(['off','shadow','on']);
+// egress-v1: this machine relays a node's upstream traffic through the node's egress machine, and
+// recognises such relayed requests when it is the egress machine itself.
+export const EGRESS_CAPABILITY='egress-v1';
+export const EGRESS_HEADER='x-aegis-egress',EGRESS_HOST_HEADER='x-aegis-egress-host';
 export const VERDICTS=Object.freeze(['ok','starved_down','starved_up','unknown']);
 export const STEER_DEFAULTS=Object.freeze({
   hlsWindowMs:20_000,minHlsSegments:4,progressiveWindowTicks:120,verdictTtlMs:60_000,dwellMs:120_000,
   switchWindowMs:600_000,maxSwitches:3,improve:1.3,penaltyMs:600_000,tokenTtlMs:30_000,sessionTtlMs:30*60_000,
   peerStaleMs:60_000,landingTimeoutMs:15_000,detachMs:15_000,reportEveryMs:5_000,
-  syncActiveMs:5_000,syncIdleMs:30_000,syncDebounceMs:500,syncMaxBackoffMs:300_000,boundBytes:64*1024*1024
+  syncActiveMs:5_000,syncIdleMs:30_000,syncDebounceMs:500,syncMaxBackoffMs:300_000,boundBytes:64*1024*1024,
+  historyMinSamples:3,historyBadShare:0.34,historyGoodShare:0.75,boundContinueMs:30_000
 });
 
-const SESSION_KEY_RE=/^[A-Za-z0-9_-]{22}$/;
+const SESSION_KEY_RE=/^[A-Za-z0-9_-]{22}$/,PREFIX_KEY_RE=/^[A-Za-z0-9_-]{16}$/;
 const ITEM_RE=/\/(?:emby\/)?(?:videos|audio)\/([^/]+)\//i;
 const DOWNLOAD_RE=/\/items\/([^/]+)\/download/i;
 // Side files of a playback (subtitles, images, trickplay) are tiny, parallel and not the stream itself:
@@ -91,6 +97,45 @@ export function sessionKeyFor(route, item, identity) {
   return b64u(mac(key,'session',[item,identity.mediaSourceId,identity.playSessionId,identity.deviceId].join('\n')).subarray(0,16));
 }
 
+// The client's network, coarse enough to stand for "viewers on the same line": IPv4 /24, IPv6 /48.
+export function clientPrefix(ip) {
+  const value=String(ip||'').trim().replace(/^::ffff:/i,'');
+  if(net.isIPv4(value))return `${value.split('.').slice(0,3).join('.')}.0/24`;
+  if(!net.isIPv6(value))return '';
+  const [head,tail]=value.split('::'),left=head?head.split(':'):[],right=tail?tail.split(':'):[];
+  const groups=value.includes('::')?[...left,...Array(Math.max(0,8-left.length-right.length)).fill('0'),...right]:left;
+  return `${groups.slice(0,3).map(group=>parseInt(group,16).toString(16)).join(':')}::/48`;
+}
+
+// The same X-Real-IP the relay's viewer list trusts: set by the fronting Nginx, never by the client.
+export function clientIpOf(req) {
+  const first=value=>String(value||'').split(',')[0].trim();
+  return first(req.headers['x-real-ip'])||first(req.headers['x-forwarded-for'])||String(req.socket?.remoteAddress||'');
+}
+
+// What the panel learns per network is keyed by a per-node digest: no address ever leaves the machine.
+export function prefixKeyFor(route, ip) {
+  const key=steerKey(route),prefix=clientPrefix(ip);
+  return key&&prefix?b64u(mac(key,'prefix',prefix).subarray(0,12)):'';
+}
+
+// A request one machine relays to the node's egress machine carries a short-lived proof derived from
+// the node key (which only the machines serving the node hold), plus the host the client used. The
+// egress machine then builds every link for that host and leaves steering and accounting to the relay.
+export function egressToken(route, nowMs) {
+  const key=steerKey(route);
+  return key?b64u(mac(key,'egress',String(Math.floor(nowMs/60_000))).subarray(0,16)):'';
+}
+
+export function relayedEgress(route, headers, nowMs) {
+  const key=steerKey(route),token=String(headers?.[EGRESS_HEADER]||''),host=String(headers?.[EGRESS_HOST_HEADER]||'').trim().toLowerCase();
+  if(!key||!/^[A-Za-z0-9_-]{22}$/.test(token)||!/^[a-z0-9.-]{1,253}(?::\d{1,5})?$/.test(host))return null;
+  const raw=Buffer.from(token,'base64url'),minute=Math.floor(nowMs/60_000);
+  // Machine clocks drift a little; a captured proof is stale within minutes.
+  for(let skew=-2;skew<=2;skew++)if(crypto.timingSafeEqual(raw,mac(key,'egress',String(minute+skew)).subarray(0,16)))return {host};
+  return null;
+}
+
 export function sealSteerToken(route, {epoch, issuedAtMs, target, sessionKey}) {
   const key=steerKey(route),session=Buffer.from(String(sessionKey||''),'base64url');
   if(!key)throw new Error('steering key unavailable');
@@ -148,9 +193,15 @@ export function decide(session, {self, nowMs, candidates, params=STEER_DEFAULTS}
   const assigned=session.assigned||'',target=assigned||self;
   if(target!==self&&!candidates.get(target)?.eligible)return {target:self,assigned:'',changed:true,switched:false,reason:'target_unavailable'};
   const current=session.scores?.[target];
-  const starving=current&&current.verdict==='starved_down'&&nowMs-current.at<=params.verdictTtlMs;
+  const fresh=current&&nowMs-current.at<=params.verdictTtlMs,starving=fresh&&current.verdict==='starved_down';
   const recent=(session.switches||[]).filter(at=>nowMs-at<params.switchWindowMs);
-  if(!starving||nowMs-(session.lastSwitchAt||0)<params.dwellMs||recent.length>=params.maxSwitches)return {target,assigned,changed:false};
+  if(nowMs-(session.lastSwitchAt||0)<params.dwellMs||recent.length>=params.maxSwitches)return {target,assigned,changed:false};
+  if(!starving){
+    // The one move not triggered by starving: a session that never moved, on a machine this network
+    // has kept starving on, while another one has kept serving it well. Decided before it stalls.
+    const pick=!session.lastSwitchAt&&!(fresh&&current.verdict==='ok')?historyPick(session,target,candidates,params):'';
+    return pick?{target:pick,assigned:pick,changed:true,switched:true,reason:'history',fromRateBps:current?.rateBps||0,toRateBps:0}:{target,assigned,changed:false};
+  }
   let best=null,explore=null;
   for(const [id,candidate] of candidates){
     if(id===target||!candidate.eligible)continue;
@@ -159,13 +210,34 @@ export function decide(session, {self, nowMs, candidates, params=STEER_DEFAULTS}
       if(score.verdict==='ok'&&score.rateBps>=params.improve*(current.rateBps||0)&&(!best||score.rateBps>best.rateBps))best={id,rateBps:score.rateBps};
       continue;
     }
-    const tried=session.tried?.[id]||0;
-    if(!explore||tried<explore.tried)explore={id,tried};
+    // Untested here: try the machine this network has done best on, then the least recently tried.
+    const tried=session.tried?.[id]||0,share=historyShare(session,id,params);
+    if(!explore||share>explore.share||(share===explore.share&&tried<explore.tried))explore={id,tried,share};
   }
   const pick=best?.id||explore?.id;
   if(!pick)return {target,assigned,changed:false};
   return {target:pick,assigned:pick,changed:true,switched:true,reason:best?'better_line':'explore',fromRateBps:current.rateBps||0,toRateBps:best?.rateBps||0};
 }
+
+// Share of good verdicts this client network has had on a machine (0.5 while too few are known).
+function historyShare(session, id, params) {
+  const seen=session.prior?.[id];
+  return seen&&seen.n>=params.historyMinSamples?seen.ok:0.5;
+}
+
+function historyPick(session, target, candidates, params) {
+  const mine=session.prior?.[target];
+  if(!mine||mine.n<params.historyMinSamples||mine.ok>params.historyBadShare)return '';
+  let pick=null;
+  for(const [id,candidate] of candidates){
+    const seen=session.prior?.[id];
+    if(id===target||!candidate.eligible||!seen||seen.n<params.historyMinSamples||seen.ok<params.historyGoodShare)continue;
+    if(!pick||seen.ok>pick.ok)pick={id,ok:seen.ok};
+  }
+  return pick?.id||'';
+}
+
+const rangeStart=value=>{const match=/^bytes=(\d+)-/.exec(String(value||'').trim());return match?Number(match[1]):null};
 
 function appendToken(search, token) {
   return `${search?`${search}&`:'?'}${STEER_PARAM}=${token}`;
@@ -184,7 +256,7 @@ function manifestTargetDuration(buffer, encoding) {
 // One served playback request. The proxy reports headers/bytes; the engine samples backpressure.
 class SteerTrack {
   constructor(engine, session, kind, nowMs) {
-    this.engine=engine;this.session=session;this.kind=kind;this.reqAt=nowMs;this.hdrAt=0;this.endAt=0;this.sent=0;this.blockedTicks=0;this.res=null;this.done=false;
+    this.engine=engine;this.session=session;this.kind=kind;this.reqAt=nowMs;this.hdrAt=0;this.endAt=0;this.sent=0;this.blockedTicks=0;this.res=null;this.done=false;this.bound=null;
     const local=engine.localOf(session);
     if(kind==='segment')local.hls.open=this;
     else if(kind==='progressive'){
@@ -196,12 +268,24 @@ class SteerTrack {
     engine.tracks.add(this);
   }
   attach(res) { this.res=res;res.once('close',()=>this.close()); }
-  headers() { if(!this.hdrAt)this.hdrAt=this.engine.now(); }
+  headers(status, headers={}) {
+    if(!this.hdrAt)this.hdrAt=this.engine.now();
+    // A capped Range only counts when the origin really cut the file there; near the end of a file, or
+    // from an origin that ignores Range, nothing was cut and there is nothing to continue.
+    if(this.bound){
+      const match=/^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec(String(headers['content-range']||'').trim());
+      const cut=status===206&&match&&Number(match[1])===this.bound.start&&Number(match[2])===this.bound.end&&(match[3]==='*'||Number(match[3])>this.bound.end+1);
+      if(cut)this.bound.length=this.bound.end-this.bound.start+1;else this.engine.dropBound(this);
+    }
+  }
   bytes(count) { this.sent+=count;if(this.kind==='progressive')this.engine.localOf(this.session).prog.tickBytes+=count; }
   close() {
     if(this.done)return;
     this.done=true;this.endAt=this.engine.now();this.res=null;this.engine.tracks.delete(this);
     if(this.kind==='progressive'){const prog=this.engine.localOf(this.session).prog;prog.active.delete(this);prog.lastServedAt=this.endAt;}
+    // The whole capped range reached the client: a player that handles it asks for the rest right away.
+    if(this.bound?.length&&this.sent>=this.bound.length)this.engine.localOf(this.session).boundWait={end:this.bound.end,at:this.endAt,client:this.bound.client,trial:this.bound.trial};
+    else if(this.bound)this.engine.dropBound(this);
   }
   // The media playlist states its segment length; read it off the wire without delaying delivery.
   manifest(stream, encoding) {
@@ -215,8 +299,8 @@ export class SteeringEngine {
   constructor({selfId, lineOf=()=>0, canServe=()=>true, params={}, clock=()=>Date.now()}={}) {
     this.selfId=String(selfId||'');this.lineOf=lineOf;this.canServe=canServe;this.params={...STEER_DEFAULTS,...params};this.clock=clock;
     this.offsetMs=0;this.sessions=new Map();this.items=new Map();this.tracks=new Set();this.health=new Map();
-    this.excluded=new Set();this.bounded=new Set();this.boundBytes=this.params.boundBytes;
-    this.cursor=0;this.reports=new Map();this.decisions=[];this.landings=[];this.failures=[];this.shadow=[];
+    this.excluded=new Set();this.bounded=new Set();this.trials=new Set();this.trialing=new Set();this.boundBytes=this.params.boundBytes;
+    this.cursor=0;this.reports=new Map();this.decisions=[];this.landings=[];this.failures=[];this.shadow=[];this.bounds=[];
     this.ticker=null;this.syncTimer=null;this.syncDue=0;this.syncing=false;this.send=null;this.routes=()=>[];this.syncErrors=0;this.lastSyncError='';this.lastSyncAt=0;
   }
 
@@ -227,14 +311,14 @@ export class SteeringEngine {
   session(key, routeId, nowMs) {
     let session=this.sessions.get(key);
     if(!session){
-      session={key,routeId,assigned:'',epoch:0,lastSwitchAt:0,switches:[],scores:{},tried:{},segmentSeconds:0,lastLanding:null,lastSeen:nowMs,client:'',minRateMbps:0,pending:null,landedEpoch:-1,shadow:{lastSwitchAt:0,switches:[]},local:null};
+      session={key,routeId,assigned:'',epoch:0,lastSwitchAt:0,switches:[],scores:{},tried:{},segmentSeconds:0,lastLanding:null,lastSeen:nowMs,client:'',minRateMbps:0,pending:null,landedEpoch:-1,shadow:{lastSwitchAt:0,switches:[]},prefix:'',prior:{},local:null};
       this.sessions.set(key,session);this.startTicking();
     }
     return session;
   }
 
   localOf(session) {
-    session.local||={hls:{open:null,samples:[]},prog:{ticks:[],tickBytes:0,active:new Set(),lastServedAt:0},lastVerdict:'',lastReportAt:null};
+    session.local||={hls:{open:null,samples:[]},prog:{ticks:[],tickBytes:0,active:new Set(),lastServedAt:0},lastVerdict:'',lastReportAt:null,boundWait:null,trialed:false};
     return session.local;
   }
 
@@ -249,7 +333,10 @@ export class SteeringEngine {
     for(const peer of route.steering.peers||[]){
       if(peer.id===this.selfId){candidates.set(peer.id,{eligible:true,base:peer.base});continue;}
       const health=this.health.get(peer.id),routeHealth=health?.routes?.[route.id];
-      const eligible=!!(health&&health.healthy&&routeHealth&&!routeHealth.quotaExhausted&&Number(routeHealth.line)===line&&nowMs-health.at<=this.params.peerStaleMs);
+      // Same upstream line, so a seek lands on the Emby server holding the transcode — unless every
+      // machine reaches the upstream through the node's egress machine anyway.
+      const sameLine=route.steering.params?.anyLine===true||Number(routeHealth?.line)===line;
+      const eligible=!!(health&&health.healthy&&routeHealth&&!routeHealth.quotaExhausted&&sameLine&&nowMs-health.at<=this.params.peerStaleMs);
       candidates.set(peer.id,{eligible,base:peer.base});
     }
     if(!candidates.has(this.selfId))candidates.set(this.selfId,{eligible:true,base:''});
@@ -273,6 +360,10 @@ export class SteeringEngine {
     if(itemKey)this.rememberItem(itemKey,key,nowMs);
     const session=this.session(key,route.id,nowMs);
     session.lastSeen=nowMs;session.minRateMbps=Number(topology.params?.minRateMbps||0);if(identity.client)session.client=identity.client;
+    if(!session.prefix)session.prefix=prefixKeyFor(route,clientIpOf(req));
+    // The player came back for the bytes right after a capped range: it continues on its own.
+    const wait=session.local?.boundWait;
+    if(wait&&kind==='progressive'&&rangeStart(req.headers.range)===wait.end+1)this.boundResult(session,true,nowMs);
     // The next segment request marks the moment the client finished the previous one.
     if(kind==='segment')this.closeCycle(session,nowMs);
     // A request we were just steered to is always served here: one steering hop per request at most,
@@ -320,10 +411,18 @@ export class SteeringEngine {
     if(session.local.lastReportAt===null)this.queueReport(session,true);
     // Phase 3 (opt-in per client): cap an open-ended Range so a long direct play is cut into requests,
     // each of which is a chance to move the session. Only for clients proven to continue on their own.
+    // A client type on trial (automatic detection, off by default) gets one capped range per session and
+    // one session at a time per machine: the trial can only ever interrupt that one playback.
     let range=null;
-    if(kind==='progressive'&&topology.mode==='on'&&identity.client&&this.bounded.has(identity.client.toLowerCase())){
+    const name=identity.client.toLowerCase(),local=session.local;
+    const trial=!!name&&!this.bounded.has(name)&&this.trials.has(name)&&!local.trialed&&!this.trialing.has(name);
+    if(kind==='progressive'&&topology.mode==='on'&&name&&(this.bounded.has(name)||trial)){
       const match=/^bytes=(\d+)-$/.exec(String(req.headers.range||'').trim()),start=match?Number(match[1]):NaN;
-      if(Number.isSafeInteger(start))range=`bytes=${start}-${start+this.boundBytes-1}`;
+      if(Number.isSafeInteger(start)){
+        range=`bytes=${start}-${start+this.boundBytes-1}`;
+        track.bound={start,end:start+this.boundBytes-1,client:identity.client,trial,length:0};
+        if(trial){local.trialed=true;this.trialing.add(name);}
+      }
     }
     return {track,range};
   }
@@ -361,7 +460,7 @@ export class SteeringEngine {
   queueReport(session, urgent=false) {
     const own=session.scores[this.selfId],local=this.localOf(session);
     local.lastReportAt=this.now();
-    this.reports.set(session.key,{s:session.key,r:session.routeId,verdict:own?.verdict||'unknown',rateBps:own?.rateBps||0,at:own?.at||this.now(),segmentSeconds:session.segmentSeconds||0,client:session.client});
+    this.reports.set(session.key,{s:session.key,r:session.routeId,verdict:own?.verdict||'unknown',rateBps:own?.rateBps||0,at:own?.at||this.now(),segmentSeconds:session.segmentSeconds||0,client:session.client,p:session.prefix||''});
     if(urgent)this.requestSync();
   }
 
@@ -390,6 +489,21 @@ export class SteeringEngine {
     if(session.assigned===pending.target)this.reassign(session,{target:this.selfId,assigned:'',changed:true,switched:false,reason:'landing_timeout'},nowMs);
   }
 
+  // A capped range that cut nothing, or never fully reached the client, proves nothing either way.
+  dropBound(track) {
+    if(track.bound?.trial)this.trialing.delete(String(track.bound.client).toLowerCase());
+    track.bound=null;
+  }
+
+  boundResult(session, continued, nowMs) {
+    const wait=session.local.boundWait;
+    session.local.boundWait=null;
+    if(wait.trial)this.trialing.delete(String(wait.client).toLowerCase());
+    this.bounds.push({s:session.key,r:session.routeId,client:wait.client,continued,trial:wait.trial,at:nowMs});
+    if(this.bounds.length>1000)this.bounds.splice(0,this.bounds.length-1000);
+    this.requestSync();
+  }
+
   startTicking() {
     if(this.ticker)return;
     this.ticker=setInterval(()=>this.tick(),1000);this.ticker.unref?.();
@@ -412,6 +526,7 @@ export class SteeringEngine {
         if(prog.ticks.length>=windowTicks)this.score(session,progressiveVerdict(prog.ticks,{windowTicks,minRateMbps:session.minRateMbps}),nowMs);
       }
       if(session.pending)this.checkPending(session,nowMs);
+      if(session.local?.boundWait&&nowMs-session.local.boundWait.at>this.params.boundContinueMs)this.boundResult(session,false,nowMs);
       if(nowMs-session.lastSeen>this.params.sessionTtlMs&&!prog?.active.size)this.sessions.delete(session.key);
     }
     for(const [itemKey,entry] of this.items){if(nowMs-entry.at<=this.params.sessionTtlMs)break;this.items.delete(itemKey);}
@@ -429,14 +544,16 @@ export class SteeringEngine {
     for(const route of routes)health.routes[route.id]={line:this.lineOf(route),quotaExhausted:!this.canServe(route)};
     const reports=[...this.reports.values()].slice(0,200);
     for(const report of reports)this.reports.delete(report.s);
-    return {protocolVersion:1,cursor:this.cursor,reports,decisions:this.decisions.splice(0,200),landings:this.landings.splice(0,200),failures:this.failures.splice(0,200),shadow:this.shadow.splice(0,200),health};
+    return {protocolVersion:1,cursor:this.cursor,reports,decisions:this.decisions.splice(0,200),landings:this.landings.splice(0,200),failures:this.failures.splice(0,200),shadow:this.shadow.splice(0,200),bounds:this.bounds.splice(0,200),health};
   }
 
   // A failed sync must not lose decisions/landings: put them back in front (reports are superseded by
   // fresher ones anyway).
   requeue(payload) {
-    this.decisions.unshift(...payload.decisions);this.landings.unshift(...payload.landings);this.failures.unshift(...payload.failures);this.shadow.unshift(...payload.shadow);
-    for(const list of ['decisions','landings','failures','shadow'])if(this[list].length>1000)this[list].splice(0,this[list].length-1000);
+    for(const list of ['decisions','landings','failures','shadow','bounds']){
+      this[list].unshift(...(payload[list]||[]));
+      if(this[list].length>1000)this[list].splice(0,this[list].length-1000);
+    }
   }
 
   applySync(response) {
@@ -448,6 +565,7 @@ export class SteeringEngine {
     if(Array.isArray(response.peers))this.health=new Map(response.peers.map(peer=>[String(peer?.id||''),{healthy:peer?.healthy===true,at:Number(peer?.at)||0,routes:peer?.routes&&typeof peer.routes==='object'?peer.routes:{}}]));
     if(Array.isArray(response.excludedClients))this.excluded=new Set(response.excludedClients.map(client=>String(client).toLowerCase()));
     if(Array.isArray(response.boundedClients))this.bounded=new Set(response.boundedClients.map(client=>String(client).toLowerCase()));
+    if(Array.isArray(response.trialClients))this.trials=new Set(response.trialClients.map(client=>String(client).toLowerCase()));
     if(Number.isSafeInteger(response.boundBytes)&&response.boundBytes>=1024*1024)this.boundBytes=response.boundBytes;
   }
 
@@ -468,6 +586,10 @@ export class SteeringEngine {
     }
     for(const [id,at] of Object.entries(remote.tried&&typeof remote.tried==='object'?remote.tried:{}))session.tried[id]=Math.max(session.tried[id]||0,Number(at)||0);
     if(!session.segmentSeconds&&Number(remote.segmentSeconds)>0)session.segmentSeconds=Number(remote.segmentSeconds);
+    if(remote.prior&&typeof remote.prior==='object'){
+      session.prior={};
+      for(const [id,seen] of Object.entries(remote.prior).slice(0,32)){const n=Math.floor(Number(seen?.n)||0),ok=Number(seen?.ok);if(n>0&&ok>=0&&ok<=1)session.prior[id]={ok,n};}
+    }
     if(remote.lastLanding&&(!session.lastLanding||Number(remote.lastLanding.at)>session.lastLanding.at))session.lastLanding={epoch:Number(remote.lastLanding.epoch)||0,at:Number(remote.lastLanding.at)||0};
     session.lastSeen=Math.max(session.lastSeen,Number(remote.lastSeen)||0);
   }
