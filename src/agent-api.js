@@ -6,7 +6,7 @@ import { LOCAL_AGENT_ID, normalizeAgentDomain, replaceAgentDeployments } from '.
 import { sealAgentSnapshot } from './agent-config.js';
 import { sanitizeTelemetry } from './telemetry.js';
 import { STEERING_CAPABILITY } from './steering.js';
-import { readSteeringSettings } from './steering-topology.js';
+import { cleanEntryStatus, desiredEntry, ENTRY_CAPABILITY, readSteeringSettings } from './steering-topology.js';
 
 export const AGENT_PROTOCOL_VERSION=1;
 export const ENROLLMENT_TTL_MS=10*60_000;
@@ -230,6 +230,7 @@ export class AgentApi {
         // An upgraded machine (new capability) or a changed domain reshapes which machines may steer a
         // node between them; recompile everyone's snapshot so the new peer list goes out right away.
         if(steeringTopologyKey(agent)!==topologyBefore&&readSteeringSettings(this.store.data).mode!=='off'){this.invalidate();this.onTopologyChange?.();}
+        if(parsed.entryStatus!==undefined)agent.entryStatus=cleanEntryStatus(parsed.entryStatus);
         if(parsed.telemetry!==undefined){const telemetry=sanitizeTelemetry(parsed.telemetry);if(!telemetry)throw Object.assign(new Error('invalid agent telemetry'),{status:400,nonce:requestNonce});agent.telemetry=telemetry;agent.lastTelemetryAt=at;}
         // Heartbeat state is disposable; the panel's periodic flush persists it. Writing the whole
         // encrypted store synchronously on every check-in stalled the event loop serving playback.
@@ -245,7 +246,7 @@ export class AgentApi {
         // An agent that follows config over the long poll (config-longpoll-v1) is woken the moment its
         // node set changes, so the beat is no longer the lever: it only carries health and telemetry.
         const pendingConfig=snapshot.revision>Number(agent.appliedRevision||0),longPoll=agent.capabilities.includes('config-longpoll-v1');
-        return this.send(res,200,{protocolVersion:AGENT_PROTOCOL_VERSION,serverTime:nowSeconds(),desiredRevision:snapshot.revision,heartbeatSeconds:longPoll?30:pendingConfig?5:10,agentVersion:this.version,desiredDomain:agent.desiredDomain||'',desiredMode:agent.desiredMode||'',certificateEmail:this.store.data.settings?.certificateEmail||''},requestNonce);
+        return this.send(res,200,{protocolVersion:AGENT_PROTOCOL_VERSION,serverTime:nowSeconds(),desiredRevision:snapshot.revision,heartbeatSeconds:longPoll?30:pendingConfig?5:10,agentVersion:this.version,desiredDomain:agent.desiredDomain||'',desiredMode:agent.desiredMode||'',certificateEmail:this.store.data.settings?.certificateEmail||'',...(agent.capabilities.includes(ENTRY_CAPABILITY)?{entry:desiredEntry(this.store.data,agent.id)}:{})},requestNonce);
       }
       if(req.method==='GET'&&url.pathname==='/api/agent/v1/config'){
         const {raw}=await readBody(req),verified=this.verify(req,url,raw);requestNonce=verified.nonce;

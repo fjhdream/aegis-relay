@@ -123,3 +123,50 @@ export function steeringEntryBaseUrl(data, route) {
   if(!settings.entryDomain||!route||!steeringTopology(data,route,settings)||entryCoverageGaps(data,route,settings).length)return '';
   return `https://${settings.entryDomain}`;
 }
+
+// --- Entry domain on each machine (applied by a host unit, like a domain switch) ---
+export const ENTRY_CAPABILITY='entry-v1';
+const ENTRY_STATES=['pending','applying','active','failed'];
+const ENTRY_RETRY_MINUTES=[3,9,27,60];
+
+// What a machine must serve for the entry domain: the domain itself, the certificate email, and the
+// other participating machines it forwards ACME challenges to. null when it should not serve it.
+export function desiredEntry(data, agentId) {
+  const settings=readSteeringSettings(data),email=String(data?.settings?.certificateEmail||'').trim().toLowerCase();
+  if(!settings.entryDomain||!email)return null;
+  const machines=(Array.isArray(data.agents)?data.agents:[]).filter(agent=>steerableAgent(agent,settings)),self=machines.find(agent=>agent.id===agentId);
+  if(!self)return null;
+  return {domain:settings.entryDomain,email,peers:machines.filter(agent=>agent!==self).map(agent=>String(agent.domain).toLowerCase()).sort()};
+}
+
+// The request comes from the panel (signed) and goes to a root-owned host script (which re-checks it);
+// anything off here is dropped rather than repaired.
+export function cleanEntryRequest(value) {
+  if(!value||typeof value!=='object')return null;
+  const domain=String(value.domain||'').toLowerCase(),email=String(value.email||'').toLowerCase(),peers=Array.isArray(value.peers)?value.peers.map(peer=>String(peer).toLowerCase()):null;
+  if(!DOMAIN_RE.test(domain)||!/^[^\s@]+@[^\s@]+$/.test(email)||email.length>254||!peers||peers.length>16||!peers.every(peer=>DOMAIN_RE.test(peer)&&peer!==domain))return null;
+  return {domain,email,peers:[...new Set(peers)].sort()};
+}
+
+export function cleanEntryStatus(value) {
+  if(!value||typeof value!=='object')return null;
+  return {requestId:String(value.requestId||'').slice(0,80),state:ENTRY_STATES.includes(value.state)?value.state:'failed',
+    entryDomain:String(value.entryDomain||'').slice(0,253),peers:Array.isArray(value.peers)?value.peers.slice(0,16).map(peer=>String(peer).slice(0,253)):[],
+    attempt:Math.max(0,Math.min(1000,Math.floor(Number(value.attempt)||0))),message:String(value.message||'').slice(0,500),updatedAt:String(value.updatedAt||'').slice(0,40)};
+}
+
+// 0 when nothing is to be done, otherwise the attempt number of the request to file. A failure for the
+// same configuration is retried with growing pauses: until every machine forwards ACME challenges (or
+// DNS is in place) issuance keeps failing, and Let's Encrypt allows only a few failures per hour.
+export function entryAttempt(desired, status, nowMs=Date.now()) {
+  if(!desired)return 0;
+  const same=status&&status.entryDomain===desired.domain&&status.peers.join(' ')===desired.peers.join(' ');
+  if(!same)return 1;
+  if(status.state!=='failed')return 0;
+  const waitMs=ENTRY_RETRY_MINUTES[Math.min(ENTRY_RETRY_MINUTES.length-1,Math.max(0,status.attempt-1))]*60_000,age=nowMs-Date.parse(status.updatedAt||'');
+  return Number.isFinite(age)&&age>=waitMs?status.attempt+1:0;
+}
+
+export function entryCommand(entry, local) {
+  return `sudo ${local?'aegis-relay':'aegis-relay-agent'} entry ${entry.domain} ${entry.email}${entry.peers.length?` ${entry.peers.join(' ')}`:''}`;
+}

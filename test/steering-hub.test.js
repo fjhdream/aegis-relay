@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SteeringHub } from '../src/steering-hub.js';
 import { SteeringEngine } from '../src/steering.js';
-import { agentSnapshotNodes, agentSteeringIssues, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
+import { agentSnapshotNodes, agentSteeringIssues, cleanEntryRequest, desiredEntry, entryAttempt, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
 import { compileAgentDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
 
@@ -222,4 +222,30 @@ test('capped ranges: a failed continuation switches a client off, a clean trial 
   send([['Kodi',false,true]]);
   assert.deepEqual(verdicts.at(-1),['Kodi',false],'one failed trial is enough');
   assert.deepEqual(hub.view().ranges.find(item=>item.client==='VLC').state,'on');
+});
+
+test('each participating machine is told to serve the entry domain and forward ACME challenges to the others',()=>{
+  const {data}=fixture();
+  assert.equal(desiredEntry(data,'local'),null,'no certificate email yet');
+  data.settings.certificateEmail='Ops@Example.com';
+  assert.deepEqual(desiredEntry(data,'local'),{domain:'entry.example.com',email:'ops@example.com',peers:['s2.example.com']});
+  assert.deepEqual(desiredEntry(data,'b').peers,['s1.example.com']);
+  assert.equal(desiredEntry(data,'c'),null,'a machine that cannot steer does not serve the entry domain');
+  assert.deepEqual(cleanEntryRequest({domain:'Entry.Example.com',email:'a@b',peers:['s2.example.com','s2.example.com']}),{domain:'entry.example.com',email:'a@b',peers:['s2.example.com']});
+  for(const bad of [{domain:'entry.example.com;reboot',email:'a@b',peers:[]},{domain:'entry.example.com',email:'a b@c',peers:[]},{domain:'entry.example.com',email:'a@b',peers:['x y']},{domain:'entry.example.com',email:'a@b',peers:['entry.example.com']},{domain:'entry.example.com',email:'a@b'}])assert.equal(cleanEntryRequest(bad),null);
+});
+
+test('an entry setup is filed once per configuration and a failure is retried with growing pauses',()=>{
+  const desired={domain:'entry.example.com',email:'a@b',peers:['s2.example.com']},now=Date.parse('2026-10-29T00:00:00Z');
+  const status=(state,attempt,minutesAgo,extra={})=>({requestId:'r',state,entryDomain:'entry.example.com',peers:['s2.example.com'],attempt,message:'',updatedAt:new Date(now-minutesAgo*60_000).toISOString(),...extra});
+  assert.equal(entryAttempt(desired,null,now),1);
+  assert.equal(entryAttempt(desired,status('active',1,0),now),0);
+  assert.equal(entryAttempt(desired,status('applying',1,0),now),0);
+  assert.equal(entryAttempt(desired,status('active',1,0,{peers:[]}),now),1,'a new machine joined');
+  assert.equal(entryAttempt(desired,status('failed',1,2),now),0);
+  assert.equal(entryAttempt(desired,status('failed',1,3),now),2);
+  assert.equal(entryAttempt(desired,status('failed',2,8),now),0);
+  assert.equal(entryAttempt(desired,status('failed',2,9),now),3);
+  assert.equal(entryAttempt(desired,status('failed',9,59),now),0);
+  assert.equal(entryAttempt(desired,status('failed',9,60),now),10);
 });

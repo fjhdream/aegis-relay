@@ -208,4 +208,11 @@ test('the signed steering endpoint exchanges sessions, and an upgrade to steerin
   assert.ok(payload.peers.some(peer=>peer.id==='local'&&peer.healthy));
   const unsigned=response();await api.handle(request('/api/agent/v1/steering',steerBody,{}),unsigned);
   assert.equal(unsigned.status,401);
+  // An agent that sets up the entry domain itself (entry-v1) is told what to serve and reports back.
+  data.settings.certificateEmail='ops@example.com';
+  assert.equal(JSON.parse(checkResponse.raw).entry,undefined,'older agents are not sent the entry setup');
+  const entryBody=Buffer.from(JSON.stringify({agentVersion:'0.11.1',currentRevision:0,applyState:'waiting',proxyHealthy:true,domain:'s2.example.com',proxyMode:'domain',capabilities:['config-v1','steering-v1','entry-v1'],entryStatus:{requestId:'r1',state:'failed',entryDomain:'entry.example.com',peers:['s1.example.com'],attempt:2,message:'x'.repeat(900)}}));
+  const entryResponse=response();await api.handle(signed('/api/agent/v1/check-in',entryBody,'entry-checkin-nonce-001'),entryResponse);
+  assert.deepEqual(JSON.parse(entryResponse.raw).entry,{domain:'entry.example.com',email:'ops@example.com',peers:['s1.example.com']});
+  assert.deepEqual([data.agents[1].entryStatus.state,data.agents[1].entryStatus.attempt,data.agents[1].entryStatus.message.length],['failed',2,500]);
 });

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomToken } from './security.js';
 import { normalizeAgentDomain } from './agent-registry.js';
+import { cleanEntryStatus, entryAttempt } from './steering-topology.js';
 
 const REQUEST_FILE='host-domain-request.json';
 const STATUS_FILE='host-domain-status.json';
@@ -57,6 +58,23 @@ export function requestDomainSwitch({dataFile,domain,email,currentDomain=''}){
   atomicJson(path.join(dir,STATUS_FILE),status);
   atomicJson(path.join(dir,REQUEST_FILE),request);
   return status;
+}
+
+// The panel machine serves the steering entry domain too: same plumbing, its own host unit.
+const ENTRY_REQUEST_FILE='host-entry-request.json',ENTRY_STATUS_FILE='host-entry-status.json';
+export function readEntryStatus(dataFile){return cleanEntryStatus(readJson(path.join(path.dirname(dataFile),ENTRY_STATUS_FILE)))}
+
+// Files a request when the entry setup on this host differs from `entry` (or failed and is due for a
+// retry). One host change at a time: never next to a pending domain switch.
+export function followEntry({dataFile,entry,nowMs=Date.now()}){
+  const dir=path.dirname(dataFile);
+  if(!entry||fs.existsSync(path.join(dir,ENTRY_REQUEST_FILE))||fs.existsSync(path.join(dir,REQUEST_FILE)))return false;
+  const attempt=entryAttempt(entry,readEntryStatus(dataFile),nowMs);
+  if(!attempt)return false;
+  const requestId=randomToken(18),requestedAt=new Date(nowMs).toISOString();
+  atomicJson(path.join(dir,ENTRY_STATUS_FILE),{requestId,state:'pending',entryDomain:entry.domain,peers:entry.peers,attempt,message:'等待主机配置入口域名',updatedAt:requestedAt});
+  atomicJson(path.join(dir,ENTRY_REQUEST_FILE),{version:1,requestId,entryDomain:entry.domain,certificateEmail:entry.email,peers:entry.peers,attempt,requestedAt});
+  return true;
 }
 
 export const DOMAIN_REQUEST_FILE=REQUEST_FILE;

@@ -217,6 +217,10 @@ test('automatic steering settings are validated before anything is written',asyn
   assert.equal(saved.status,200);
   assert.deepEqual([saved.body.settings.mode,saved.body.settings.entryDomain,saved.body.settings.boundMB],['shadow','entry.example.com',8]);
   assert.deepEqual(saved.body.entryCommands.map(item=>item.command),[`sudo aegis-relay entry entry.example.com ${saved.body.certificateEmail}`]);
+  // The panel machine sets the entry domain up itself through its host unit.
+  assert.deepEqual([saved.body.entryCommands[0].auto,saved.body.entryCommands[0].state],[true,'pending']);
+  const filed=JSON.parse(fs.readFileSync(path.join(work,'data','host-entry-request.json'),'utf8'));
+  assert.deepEqual([filed.entryDomain,filed.certificateEmail,filed.peers,filed.attempt],['entry.example.com',saved.body.certificateEmail,[],1]);
   // A node opted in on a single machine cannot steer, so it keeps its direct address and says why.
   const quiet=(await call('GET','/routes')).body.routes.find(r=>r.alias==='quiet');
   const direct=(await call('GET',`/routes/${quiet.id}/channels`)).body.publicBaseUrl;

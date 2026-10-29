@@ -18,6 +18,7 @@ install -m 0755 "$TMP_DIR/source/scripts/aegis-relay-agent" /usr/local/bin/aegis
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-domain.sh" "$INSTALL_DIR/agent-configure-domain.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-ip.sh" "$INSTALL_DIR/agent-configure-ip.sh"
 install -m 0755 "$TMP_DIR/source/scripts/configure-entry-domain.sh" "$INSTALL_DIR/configure-entry-domain.sh"
+install -m 0755 "$TMP_DIR/source/scripts/host-entry-apply.sh" "$INSTALL_DIR/host-entry-apply.sh"
 set_env(){ KEY=$1 VALUE=$2 FILE="$INSTALL_DIR/.env" TMP="$INSTALL_DIR/.env.tmp"; awk -v key="$KEY" -v value="$VALUE" 'BEGIN{done=0} $0 ~ "^"key"=" {print key"="value;done=1;next} {print} END{if(!done)print key"="value}' "$FILE" > "$TMP"; chmod 600 "$TMP"; mv "$TMP" "$FILE"; }
 SOURCE_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP_DIR/source/package.json" | head -n1)
 set_env AGENT_VERSION "$SOURCE_VERSION"
@@ -45,8 +46,29 @@ Unit=aegis-relay-agent-domain.service
 [Install]
 WantedBy=multi-user.target
 EOF
+  cat > /etc/systemd/system/aegis-relay-agent-entry.service <<EOF
+[Unit]
+Description=AegisRelay agent constrained steering entry domain setup
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh $INSTALL_DIR/host-entry-apply.sh $INSTALL_DIR
+EOF
+  cat > /etc/systemd/system/aegis-relay-agent-entry.path <<EOF
+[Unit]
+Description=Watch AegisRelay agent steering entry domain requests
+
+[Path]
+PathExists=$INSTALL_DIR/data/host-entry-request.json
+Unit=aegis-relay-agent-entry.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
   systemctl daemon-reload
   systemctl enable --now aegis-relay-agent-domain.path
+  systemctl enable --now aegis-relay-agent-entry.path
 fi
 cd "$INSTALL_DIR"; docker build -f Dockerfile.agent -t aegis-relay-agent:local .
 compose(){ if docker compose version >/dev/null 2>&1; then docker compose -f compose.agent.yml "$@"; else docker-compose -f compose.agent.yml "$@"; fi; }

@@ -71,7 +71,7 @@ ensure_env ADMIN_PUBLISH_IP 0.0.0.0
 ensure_env PROXY_PUBLISH_IP 127.0.0.1
 if docker compose version >/dev/null 2>&1; then docker compose up -d --build; else docker-compose up -d --build; fi
 install -m 0755 scripts/aegis-relay /usr/local/bin/aegis-relay
-chmod 0755 scripts/configure-domain.sh scripts/configure-local-domain.sh scripts/host-domain-apply.sh scripts/domain-wizard.sh
+chmod 0755 scripts/configure-domain.sh scripts/configure-local-domain.sh scripts/host-domain-apply.sh scripts/domain-wizard.sh scripts/configure-entry-domain.sh scripts/host-entry-apply.sh
 
 if command -v systemctl >/dev/null 2>&1; then
   cat > /etc/systemd/system/aegis-relay-domain.service <<EOF
@@ -94,8 +94,29 @@ Unit=aegis-relay-domain.service
 [Install]
 WantedBy=multi-user.target
 EOF
+  cat > /etc/systemd/system/aegis-relay-entry.service <<EOF
+[Unit]
+Description=AegisRelay constrained steering entry domain setup
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh $INSTALL_DIR/scripts/host-entry-apply.sh $INSTALL_DIR
+EOF
+  cat > /etc/systemd/system/aegis-relay-entry.path <<EOF
+[Unit]
+Description=Watch AegisRelay steering entry domain requests
+
+[Path]
+PathExists=$INSTALL_DIR/data/host-entry-request.json
+Unit=aegis-relay-entry.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
   systemctl daemon-reload
   systemctl enable --now aegis-relay-domain.path
+  systemctl enable --now aegis-relay-entry.path
 fi
 
 PUBLIC_IP=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')

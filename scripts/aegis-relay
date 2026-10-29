@@ -28,8 +28,8 @@ do_uninstall(){
   [ "$ans" = yes ] || { echo "已取消，未做任何修改。"; return 1; }
   compose down 2>/dev/null || true
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now aegis-relay-domain.path 2>/dev/null || true
-    rm -f /etc/systemd/system/aegis-relay-domain.path /etc/systemd/system/aegis-relay-domain.service
+    systemctl disable --now aegis-relay-domain.path aegis-relay-entry.path 2>/dev/null || true
+    rm -f /etc/systemd/system/aegis-relay-domain.path /etc/systemd/system/aegis-relay-domain.service /etc/systemd/system/aegis-relay-entry.path /etc/systemd/system/aegis-relay-entry.service
     systemctl daemon-reload 2>/dev/null || true
   fi
   if [ -e /etc/nginx/sites-enabled/aegis-relay.conf ] || [ -e /etc/nginx/sites-enabled/aegis-relay-entry.conf ]; then

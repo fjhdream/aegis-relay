@@ -17,12 +17,12 @@ import { agentEntryUrl, deploymentId, ensureLocalDeployment, LOCAL_AGENT_ID, nor
 import { AgentApi, enrollmentInstallCommand, issueEnrollment, normalizeCertificateEmail } from './agent-api.js';
 import { aggregateTelemetry, indexViewersByNode, nodeChannels, sanitizeTelemetry, telemetryFromMetrics } from './telemetry.js';
 import { createDashboardFeed } from './dashboard-feed.js';
-import { activeLocalDomain, baseHostname, domainRequestRole, readDomainStatus, requestDomainSwitch } from './domain-control.js';
+import { activeLocalDomain, baseHostname, domainRequestRole, followEntry, readDomainStatus, readEntryStatus, requestDomainSwitch } from './domain-control.js';
 import { qrRows } from './qr.js';
 import { fetchPanelIcon, MAX_ICON_BYTES, normalizePanelIcon } from './panel-icon.js';
 import { SteeringEngine, STEERING_MODES } from './steering.js';
 import { SteeringHub } from './steering-hub.js';
-import { agentSteeringIssues, entryCoverageGaps, normalizeClientList, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
+import { agentSteeringIssues, desiredEntry, ENTRY_CAPABILITY, entryCommand, entryCoverageGaps, normalizeClientList, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const APP_VERSION=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8')).version;
@@ -36,9 +36,11 @@ const cfg = {
 const key = deriveKey(process.env.APP_MASTER_KEY); const store = new Store(cfg.dataFile, key);
 if(!store.data.settings.certificateEmail&&cfg.certificateEmail){store.data.settings.certificateEmail=normalizeCertificateEmail(cfg.certificateEmail);store.save();}
 const configuredLocalDomain=activeLocalDomain(cfg);
-const localRecord=store.data.agents.find(agent=>agent.id===LOCAL_AGENT_ID);
-if(localRecord&&configuredLocalDomain&&localRecord.domain!==configuredLocalDomain){localRecord.domain=configuredLocalDomain;localRecord.updatedAt=new Date().toISOString();store.save();}
 const localAgent = new LocalAgent({store}); localAgent.start();
+// After the local agent: on a fresh install it is what creates this record, and the steering topology
+// reads the domain from the record (an empty one left the panel machine out until the next restart).
+const localRecord=store.data.agents.find(agent=>agent.id===LOCAL_AGENT_ID);
+if(localRecord&&configuredLocalDomain&&localRecord.domain!==configuredLocalDomain){localRecord.domain=configuredLocalDomain;localRecord.updatedAt=new Date().toISOString();store.save();localAgent.reconcile();}
 // Automatic steering: the hub arbitrates sessions across machines; a client type that keeps failing to
 // follow steering redirects is excluded for good (until the operator clears it).
 // Capped ranges (direct play cut into requests): a client type that continued on trial is switched on,
@@ -139,11 +141,21 @@ function routeBaseUrl(route){return steeringEntryBaseUrl(store.data,route)||rout
 function steeringView(){
   const settings=steeringSettings(store.data),agents=store.data.agents.map(agentView).sort((a,b)=>a.sortOrder-b.sortOrder);
   const machines=store.data.agents.filter(agent=>agent.state!=='revoked').map(agent=>{const view=agents.find(item=>item.id===agent.id)||{};return{id:agent.id,name:agent.name||agent.id,domain:view.domain||agent.domain||'',local:agent.id===LOCAL_AGENT_ID,status:view.status,agentVersion:view.agentVersion||'',steerTarget:agent.steerTarget!==false,issues:agentSteeringIssues({...agent,domain:view.domain||agent.domain},settings)}});
-  const ready=machines.filter(machine=>!machine.issues.length),email=store.data.settings.certificateEmail||'';
-  const entryCommands=settings.entryDomain&&email?ready.map(machine=>{const peers=ready.filter(other=>other.id!==machine.id).map(other=>other.domain);return{id:machine.id,name:machine.name,command:`sudo ${machine.local?'aegis-relay':'aegis-relay-agent'} entry ${settings.entryDomain} ${email}${peers.length?` ${peers.join(' ')}`:''}`}}):[];
+  const email=store.data.settings.certificateEmail||'',entryCommands=[];
+  // Machines that know entry-v1 (and the panel itself) set the entry domain up on their own; the command
+  // stays available for older agents and for re-running by hand.
+  for(const machine of machines){
+    const agent=store.data.agents.find(item=>item.id===machine.id),entry=desiredEntry(store.data,machine.id);
+    if(!entry)continue;
+    const status=machine.local?readEntryStatus(cfg.dataFile):agent.entryStatus||null,current=!!status&&status.entryDomain===entry.domain&&status.peers.join(' ')===entry.peers.join(' ');
+    entryCommands.push({id:machine.id,name:machine.name,command:entryCommand(entry,machine.local),auto:machine.local||(agent.capabilities||[]).includes(ENTRY_CAPABILITY),state:current?status.state:'waiting',message:current?status.message:'',attempt:current?status.attempt:0,updatedAt:current?status.updatedAt:''});
+  }
   const routes=store.data.routes.map(route=>{const issues=routeSteeringIssues(store.data,route,settings),gaps=settings.entryDomain&&!issues.length?entryCoverageGaps(store.data,route,settings):[];return{id:route.id,alias:route.alias,name:route.name,enabled:route.autoSteer?.enabled===true,issues,entryGaps:gaps.map(agent=>agent.name||agent.id),entryAddress:!!steeringEntryBaseUrl(store.data,route)}});
   return {settings:{mode:settings.mode,entryDomain:settings.entryDomain,excludedClients:settings.excludedClients,autoExcluded:settings.autoExcluded,boundedClients:settings.boundedClients,boundAuto:settings.boundAuto,autoBounded:settings.autoBounded,autoUnbounded:settings.autoUnbounded,boundMB:settings.boundMB},certificateEmail:email,machines,routes,entryCommands,live:steeringHub.view()};
 }
+// The panel machine serves the entry domain like every other participating machine; its host unit
+// applies the request (agents do the same from their check-in).
+function syncLocalEntry(){try{followEntry({dataFile:cfg.dataFile,entry:desiredEntry(store.data,LOCAL_AGENT_ID)})}catch(error){console.error('[aegis] entry domain request failed',error?.message||error)}}
 function credentialsFor(route,accessKey){return{...clientCredentials(route,accessKey),publicBaseUrl:routeBaseUrl(route)}}
 function checkedAlias(value){const alias=cleanAlias(value);if(['r','api','gateway','app','index','index.html','favicon.ico'].includes(alias))throw new Error('alias is reserved');return alias;}
 function machineTelemetryList(){
@@ -321,6 +333,7 @@ async function updateAgent(req,res,agent){
   agent.updatedAt=now;
   // Another machine's deployments or participation reshape the steering peers in this machine's snapshot too.
   if(local||routeIds||b.steerTarget!==undefined)localAgent.reconcile();
+  if(b.steerTarget!==undefined||b.domain!==undefined)syncLocalEntry();
   agentApi.invalidate();
   store.audit(localDomainRequested?'agent.local_domain_requested':'agent.updated',ip(req),agent.id);
   return json(res,200,{agent:agentView(agent)});
@@ -473,7 +486,7 @@ async function updateSteering(req,res){
   if(b.clearAutoExcluded===true)settings.autoExcluded={};
   if(b.boundAuto!==undefined)settings.boundAuto=b.boundAuto===true;
   if(b.clearRangeAuto===true){settings.autoBounded={};settings.autoUnbounded={};steeringHub.bounds.clear();}
-  store.audit('steering.updated',ip(req),settings.mode);store.save();publishRoutes();
+  store.audit('steering.updated',ip(req),settings.mode);store.save();publishRoutes();syncLocalEntry();
   return json(res,200,steeringView());
 }
 
@@ -575,4 +588,6 @@ process.on('uncaughtException',err=>console.error('[aegis] uncaught exception',e
 process.on('unhandledRejection',err=>console.error('[aegis] unhandled rejection',err&&err.stack||err));
 const flushTimer=setInterval(()=>store.save(),60_000);flushTimer.unref();
 const reminderTimer=setInterval(()=>notifier.tick(store.data.routes),60*60_000);reminderTimer.unref();
-for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{clearInterval(flushTimer);clearInterval(reminderTimer);steering.stop();const saved=store.save();agentApi.close();admin.close();proxy.close(()=>saved.then(()=>process.exit(0)));setTimeout(()=>process.exit(1),10_000).unref();});
+// Other machines joining, leaving or changing domain reshape the peers this machine forwards to.
+const entryTimer=setInterval(syncLocalEntry,30_000);entryTimer.unref();syncLocalEntry();
+for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{clearInterval(flushTimer);clearInterval(reminderTimer);clearInterval(entryTimer);steering.stop();const saved=store.save();agentApi.close();admin.close();proxy.close(()=>saved.then(()=>process.exit(0)));setTimeout(()=>process.exit(1),10_000).unref();});
