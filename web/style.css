@@ -105,8 +105,9 @@ svg{stroke-linecap:round;stroke-linejoin:round}
 .brand strong{display:block;font-size:15px;font-weight:600;letter-spacing:-.01em}
 .brand small{display:block;color:var(--rail-text-3);font-size:10px;letter-spacing:.12em}
 .brand-mark{display:grid;place-items:center;width:30px;height:30px;flex-shrink:0;border-radius:var(--r-sm);
-  background:var(--text);color:var(--bg);font-weight:700;font-size:15px}
-.brand-large .brand-mark{width:42px;height:42px;border-radius:var(--r);font-size:20px}
+  background:var(--text);color:var(--bg)}
+.brand-mark svg{width:62%;height:62%;display:block}
+.brand-large .brand-mark{width:42px;height:42px;border-radius:var(--r)}
 .brand-large strong{font-size:20px}
 .brand-mark.custom{background:var(--surface);box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
 .brand-mark img{width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block}
