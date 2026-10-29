@@ -155,3 +155,71 @@ test('two engines converge through the hub: a landing at the target confirms the
   assert.equal(a.failures.length,0);
   a.stop();b.stop();
 });
+
+test('switch outcomes: a real switch is judged at its target, a shadow one by whether the line recovered',()=>{
+  let now=5_000_000;
+  const {store}=fixture(),hub=new SteeringHub({store,clock:()=>now}),at=ms=>{now=5_000_000+ms;return now};
+  const [s1,s2,s3,s4]=['D','E','F','G'].map(c=>c.repeat(22));
+  hub.exchange('local',{decisions:[{s:s1,r:'n1',assigned:'b',epoch:1,switched:true,from:'local',reason:'explore',fromRateBps:1e6,at:at(0)}]});
+  hub.exchange('b',{reports:[{s:s1,r:'n1',verdict:'unknown',rateBps:0,at:at(1000)}]});
+  assert.equal(hub.view().effects.on.total,0,'still waiting for a verdict');
+  hub.exchange('b',{reports:[{s:s1,r:'n1',verdict:'ok',rateBps:3e6,at:at(2000)}]});
+  // a redirect that never lands
+  hub.exchange('local',{decisions:[{s:s2,r:'n1',assigned:'b',epoch:1,switched:true,from:'local',at:at(3000)}]});
+  hub.exchange('local',{failures:[{s:s2,r:'n1',epoch:1,target:'b',client:'X',at:at(19_000)}],decisions:[{s:s2,r:'n1',assigned:'',epoch:2,switched:false,reason:'landing_timeout',at:now}]});
+  const on=hub.view().effects.on;
+  assert.deepEqual([on.total,on.better,on.notLanded,on.medianGain],[2,1,1,3]);
+  assert.deepEqual(on.pairs.map(pair=>[pair.from,pair.to,pair.total,pair.better]),[['local','b',2,1]]);
+  // shadow: one line recovers by itself, one stays stuck
+  hub.exchange('local',{shadow:[{s:s3,r:'n1',to:'b',reason:'explore',at:at(20_000)}],reports:[{s:s3,r:'n1',verdict:'starved_down',rateBps:1,at:now}]});
+  hub.exchange('local',{reports:[{s:s3,r:'n1',verdict:'ok',rateBps:1,at:at(80_000)}]});
+  hub.exchange('local',{shadow:[{s:s4,r:'n1',to:'b',reason:'explore',at:now}]});
+  hub.exchange('local',{reports:[{s:s4,r:'n1',verdict:'starved_down',rateBps:1,at:at(140_000)}]});
+  hub.exchange('local',{reports:[{s:s4,r:'n1',verdict:'starved_down',rateBps:1,at:at(210_000)}]});
+  assert.deepEqual(hub.view().effects.shadow,{total:2,recovered:1,persisted:1,unmeasured:0});
+  // an outcome nobody reports on is closed as unmeasured
+  hub.exchange('local',{decisions:[{s:'H'.repeat(22),r:'n1',assigned:'b',epoch:1,switched:true,from:'local',at:now}]});
+  at(900_000);hub.exchange('local',{});
+  assert.equal(hub.view().effects.on.unmeasured,1);
+});
+
+test('history is kept per node and client network, at most one sample a minute per session and machine',()=>{
+  let now=6_000_000;
+  const {store}=fixture(),hub=new SteeringHub({store,clock:()=>now}),p='N'.repeat(16);
+  for(let i=0;i<3;i++){
+    const s=String.fromCharCode(75+i).repeat(22);
+    hub.exchange('local',{reports:[{s,r:'n1',verdict:'starved_down',rateBps:1,at:now,p},{s,r:'n1',verdict:'starved_down',rateBps:1,at:now,p}]});
+    hub.exchange('b',{reports:[{s,r:'n1',verdict:'ok',rateBps:1,at:now,p}]});
+    now+=120_000;
+    hub.exchange('local',{reports:[{s,r:'n1',verdict:'starved_up',rateBps:1,at:now,p}]});
+  }
+  const fresh='Q'.repeat(22),response=hub.exchange('local',{reports:[{s:fresh,r:'n1',verdict:'unknown',rateBps:0,at:now,p}]});
+  assert.deepEqual(response.sessions.find(item=>item.s===fresh).prior,{local:{ok:0,n:3},b:{ok:1,n:3}});
+  assert.equal(hub.view().networks,1);
+  assert.equal(response.sessions.find(item=>item.s==='R'.repeat(22)),undefined);
+  const other=hub.exchange('local',{reports:[{s:'S'.repeat(22),r:'n1',verdict:'unknown',rateBps:0,at:now,p:'M'.repeat(16)}]});
+  assert.equal(other.sessions.find(item=>item.s==='S'.repeat(22)).prior,undefined);
+});
+
+test('capped ranges: a failed continuation switches a client off, a clean trial switches it on',()=>{
+  const {store,data}=fixture(),verdicts=[];
+  data.settings.steering.boundedClients=['Infuse'];
+  const hub=new SteeringHub({store,onBoundVerdict:(client,works)=>{verdicts.push([client,works]);(works?data.settings.steering.autoBounded||={}:data.settings.steering.autoUnbounded||={})[client]='now'}});
+  const send=items=>hub.exchange('local',{bounds:items.map(([client,continued,trial])=>({s:'T'.repeat(22),r:'n1',client,continued,trial,at:1}))});
+  send([['Infuse',true,false],['Infuse',false,false]]);
+  assert.deepEqual(verdicts,[]);
+  assert.deepEqual(send([['Infuse',false,false]]).boundedClients,[],'2 of 3 failed: off, even though the operator listed it');
+  // trials only run with automatic detection on, in active mode, for clients that follow redirects
+  assert.deepEqual(hub.exchange('local',{}).trialClients,[]);
+  data.settings.steering.boundAuto=true;
+  for(let i=0;i<5;i++)hub.exchange('b',{landings:[{s:String.fromCharCode(97+i).repeat(22),r:'n1',epoch:1,client:'VLC',at:1}]});
+  assert.deepEqual(hub.exchange('local',{}).trialClients,['VLC']);
+  send([['VLC',true,true],['VLC',true,true]]);
+  assert.equal(verdicts.length,1);
+  const after=send([['VLC',true,true]]);
+  assert.deepEqual(verdicts.at(-1),['VLC',true]);
+  assert.deepEqual([after.boundedClients,after.trialClients],[['VLC'],[]]);
+  send([['Kodi',false,true]]);
+  assert.deepEqual(verdicts.at(-1),['Kodi',false],'one failed trial is enough');
+  assert.deepEqual(hub.view().ranges.find(item=>item.client==='VLC').state,'on');
+});

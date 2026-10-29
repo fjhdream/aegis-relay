@@ -759,3 +759,6 @@ code,pre{font-family:var(--mono)}
 .steering-commands pre{margin:6px 0 0;padding:12px 14px;border:1px solid var(--line-2);border-radius:var(--r-sm);background:var(--inset);white-space:pre-wrap;word-break:break-all;font-size:13px}
 .steering-commands .command-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .steer-scores{display:flex;flex-wrap:wrap;gap:6px}
+.steering-effects{margin-bottom:14px}
+.steering-effects .deploy-card small{display:block}
+.steering-effects .deploy-card small+strong{margin:4px 0}

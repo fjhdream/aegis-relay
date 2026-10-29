@@ -41,7 +41,16 @@ if(localRecord&&configuredLocalDomain&&localRecord.domain!==configuredLocalDomai
 const localAgent = new LocalAgent({store}); localAgent.start();
 // Automatic steering: the hub arbitrates sessions across machines; a client type that keeps failing to
 // follow steering redirects is excluded for good (until the operator clears it).
-const steeringHub = new SteeringHub({store,onAutoExclude:client=>{const settings=steeringSettings(store.data);if(Object.keys(settings.autoExcluded).some(item=>item.toLowerCase()===client.toLowerCase()))return;settings.autoExcluded[client]=new Date().toISOString();store.audit('steering.client_auto_excluded','system',client);store.save();}});
+// Capped ranges (direct play cut into requests): a client type that continued on trial is switched on,
+// one that failed to continue is switched off, until the operator clears the automatic results.
+function rangeVerdict(client,works){
+  const settings=steeringSettings(store.data),lower=client.toLowerCase(),has=map=>Object.keys(map).some(item=>item.toLowerCase()===lower);
+  if(has(settings.autoUnbounded)||(works&&has(settings.autoBounded)))return;
+  if(works)settings.autoBounded[client]=new Date().toISOString();
+  else{settings.autoUnbounded[client]=new Date().toISOString();for(const item of Object.keys(settings.autoBounded))if(item.toLowerCase()===lower)delete settings.autoBounded[item];}
+  store.audit(works?'steering.client_range_enabled':'steering.client_range_disabled','system',client);store.save();
+}
+const steeringHub = new SteeringHub({store,onBoundVerdict:rangeVerdict,onAutoExclude:client=>{const settings=steeringSettings(store.data);if(Object.keys(settings.autoExcluded).some(item=>item.toLowerCase()===client.toLowerCase()))return;settings.autoExcluded[client]=new Date().toISOString();store.audit('steering.client_auto_excluded','system',client);store.save();}});
 // A machine's capabilities or domain feed every node's steering topology, so a change there recompiles
 // the local snapshot too (remote ones are recompiled by the API itself).
 const agentApi = new AgentApi({store,version:APP_VERSION,steering:steeringHub,onTopologyChange:()=>localAgent.reconcile()});
@@ -133,7 +142,7 @@ function steeringView(){
   const ready=machines.filter(machine=>!machine.issues.length),email=store.data.settings.certificateEmail||'';
   const entryCommands=settings.entryDomain&&email?ready.map(machine=>{const peers=ready.filter(other=>other.id!==machine.id).map(other=>other.domain);return{id:machine.id,name:machine.name,command:`sudo ${machine.local?'aegis-relay':'aegis-relay-agent'} entry ${settings.entryDomain} ${email}${peers.length?` ${peers.join(' ')}`:''}`}}):[];
   const routes=store.data.routes.map(route=>{const issues=routeSteeringIssues(store.data,route,settings),gaps=settings.entryDomain&&!issues.length?entryCoverageGaps(store.data,route,settings):[];return{id:route.id,alias:route.alias,name:route.name,enabled:route.autoSteer?.enabled===true,issues,entryGaps:gaps.map(agent=>agent.name||agent.id),entryAddress:!!steeringEntryBaseUrl(store.data,route)}});
-  return {settings:{mode:settings.mode,entryDomain:settings.entryDomain,excludedClients:settings.excludedClients,autoExcluded:settings.autoExcluded,boundedClients:settings.boundedClients,boundMB:settings.boundMB},certificateEmail:email,machines,routes,entryCommands,live:steeringHub.view()};
+  return {settings:{mode:settings.mode,entryDomain:settings.entryDomain,excludedClients:settings.excludedClients,autoExcluded:settings.autoExcluded,boundedClients:settings.boundedClients,boundAuto:settings.boundAuto,autoBounded:settings.autoBounded,autoUnbounded:settings.autoUnbounded,boundMB:settings.boundMB},certificateEmail:email,machines,routes,entryCommands,live:steeringHub.view()};
 }
 function credentialsFor(route,accessKey){return{...clientCredentials(route,accessKey),publicBaseUrl:routeBaseUrl(route)}}
 function checkedAlias(value){const alias=cleanAlias(value);if(['r','api','gateway','app','index','index.html','favicon.ico'].includes(alias))throw new Error('alias is reserved');return alias;}
@@ -462,6 +471,8 @@ async function updateSteering(req,res){
   if(b.boundedClients!==undefined)settings.boundedClients=normalizeClientList(b.boundedClients);
   if(b.boundMB!==undefined)settings.boundMB=Math.round(numeric(b.boundMB,8,1024));
   if(b.clearAutoExcluded===true)settings.autoExcluded={};
+  if(b.boundAuto!==undefined)settings.boundAuto=b.boundAuto===true;
+  if(b.clearRangeAuto===true){settings.autoBounded={};settings.autoUnbounded={};steeringHub.bounds.clear();}
   store.audit('steering.updated',ip(req),settings.mode);store.save();publishRoutes();
   return json(res,200,steeringView());
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, hlsVerdict, itemOf, openSteerToken, playIdentity, progressiveVerdict, requestKind, sealSteerToken, sessionKeyFor, STEER_DEFAULTS, SteeringEngine, steerTokenOf, stripSteerParam } from '../src/steering.js';
+import { clientPrefix, decide, hlsVerdict, prefixKeyFor, itemOf, openSteerToken, playIdentity, progressiveVerdict, requestKind, sealSteerToken, sessionKeyFor, STEER_DEFAULTS, SteeringEngine, steerTokenOf, stripSteerParam } from '../src/steering.js';
 import { newRouteAuthKey } from '../src/route-auth.js';
 
 const route=(extra={})=>({id:'n1',alias:'movie',routeAuthKey:newRouteAuthKey(),steering:{mode:'on',peers:[{id:'a',base:'https://a.example.com'},{id:'b',base:'https://b.example.com'}],params:{minRateMbps:0}},...extra});
@@ -221,5 +221,86 @@ test('bounded ranges are only applied to opted-in clients in active mode',()=>{
   a.bounded=new Set(['infuse']);a.boundBytes=1024*1024;
   assert.equal(call({range:'bytes=100-','x-emby-client':'Infuse'}).range,`bytes=100-${100+1024*1024-1}`);
   assert.equal(call({range:'bytes=100-200','x-emby-client':'Infuse'}).range,null);
+  a.stop();
+});
+
+test('client networks are reduced to a /24 or /48 and only ever leave as a per-node digest',()=>{
+  assert.equal(clientPrefix('203.0.113.77'),'203.0.113.0/24');
+  assert.equal(clientPrefix('::ffff:203.0.113.77'),'203.0.113.0/24');
+  assert.equal(clientPrefix('2001:db8:abcd:12::1'),'2001:db8:abcd::/48');
+  assert.equal(clientPrefix('2001:db8::1'),'2001:db8:0::/48');
+  assert.equal(clientPrefix('not-an-ip'),'');
+  const r=route(),key=prefixKeyFor(r,'203.0.113.5');
+  assert.match(key,/^[A-Za-z0-9_-]{16}$/);
+  assert.equal(prefixKeyFor(r,'203.0.113.200'),key,'same /24');
+  assert.notEqual(prefixKeyFor(r,'203.0.114.5'),key);
+  assert.notEqual(prefixKeyFor({...r,routeAuthKey:newRouteAuthKey()},'203.0.113.5'),key,'keyed per node');
+});
+
+test('history moves a fresh session off a machine its network keeps starving on, and ranks untested machines',()=>{
+  const nowMs=20_000_000,candidates=new Map([['a',{eligible:true}],['b',{eligible:true}],['c',{eligible:true}]]);
+  const prior={a:{ok:0.1,n:5},b:{ok:0.9,n:4},c:{ok:0.5,n:6}};
+  const fresh=decide({assigned:'',lastSwitchAt:0,switches:[],tried:{},scores:{},prior},{self:'a',nowMs,candidates});
+  assert.deepEqual([fresh.target,fresh.reason,fresh.switched],['b','history',true]);
+  // not once it is measured fine here, not after it already moved, not on thin evidence
+  assert.equal(decide({assigned:'',lastSwitchAt:0,switches:[],tried:{},scores:{a:{verdict:'ok',rateBps:1,at:nowMs}},prior},{self:'a',nowMs,candidates}).changed,false);
+  assert.equal(decide({assigned:'',lastSwitchAt:nowMs-900_000,switches:[],tried:{},scores:{},prior},{self:'a',nowMs,candidates}).changed,false);
+  assert.equal(decide({assigned:'',lastSwitchAt:0,switches:[],tried:{},scores:{},prior:{a:{ok:0.1,n:2},b:{ok:1,n:9}}},{self:'a',nowMs,candidates}).changed,false);
+  assert.equal(decide({assigned:'',lastSwitchAt:0,switches:[],tried:{},scores:{},prior:{a:{ok:0.1,n:5},b:{ok:0.6,n:9}}},{self:'a',nowMs,candidates}).changed,false,'no clearly better machine');
+  // starving with nothing measured elsewhere: the machine this network did best on goes first
+  const starving={assigned:'',lastSwitchAt:0,switches:[],tried:{b:nowMs-900_000,c:nowMs-950_000},scores:{a:{verdict:'starved_down',rateBps:1e6,at:nowMs}},prior:{b:{ok:0.8,n:5}}};
+  assert.deepEqual([decide(starving,{self:'a',nowMs,candidates}).target,decide({...starving,prior:{}},{self:'a',nowMs,candidates}).target],['b','c']);
+});
+
+test('the engine reports the client network digest and adopts the panel history for a session',()=>{
+  const clock=9_000_000_000,r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});
+  const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1&PlaySessionId=p1',q=request(url,{'x-real-ip':'198.51.100.9'});
+  a.plan({route:r,found:found(r,url),req:q.req,incoming:q.incoming,publicContext:https});
+  const session=[...a.sessions.values()][0],report=a.syncPayload([r]).reports[0];
+  assert.equal(report.p,prefixKeyFor(r,'198.51.100.1'));
+  a.applySync({sessions:[{s:session.key,r:'n1',epoch:0,assigned:'',prior:{a:{ok:0.1,n:4},b:{ok:0.95,n:4},x:{ok:7,n:1}}}]});
+  assert.deepEqual(session.prior,{a:{ok:0.1,n:4},b:{ok:0.95,n:4}});
+  healthy(a,clock);
+  const next=a.plan({route:r,found:found(r,url),req:q.req,incoming:q.incoming,publicContext:https});
+  assert.ok(next.redirect.startsWith('https://b.example.com/'));
+  assert.equal(a.decisions.at(-1).reason,'history');
+  a.stop();
+});
+
+test('a capped range is judged by whether the player comes back for the next byte',()=>{
+  let clock=10_000_000_000;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.bounded=new Set(['infuse']);a.boundBytes=1000;
+  const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1&PlaySessionId=p1';
+  const call=(range,client='Infuse',key='d1')=>{const u=url.replace('d1',key),q=request(u,{range,'x-emby-client':client});return a.plan({route:r,found:found(r,u),req:q.req,incoming:q.incoming,publicContext:https})};
+  const serve=(plan,{status=206,contentRange='bytes 0-999/50000',sent=1000}={})=>{plan.track.headers(status,{'content-range':contentRange});plan.track.bytes(sent);plan.track.close()};
+  serve(call('bytes=0-'));
+  assert.equal(a.bounds.length,0,'waiting for the player');
+  call('bytes=1000-');
+  assert.deepEqual(a.bounds.map(item=>[item.client,item.continued,item.trial]),[['Infuse',true,false]]);
+  // the player never comes back
+  serve(call('bytes=0-',undefined,'d2'));clock+=31_000;a.tick();
+  assert.deepEqual(a.bounds.map(item=>item.continued),[true,false]);
+  // nothing was cut (end of file, origin ignored Range, client left early): no verdict at all
+  serve(call('bytes=0-',undefined,'d3'),{contentRange:'bytes 0-999/1000'});
+  serve(call('bytes=0-',undefined,'d4'),{status:200,contentRange:''});
+  serve(call('bytes=0-',undefined,'d5'),{sent:10});
+  clock+=31_000;a.tick();
+  assert.equal(a.bounds.length,2);
+  a.stop();
+});
+
+test('a client on trial gets one capped range per session and one session at a time',()=>{
+  let clock=11_000_000_000;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.trials=new Set(['vlc']);a.boundBytes=1000;
+  const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1&PlaySessionId=p1';
+  const call=(key,range='bytes=0-')=>{const u=url.replace('d1',key),q=request(u,{range,'x-emby-client':'VLC'});return a.plan({route:r,found:found(r,u),req:q.req,incoming:q.incoming,publicContext:https})};
+  const first=call('d1');
+  assert.equal(first.range,'bytes=0-999');
+  assert.equal(call('d2').range,null,'another session waits for the running trial');
+  first.track.headers(206,{'content-range':'bytes 0-999/9999'});first.track.bytes(1000);first.track.close();
+  call('d1','bytes=1000-');
+  assert.deepEqual(a.bounds.map(item=>[item.continued,item.trial]),[[true,true]]);
+  assert.equal(call('d1','bytes=5000-').range,null,'one trial per session');
+  assert.equal(call('d2').range,'bytes=0-999','the next session may try');
   a.stop();
 });

@@ -580,7 +580,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
           }
           catch { delete out.location; }
         }
-        finished=true;track?.headers();
+        finished=true;track?.headers(status,out);
         if (res.destroyed || res.headersSent) { up.destroy(); metricDone?.(status,0,false); return; }
         const speed=Number(route.speedLimitMbps||0);
         let measured=false,streamed=0;

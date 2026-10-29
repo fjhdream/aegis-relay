@@ -35,8 +35,18 @@ export function readSteeringSettings(data) {
     excludedClients:Array.isArray(raw.excludedClients)?raw.excludedClients:[],
     autoExcluded:raw.autoExcluded&&typeof raw.autoExcluded==='object'&&!Array.isArray(raw.autoExcluded)?raw.autoExcluded:{},
     boundedClients:Array.isArray(raw.boundedClients)?raw.boundedClients:[],
-    boundMB:Number.isFinite(boundMB)&&boundMB>=8&&boundMB<=1024?Math.round(boundMB):64
+    boundMB:Number.isFinite(boundMB)&&boundMB>=8&&boundMB<=1024?Math.round(boundMB):64,
+    boundAuto:raw.boundAuto===true,
+    autoBounded:clientMap(raw.autoBounded),autoUnbounded:clientMap(raw.autoUnbounded)
   };
+}
+const clientMap=value=>value&&typeof value==='object'&&!Array.isArray(value)?value:{};
+
+// Client types whose open-ended Range gets capped: the operator's list plus the ones detected
+// automatically, minus any that failed to continue (which is checked even for listed ones).
+export function boundedClientList(settings) {
+  const failed=new Set(Object.keys(settings.autoUnbounded).map(client=>client.toLowerCase()));
+  return normalizeClientList([...settings.boundedClients,...Object.keys(settings.autoBounded)]).filter(client=>!failed.has(client.toLowerCase()));
 }
 
 // Same as readSteeringSettings, but stores the normalized object so callers can edit it in place.
