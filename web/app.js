@@ -45,12 +45,15 @@ function uptime(start){if(!start)return'—';let s=Math.max(0,(Date.now()-new Da
 function recentDays(daily,count=14){const rows=[];for(let ago=count-1;ago>=0;ago--){const day=new Date();day.setUTCHours(0,0,0,0);day.setUTCDate(day.getUTCDate()-ago);const key=day.toISOString().slice(0,10);rows.push({key,label:`${day.getUTCMonth()+1}/${day.getUTCDate()}`,bytes:Number(daily?.[key]||0)})}return rows}
 function showSecret(content,{eyebrow='连接信息',title='节点连接信息',description='完整节点地址和连接密码可由管理员随时再次查看。'}={}){$('#modal-eyebrow').textContent=eyebrow;$('#modal-title').textContent=title;$('#modal-description').textContent=description;$('#secret').textContent=content;$('#modal').classList.remove('hidden')}
 
-const DEFAULT_FAVICON='data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#2f6f56"/><text x="32" y="45" font-family="Arial,Helvetica,sans-serif" font-size="38" font-weight="900" fill="#f4fbf6" text-anchor="middle">A</text></svg>');
+// The AegisRelay mark: a solid shield with an A cut out of it, drawn on a 24-unit grid in currentColor.
+const BRAND_MARK_PATH='M12 2.4 19.6 5.3v6.2c0 4.9-3.2 8.5-7.6 10.3-4.4-1.8-7.6-5.4-7.6-10.3V5.3zM12 8.1 15.9 15.8h-2.3L12 12.5l-1.6 3.3H8.1z';
+const BRAND_MARK=`<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="${BRAND_MARK_PATH}"/></svg>`;
+const DEFAULT_FAVICON='data:image/svg+xml;base64,'+btoa(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#09090b"/><path transform="translate(12.16 12.16) scale(1.653)" fill="#ffffff" fill-rule="evenodd" d="${BRAND_MARK_PATH}"/></svg>`);
 function applyPanelIcon(icon){
   state.panelIcon=String(icon||'');
   for(const el of document.querySelectorAll('.brand-mark')){
     if(state.panelIcon){const img=document.createElement('img');img.src=state.panelIcon;img.alt='面板图标';el.classList.add('custom');el.replaceChildren(img)}
-    else{el.classList.remove('custom');el.textContent='A'}
+    else{el.classList.remove('custom');el.innerHTML=BRAND_MARK}
   }
   let link=document.querySelector('link[rel="icon"]');
   if(!link){link=document.createElement('link');link.rel='icon';document.head.appendChild(link)}
