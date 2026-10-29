@@ -12,6 +12,8 @@ do_proxy_domain(){
   [ -n "$EMAIL" ] || { echo "请先在部署向导保存证书邮箱，或执行 aegis-relay domain" >&2; return 1; }
   "$INSTALL_DIR/scripts/configure-local-domain.sh" "$1" "$EMAIL"
 }
+# Shared steering entry domain next to this machine's own proxy domain (see the panel's 自动切流 page).
+do_entry(){ "$INSTALL_DIR/scripts/configure-entry-domain.sh" "$@"; }
 do_uninstall(){
   [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行卸载" >&2; return 1; }
   echo "即将卸载 AegisRelay 面板，这会删除：" >&2
@@ -30,8 +32,8 @@ do_uninstall(){
     rm -f /etc/systemd/system/aegis-relay-domain.path /etc/systemd/system/aegis-relay-domain.service
     systemctl daemon-reload 2>/dev/null || true
   fi
-  if [ -e /etc/nginx/sites-enabled/aegis-relay.conf ]; then
-    rm -f /etc/nginx/sites-enabled/aegis-relay.conf
+  if [ -e /etc/nginx/sites-enabled/aegis-relay.conf ] || [ -e /etc/nginx/sites-enabled/aegis-relay-entry.conf ]; then
+    rm -f /etc/nginx/sites-enabled/aegis-relay.conf /etc/nginx/sites-enabled/aegis-relay-entry.conf
     nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
   fi
   cd /; rm -rf -- "$INSTALL_DIR"
@@ -84,10 +86,14 @@ case "$ACTION" in
     [ "$#" -eq 2 ] || { echo "用法: sudo aegis-relay proxy-domain emby.example.com" >&2; exit 1; }
     do_proxy_domain "$2"
     ;;
+  entry)
+    [ "$#" -ge 3 ] || { echo "用法: sudo aegis-relay entry 入口域名 证书邮箱 [其他机器的直连域名 ...]" >&2; exit 1; }
+    shift; do_entry "$@"
+    ;;
   uninstall) do_uninstall;;
   menu)
     # No arguments opens the interactive console when attached to a terminal; otherwise show status.
     if [ -t 0 ] && [ -t 1 ]; then menu; else do_status; fi
     ;;
-  *) echo "用法: aegis-relay {menu|status|logs|update|domain [PANEL EMAIL [PROXY]]|proxy-domain DOMAIN|uninstall}" >&2; exit 1;;
+  *) echo "用法: aegis-relay {menu|status|logs|update|domain [PANEL EMAIL [PROXY]]|proxy-domain DOMAIN|entry ENTRY EMAIL [PEERS...]|uninstall}" >&2; exit 1;;
 esac

@@ -60,6 +60,9 @@ recreate(){
 }
 do_domain(){ "$INSTALL_DIR/agent-configure-domain.sh" "$1" "$2"; recreate; }
 do_ip(){ "$INSTALL_DIR/agent-configure-ip.sh"; recreate; }
+# Shared steering entry domain next to this machine's own domain; the panel's 自动切流 page prints the
+# exact command (with the other machines' domains) for every machine.
+do_entry(){ "$INSTALL_DIR/configure-entry-domain.sh" "$@"; }
 do_uninstall(){
   [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行卸载" >&2; return 1; }
   echo "即将卸载 AegisRelay 探针，这会删除：容器、systemd 域名执行器、Nginx 站点、CLI 和 $INSTALL_DIR。" >&2
@@ -73,8 +76,8 @@ do_uninstall(){
     rm -f /etc/systemd/system/aegis-relay-agent-domain.path /etc/systemd/system/aegis-relay-agent-domain.service
     systemctl daemon-reload 2>/dev/null || true
   fi
-  if [ -e /etc/nginx/sites-enabled/aegis-relay-agent.conf ]; then
-    rm -f /etc/nginx/sites-enabled/aegis-relay-agent.conf
+  if [ -e /etc/nginx/sites-enabled/aegis-relay-agent.conf ] || [ -e /etc/nginx/sites-enabled/aegis-relay-entry.conf ]; then
+    rm -f /etc/nginx/sites-enabled/aegis-relay-agent.conf /etc/nginx/sites-enabled/aegis-relay-entry.conf
     nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
   fi
   cd /; rm -rf -- "$INSTALL_DIR"
@@ -120,9 +123,13 @@ case "$ACTION" in
     do_domain "$2" "$3"
     ;;
   ip) do_ip;;
+  entry)
+    [ "$#" -ge 3 ] || { echo "用法: sudo aegis-relay-agent entry 入口域名 证书邮箱 [其他机器的直连域名 ...]" >&2; exit 1; }
+    shift; do_entry "$@"
+    ;;
   uninstall) do_uninstall;;
   menu)
     if [ -t 0 ] && [ -t 1 ]; then menu; else do_status; fi
     ;;
-  *) echo "用法: aegis-relay-agent {menu|status|logs|update|domain DOMAIN EMAIL|ip|uninstall}" >&2; exit 1;;
+  *) echo "用法: aegis-relay-agent {menu|status|logs|update|domain DOMAIN EMAIL|ip|entry ENTRY EMAIL [PEERS...]|uninstall}" >&2; exit 1;;
 esac

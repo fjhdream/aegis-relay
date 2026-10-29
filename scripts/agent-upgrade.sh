@@ -17,6 +17,7 @@ rm -rf "$INSTALL_DIR/src"; cp -a "$TMP_DIR/source/src" "$INSTALL_DIR/src"
 install -m 0755 "$TMP_DIR/source/scripts/aegis-relay-agent" /usr/local/bin/aegis-relay-agent
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-domain.sh" "$INSTALL_DIR/agent-configure-domain.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-ip.sh" "$INSTALL_DIR/agent-configure-ip.sh"
+install -m 0755 "$TMP_DIR/source/scripts/configure-entry-domain.sh" "$INSTALL_DIR/configure-entry-domain.sh"
 set_env(){ KEY=$1 VALUE=$2 FILE="$INSTALL_DIR/.env" TMP="$INSTALL_DIR/.env.tmp"; awk -v key="$KEY" -v value="$VALUE" 'BEGIN{done=0} $0 ~ "^"key"=" {print key"="value;done=1;next} {print} END{if(!done)print key"="value}' "$FILE" > "$TMP"; chmod 600 "$TMP"; mv "$TMP" "$FILE"; }
 SOURCE_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP_DIR/source/package.json" | head -n1)
 set_env AGENT_VERSION "$SOURCE_VERSION"

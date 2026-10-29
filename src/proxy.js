@@ -9,6 +9,7 @@ import { isPrivateIP } from './security.js';
 import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-auth.js';
 import { ThrottleTransform } from './metrics.js';
 import { guardedLookup } from './lookup.js';
+import { stripSteerParam } from './steering.js';
 
 const HOP = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
 const RETRY_STATUS = new Set([502, 503, 504]);
@@ -268,6 +269,13 @@ function orderedTargets(route) {
   return available.length?available:all;
 }
 
+// Index of the upstream line this machine currently serves a node from. Steering only moves a session
+// to a machine on the same line, so a seek never lands on an Emby server without its transcode session.
+export function activeUpstreamLine(route) {
+  const all=normalizedUpstreams(route),now=Date.now(),index=all.findIndex(t=>stateFor(route,t).openUntil<=now);
+  return index<0?0:index;
+}
+
 export function getRuntimeStatus(routes) {
   return routes.map(route => ({ id:route.id, alias:route.alias, upstreams:normalizedUpstreams(route).map(target=>{
     const s=stateFor(route,target); return { target:'[encrypted upstream]', failures:s.failures, circuitOpen:s.openUntil>Date.now(), retryAt:s.openUntil?new Date(s.openUntil).toISOString():null, lastSuccess:s.lastSuccess, lastError:s.lastError };
@@ -477,7 +485,7 @@ function rawHeaderBlock(headers) {
   return Object.entries(headers).flatMap(([k,v])=>v===undefined?[]:(Array.isArray(v)?v:[v]).map(item=>`${k}: ${item}\r\n`)).join('');
 }
 
-export function makeProxyHandler(routeSource, key, metrics = null) {
+export function makeProxyHandler(routeSource, key, metrics = null, steering = null) {
   return async (req, res) => {
     const incoming=new URL(req.url,'http://relay.invalid');
     if (req.method==='GET' && (incoming.pathname==='/' || incoming.pathname==='/index.html' || incoming.pathname==='/gateway' || incoming.pathname==='/gateway/')) {
@@ -486,8 +494,10 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
     }
     const found=routeFor(incoming.pathname,routesFrom(routeSource),key);
     if (!found) { res.writeHead(404,{'cache-control':'no-store'}); return res.end('not found'); }
+    // The steering token is addressed to this relay; it never reaches an upstream.
+    const search=stripSteerParam(incoming.search);
     let continuation, vod;
-    try { continuation=continuationTarget(found,key); vod=vodTarget(found,incoming.search); }
+    try { continuation=continuationTarget(found,key); vod=vodTarget(found,search); }
     catch { res.writeHead(404,{'cache-control':'no-store'});return res.end('not found'); }
     const {route}=found, playback=continuation?.playback===true||!!vod||isPlaybackPath(found.rest);
     const configured=continuation?[continuation.target.href]:vod?[vod.target.href]:orderedTargets(route);
@@ -499,6 +509,11 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
     // Mirror the proven Nginx gateway: advertise the public host/scheme so the upstream builds
     // correct redirects, but strip the client IP for privacy.
     const publicContext=publicRequestContext(req);
+    // Automatic steering: serve here, or send this playback request to a peer machine's direct domain.
+    const steer=playback&&route.steering&&steering?steering.plan({route,found,req,incoming,publicContext}):null;
+    if (steer?.redirect) { metricDone?.(302,0,false); res.writeHead(302,{location:steer.redirect,'cache-control':'no-store','referrer-policy':'no-referrer'}); return res.end(); }
+    const track=steer?.track||null;
+    track?.attach(res);
     const originalHeaders=stripAdminCredentials(strip(req.headers));
     delete originalHeaders['x-forwarded-for']; delete originalHeaders.forwarded; delete originalHeaders['x-real-ip'];
     if(publicContext.host)originalHeaders['x-forwarded-host']=publicContext.host;
@@ -506,11 +521,12 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
     // Apply the optional client-compat header hint (owned/authorized upstreams only). Query string
     // is relayed verbatim — we never rewrite the authenticated identity or tokens.
     applyClientProfile(originalHeaders,route.clientProfile);
+    if(steer?.range)originalHeaders.range=steer.range;
     // Prepared only when the node opts into stream-URL rewriting; null (no effect) otherwise. We do
     // NOT touch Accept-Encoding here — the media path and every non-rewritten response keep their
     // normal compression, so playback speed on a rewrite-enabled node matches one without it.
     const derived=routeDerived(route),rewriter=buildStreamRewriter(derived.rewrite,publicContext,found.prefix);
-    const relaySearch=incoming.search;
+    const relaySearch=search;
     const canRetry=safeMethod(req.method); let finished=false, clientGone=false, activeUp=null;
     // Emby clients abort constantly (seeking, stopping, backgrounding). Nginx tears the upstream
     // down with the client; without this the upstream kept streaming into a dead socket and leaked
@@ -560,7 +576,7 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
           }
           catch { delete out.location; }
         }
-        finished=true;
+        finished=true;track?.headers();
         if (res.destroyed || res.headersSent) { up.destroy(); metricDone?.(status,0,false); return; }
         const speed=Number(route.speedLimitMbps||0);
         let measured=false,streamed=0;
@@ -576,7 +592,7 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
           const done=err=>{ if(err&&!up.destroyed)up.destroy(); finishMetric(); };
           const tail=stages[stages.length-1];
           if(speed>0){
-            const counter=new ThrottleTransform(speed*1024*1024/8,bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes)});
+            const counter=new ThrottleTransform(speed*1024*1024/8,bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes);track?.bytes(bytes)});
             pipeline(...stages,counter,res,done);
           }else{
             // No rate limit means no throttling transform. Count bytes off the last stage (what the
@@ -584,7 +600,7 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
             // Attach pipeline first: adding a data listener puts a pre-buffered IncomingMessage into
             // flowing mode, so the destination must already be subscribed before accounting begins.
             pipeline(...stages,res,done);
-            tail.on('data',chunk=>{streamed+=chunk.length;metricDone?.addBytes?.(chunk.length)});
+            tail.on('data',chunk=>{streamed+=chunk.length;metricDone?.addBytes?.(chunk.length);track?.bytes(chunk.length)});
           }
         };
         const openResume=(plan,next)=>new Promise((resolve,reject)=>{
@@ -624,7 +640,7 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
           // openResume always dials a fresh clean socket, so resume legs keep the full stall timeout.
           const sourceReused=up.reusedSocket===true;
           const sourceStall=()=>(sourceReused&&streamed<MEDIA_STARTUP_BYTES)?MEDIA_REUSED_PROBATION_MS:MEDIA_STALL_TIMEOUT_MS;
-          const onBytes=bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes)};
+          const onBytes=bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes);track?.bytes(bytes)};
           const run=async()=>{
             let current=source,isSource=true,retries=0,lastError=null,marker=streamed,totalResumes=0;
             const resumeTimes=[];
@@ -674,6 +690,9 @@ export function makeProxyHandler(routeSource, key, metrics = null) {
           const resumePlan=playback&&speed<=0?mediaResumePlan(req.method,status,out):null;
           if(resumePlan)deliverResumable(upRes,resumePlan);else deliver(upRes);
         }
+        // Read the HLS segment length off the playlist as it passes (after delivery is wired, so the
+        // listener never switches the body into flowing mode ahead of the client).
+        if(track?.kind==='manifest'&&status===200)track.manifest(upRes,enc);
       });
       activeUp=up;
       const timeoutError=(message,extra)=>Object.assign(new Error(message),{code:'ETIMEDOUT'},extra);

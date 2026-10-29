@@ -5,6 +5,8 @@ import { compileAgentDesiredSnapshot } from './snapshot.js';
 import { LOCAL_AGENT_ID, normalizeAgentDomain, replaceAgentDeployments } from './agent-registry.js';
 import { sealAgentSnapshot } from './agent-config.js';
 import { sanitizeTelemetry } from './telemetry.js';
+import { STEERING_CAPABILITY } from './steering.js';
+import { readSteeringSettings } from './steering-topology.js';
 
 export const AGENT_PROTOCOL_VERSION=1;
 export const ENROLLMENT_TTL_MS=10*60_000;
@@ -58,6 +60,9 @@ export function consumeEnrollment(data,token,agentInput,now=Date.now()) {
   record.usedAt=at;record.agentId=agentId;delete record.digest;
   return agent;
 }
+
+// The parts of a machine record that feed the steering topology compiled into every snapshot.
+const steeringTopologyKey=agent=>`${Array.isArray(agent.capabilities)&&agent.capabilities.includes(STEERING_CAPABILITY)?1:0}|${agent.domain||''}|${agent.proxyMode||''}`;
 
 function cleanCapabilities(value) {
   return [...new Set((Array.isArray(value)?value:[]).map(item=>String(item)).filter(item=>/^[a-z0-9-]{1,32}$/.test(item)))].slice(0,16);
@@ -121,8 +126,8 @@ function importPanelPrivate(identity) { return crypto.createPrivateKey({key:Buff
 function baseHeaders(extra={}) { return {'cache-control':'no-store','content-type':'application/json; charset=utf-8','x-content-type-options':'nosniff','referrer-policy':'no-referrer',...extra}; }
 
 export class AgentApi {
-  constructor({store,version='0.0.0'}) {
-    this.store=store;this.version=version;this.panelIdentity=ensurePanelSigningIdentity(store);this.nonces=new Map();
+  constructor({store,version='0.0.0',steering=null,onTopologyChange=null}) {
+    this.store=store;this.version=version;this.steering=steering;this.onTopologyChange=onTopologyChange;this.panelIdentity=ensurePanelSigningIdentity(store);this.nonces=new Map();
     // Every response is signed and every request verified; parsing the DER keys each time was pure
     // overhead on the media event loop. The panel key is fixed for the process, agent keys per record.
     this.panelPrivateKey=importPanelPrivate(this.panelIdentity);this.agentKeys=new WeakMap();
@@ -215,11 +220,16 @@ export class AgentApi {
         if(parsed.protocolVersion!==AGENT_PROTOCOL_VERSION)throw Object.assign(new Error('unsupported protocol version'),{status:400});
         const agent=consumeEnrollment(this.store.data,parsed.token, {...agentInput,machine:parsed.machine});
         this.store.audit('agent.enrolled',requestIp(req),agent.id);
+        // A new machine that already speaks steering joins the topology of the nodes it serves.
+        if(readSteeringSettings(this.store.data).mode!=='off'){this.invalidate();this.onTopologyChange?.();}
         return this.send(res,201,{protocolVersion:AGENT_PROTOCOL_VERSION,agentId:agent.id,panelKeyId:this.panelIdentity.keyId,panelSigningPublicKey:this.panelIdentity.publicKey,serverTime:nowSeconds(),poll:{path:'/api/agent/v1/config',maxWaitSeconds:25,heartbeatSeconds:10}},requestNonce);
       }
       if(req.method==='POST'&&url.pathname==='/api/agent/v1/check-in'){
         const {raw,parsed}=await readBody(req),verified=this.verify(req,url,raw);requestNonce=verified.nonce;
-        const agent=verified.agent,at=new Date().toISOString();agent.lastSeen=at;agent.updatedAt=at;agent.agentVersion=String(parsed.agentVersion||agent.agentVersion||'unknown').slice(0,32);agent.applyState=['active','waiting','error'].includes(parsed.applyState)?parsed.applyState:'waiting';agent.proxyHealthy=parsed.proxyHealthy===true;agent.appliedRevision=Number.isSafeInteger(parsed.currentRevision)?Math.max(0,parsed.currentRevision):Number(agent.appliedRevision||0);agent.capabilities=cleanCapabilities(parsed.capabilities);agent.reportedDomain=normalizeAgentDomain(parsed.domain||'');agent.proxyMode=cleanProxyMode(parsed.proxyMode)||agent.proxyMode||(agent.domain?'domain':'ip');if(parsed.domainStatus&&typeof parsed.domainStatus==='object'){const d=parsed.domainStatus,mode=cleanProxyMode(d.mode)||'domain';agent.domainStatus={requestId:String(d.requestId||'').slice(0,80),state:['pending','applying','active','failed'].includes(d.state)?d.state:'failed',mode,desiredDomain:normalizeAgentDomain(d.desiredDomain||''),currentDomain:normalizeAgentDomain(d.currentDomain||''),message:String(d.message||'').slice(0,500),updatedAt:String(d.updatedAt||'').slice(0,40)};if(agent.domainStatus.state==='active'){agent.proxyMode=mode;agent.domain=agent.domainStatus.currentDomain||(mode==='ip'?agent.reportedDomain:agent.domain)||'';if(mode==='ip'){if(agent.desiredMode==='ip')delete agent.desiredMode;}else if(agent.desiredDomain===agent.domain){delete agent.desiredDomain;delete agent.desiredMode;}}}else if(agent.reportedDomain&&!agent.desiredDomain&&!agent.desiredMode)agent.domain=agent.reportedDomain;
+        const agent=verified.agent,at=new Date().toISOString(),topologyBefore=steeringTopologyKey(agent);agent.lastSeen=at;agent.updatedAt=at;agent.agentVersion=String(parsed.agentVersion||agent.agentVersion||'unknown').slice(0,32);agent.applyState=['active','waiting','error'].includes(parsed.applyState)?parsed.applyState:'waiting';agent.proxyHealthy=parsed.proxyHealthy===true;agent.appliedRevision=Number.isSafeInteger(parsed.currentRevision)?Math.max(0,parsed.currentRevision):Number(agent.appliedRevision||0);agent.capabilities=cleanCapabilities(parsed.capabilities);agent.reportedDomain=normalizeAgentDomain(parsed.domain||'');agent.proxyMode=cleanProxyMode(parsed.proxyMode)||agent.proxyMode||(agent.domain?'domain':'ip');if(parsed.domainStatus&&typeof parsed.domainStatus==='object'){const d=parsed.domainStatus,mode=cleanProxyMode(d.mode)||'domain';agent.domainStatus={requestId:String(d.requestId||'').slice(0,80),state:['pending','applying','active','failed'].includes(d.state)?d.state:'failed',mode,desiredDomain:normalizeAgentDomain(d.desiredDomain||''),currentDomain:normalizeAgentDomain(d.currentDomain||''),message:String(d.message||'').slice(0,500),updatedAt:String(d.updatedAt||'').slice(0,40)};if(agent.domainStatus.state==='active'){agent.proxyMode=mode;agent.domain=agent.domainStatus.currentDomain||(mode==='ip'?agent.reportedDomain:agent.domain)||'';if(mode==='ip'){if(agent.desiredMode==='ip')delete agent.desiredMode;}else if(agent.desiredDomain===agent.domain){delete agent.desiredDomain;delete agent.desiredMode;}}}else if(agent.reportedDomain&&!agent.desiredDomain&&!agent.desiredMode)agent.domain=agent.reportedDomain;
+        // An upgraded machine (new capability) or a changed domain reshapes which machines may steer a
+        // node between them; recompile everyone's snapshot so the new peer list goes out right away.
+        if(steeringTopologyKey(agent)!==topologyBefore&&readSteeringSettings(this.store.data).mode!=='off'){this.invalidate();this.onTopologyChange?.();}
         if(parsed.telemetry!==undefined){const telemetry=sanitizeTelemetry(parsed.telemetry);if(!telemetry)throw Object.assign(new Error('invalid agent telemetry'),{status:400,nonce:requestNonce});agent.telemetry=telemetry;agent.lastTelemetryAt=at;}
         // Heartbeat state is disposable; the panel's periodic flush persists it. Writing the whole
         // encrypted store synchronously on every check-in stalled the event loop serving playback.
@@ -257,6 +267,12 @@ export class AgentApi {
           if(after>=snapshot.revision)return this.send(res,204,null,requestNonce);
         }
         return this.send(res,200,sealAgentSnapshot({agent:verified.agent,snapshot,panelIdentity:this.panelIdentity}),requestNonce);
+      }
+      if(req.method==='POST'&&url.pathname==='/api/agent/v1/steering'){
+        const {raw,parsed}=await readBody(req,512*1024),verified=this.verify(req,url,raw);requestNonce=verified.nonce;
+        if(!this.steering)throw Object.assign(new Error('not found'),{status:404,nonce:requestNonce});
+        if(parsed.protocolVersion!==1)throw Object.assign(new Error('unsupported steering protocol'),{status:400,nonce:requestNonce});
+        return this.send(res,200,this.steering.exchange(verified.agent.id,parsed),requestNonce);
       }
       if(req.method==='POST'&&url.pathname==='/api/agent/v1/ack'){
         const {raw,parsed}=await readBody(req),verified=this.verify(req,url,raw);requestNonce=verified.nonce;const agent=verified.agent,revision=Number(parsed.revision),status=parsed.status;

@@ -801,3 +801,12 @@ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .row-actions{justify-content:flex-start;flex-wrap:wrap;gap:7px;padding-top:12px;border-top:1px solid var(--line)}
   .row-actions .btn{padding:8px 13px;font-size:12px}
 }
+
+/* 自动切流 */
+.table-head{padding:18px 20px 12px}
+.table-head h3{margin:4px 0 0}
+.steer-warning{border-color:color-mix(in srgb,var(--warn,#c98a1a) 40%,var(--line))}
+.steering-commands{display:grid;gap:12px;margin-top:12px}
+.steering-commands pre{margin:6px 0 0;padding:12px 14px;border:1px solid var(--line-2);border-radius:var(--r-xs);background:var(--inset,var(--surface-2));white-space:pre-wrap;word-break:break-all;font-size:13px}
+.steering-commands .command-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.steer-scores{display:flex;flex-wrap:wrap;gap:6px}

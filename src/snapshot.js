@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { canonicalJson } from './canonical-json.js';
 import { isRouteAuthKey, ROUTE_AUTH_VERSION } from './route-auth.js';
 import { b64u, timingEqual } from './security.js';
-import { routesForAgent } from './agent-registry.js';
+import { agentSnapshotNodes } from './steering-topology.js';
 
 export const SNAPSHOT_SCHEMA_VERSION=1;
 
@@ -41,6 +41,18 @@ function streamRewrite(value={}) {
   return {enabled:value?.enabled===true&&domains.length>0,domains};
 }
 
+// Present only on nodes this machine steers (see steering-topology.js), so every other snapshot keeps
+// its exact previous shape and hash.
+function steering(value) {
+  const peers=(Array.isArray(value.peers)?value.peers:[]).map(peer=>{
+    const id=String(peer?.id||''),base=String(peer?.base||'');
+    let url;try{url=new URL(base)}catch{throw new Error('invalid steering peer')}
+    if(!id||url.protocol!=='https:'||url.username||url.password||url.pathname!=='/'||url.search||url.hash||url.origin!==base)throw new Error('invalid steering peer');
+    return {id,base};
+  });
+  return {mode:value.mode==='on'?'on':'shadow',peers,params:{minRateMbps:Math.max(0,Number(value.params?.minRateMbps||0))}};
+}
+
 function normalizeNode(route) {
   if(!route||typeof route!=='object')throw new Error('snapshot node must be an object');
   const id=String(route.id||'').trim(),alias=String(route.alias||'').trim();
@@ -67,7 +79,8 @@ function normalizeNode(route) {
     upstreams,
     allowPrivate:route.allowPrivate===true,tlsVerify:route.tlsVerify!==false,
     showOnHome:route.showOnHome===true,clientProfile:clientProfile(route.clientProfile),streamRewrite:streamRewrite(route.streamRewrite),
-    speedLimitMbps:Number(route.speedLimitMbps||0),monthlyQuotaGB:Number(route.monthlyQuotaGB||0),access
+    speedLimitMbps:Number(route.speedLimitMbps||0),monthlyQuotaGB:Number(route.monthlyQuotaGB||0),access,
+    ...(route.steering?{steering:steering(route.steering)}:{})
   };
 }
 
@@ -145,7 +158,7 @@ export function compileDesiredSnapshot({nodes,previousState=null,signingIdentity
 export function compileAgentDesiredSnapshot({data,agentId,previousState=null,signingIdentity}) {
   if(!data||typeof data!=='object')throw new Error('agent snapshot requires store data');
   if(!String(agentId||'').trim())throw new Error('agent snapshot requires agentId');
-  return compileDesiredSnapshot({nodes:routesForAgent(data,agentId),previousState,signingIdentity});
+  return compileDesiredSnapshot({nodes:agentSnapshotNodes(data,agentId),previousState,signingIdentity});
 }
 
 export function verifySnapshot(snapshot, signingIdentity, {currentRevision=0,currentHash=null}={}) {

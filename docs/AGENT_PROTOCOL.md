@@ -198,6 +198,7 @@ API 根路径：
 | `POST` | `/check-in` | 心跳、版本和应用状态 |
 | `GET` | `/config?after=<revision>&wait=25` | 长轮询新配置 |
 | `POST` | `/ack` | 配置应用成功或失败回执 |
+| `POST` | `/steering` | 自动切流：上报本机测速、决策与落地，取回各会话共享状态和其他机器健康度（`steering-v1`，见 [AUTO_STEERING.md](AUTO_STEERING.md) §10） |
 | `POST` | `/metrics` | 批量指标上报 |
 | `POST` | `/panel-key/confirm` | 面板签名公钥轮换确认，预留 |
 
@@ -794,6 +795,7 @@ v1 必须保留协议字段，但可以暂不提供 UI。安全轮换需要：
 - 快照声明 `minimumAgentVersion`；
 - 控制面根据 Agent `capabilities` 禁止发布其无法执行的配置；
 - v1 初始能力：`proxy-v1`、`metrics-v1`、`dual-key-v1`。
+- `steering-v1`（0.11.0）：机器运行自动切流引擎，可作为切流目标。只有声明该能力的机器才会在快照的节点里收到 `steering` 拓扑块，旧探针的快照内容与 hash 保持不变。
 
 ## 25. 存储建议
 

@@ -59,6 +59,14 @@ https://emby.example.com/family/<访问密钥>/
 - **v0.10.22 仪表盘与请求热路径减负**：① 所有打开的面板标签页**共用一份仪表盘推送**，每次更新只构建一次快照（此前每个标签页各自在推流的事件循环上重算一遍）；访客统计按节点建索引，仪表盘只算计数、不再构建完整访客名单，聚合耗时约降为原来的 1/5。② 每个代理请求的固定开销下降：连接密钥校验复用已解码的密钥（33 个分发通道的节点约快 1.6 倍），访客名单改为维护计数（约快 4 倍），改写规则与可携带凭据的源站按路由快照只计算一次。③ 面板签名私钥与探针公钥只解析一次。所有输出与行为不变。探针也运行同一套请求路径，可按面板「待升级」提示更新。
 - 面向流媒体调优：DNS 结果缓存、TLS 会话恢复、256 KiB 有界背压窗口、Nginx `proxy_buffering off` + 显式转发 `Range`/`If-Range`（保证媒体按 206 分段透传、可秒开可拖动）、禁止临时文件和隐式限速、上下游 socket keepalive、无限速时零中间变换、`TCP_NODELAY`；下游产生背压时暂停上游失活检测，不会把暂停观看误判为断流
 
+**自动切流（v0.11.0）**
+- 某台机器到观众的线路变慢时，把这次播放的取流请求用 302 自动跳转到另一台机器的**直连域名**；HLS 转码按分片切换（基本无感），直接播放在拖动或重连时切换，切过去之后线路再变差还能再切、也能切回
+- 只在「播放器一直在读但读不快、源站供得上」时切：源站或转码本身慢不会触发切换（换机器也没用）；切换后至少停留 2 分钟、10 分钟内最多切 3 次、新线路须快 30% 以上，防止线路波动导致来回切
+- 每台机器只为自己测速，测速记录经面板同步；面板离线时各机器独立判断，**一个请求最多被跳转一次**，任何情况下都不会出现跳转循环
+- 先用「只测不切」模式观察判断是否准确，再正式开启；不跟随跳转的客户端类型会被自动排除；浏览器始终不参与
+- 入口域名（所有机器共用、按 DNS 线路分发）由面板为每台机器生成一条 `entry` 命令完成配置，证书验证请求在机器之间互相转发，不需要 DNS API Token
+- **注意**：切流后上游看到的来源 IP 会在播放中途变化，默认关闭、按节点开启，只应用于不会因此封号的上游。设计与原理见 [自动切流设计](docs/AUTO_STEERING.md)
+
 **多机数据面**
 - 面板生成 10 分钟有效的**一次性安装指令**，远程机器用 Ed25519/X25519 身份注册
 - 每台机器只拉取**属于自己的加密节点快照**，原子应用后回传版本
@@ -146,6 +154,7 @@ sudo aegis-relay logs        # 实时日志
 sudo aegis-relay update      # 拉取最新版并重建
 sudo aegis-relay domain      # 两步确认面板域名与 Emby 反代域名（默认同域），自动申请证书
 sudo aegis-relay proxy-domain emby.example.com   # 面板执行器不可用时的手动兜底
+sudo aegis-relay entry emby.example.com admin@example.com s2.example.com s3.example.com   # 自动切流的入口域名（命令由面板「自动切流」页生成）
 sudo aegis-relay uninstall   # 一键卸载面板（需输入 yes 确认；保留 TLS 证书）
 ```
 
@@ -158,6 +167,7 @@ sudo aegis-relay-agent logs
 sudo aegis-relay-agent update      # 策略更新后每台都要跑
 sudo aegis-relay-agent domain relay.example.com admin@example.com   # 切换/配置 HTTPS 域名
 sudo aegis-relay-agent ip          # 切回本机 IP 明文 HTTP 反代（面板执行器不可用时的手动兜底）
+sudo aegis-relay-agent entry emby.example.com admin@example.com s1.example.com s3.example.com   # 自动切流的入口域名（命令由面板生成）
 sudo aegis-relay-agent uninstall   # 一键卸载探针（需输入 yes 确认；保留 TLS 证书）
 ```
 
