@@ -13,7 +13,6 @@ nginx(){ return 0; }
 getent(){ return 0; }
 mkdir(){ echo mkdir >> "$TEST_CALLS"; return 88; }
 ln(){ echo ln >> "$TEST_CALLS"; return 88; }
-apt-get(){ echo apt-get >> "$TEST_CALLS"; return 88; }
 certbot(){ echo certbot >> "$TEST_CALLS"; return 88; }
 systemctl(){ echo systemctl >> "$TEST_CALLS"; return 88; }
 curl(){
