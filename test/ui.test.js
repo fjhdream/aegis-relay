@@ -1,4 +1,16 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
+import vm from 'node:vm';
+test('playback UI labels stale measurements as history and shows the last stream request',()=>{
+  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),elements=new Map();
+  const context=vm.createContext({$:id=>{if(!elements.has(id))elements.set(id,{});return elements.get(id);},$$:()=>[],setValue(){},escapeHtml:String,Date});
+  vm.runInContext(js.slice(js.indexOf('const STEER_MODES='),js.indexOf('async function saveSteering')),context);
+  context.data={settings:{},machines:[],routes:[],live:{sessions:[{session:'abc123',client:'VidHub',routeId:'n1',lastSeen:1_000_000,scores:{old:{verdict:'ok',rateBps:12e6,at:1000,stale:true},fresh:{verdict:'ok',rateBps:1e6,at:999000,stale:false}}}]}};
+  vm.runInContext('renderSteering(data)',context);
+  const html=elements.get('#steering-sessions').innerHTML;
+  assert.match(html,/样本已过期/);assert.match(html,/历史速率/);assert.match(html,/最近取流/);
+  assert.match(html,/fresh · 正常 · 8\.0 Mbps/);
+  assert.doesNotMatch(html,/old · 正常 · 96\.0 Mbps/);
+});
 test('front-end id selectors resolve to real elements',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');const ids=new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(x=>x[1])),referenced=[...js.matchAll(/\$\(['"]#([A-Za-z0-9_-]+)['"]\)/g)].map(x=>x[1]);const missing=[...new Set(referenced.filter(x=>!ids.has(x)))];assert.deepEqual(missing,[])});
 test('admin page has no inline executable scripts',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');assert.equal(/<script(?![^>]+src=)/i.test(html),false);assert.match(html,/STYLE_CSS/);assert.match(html,/HELP_CSS/);assert.match(html,/APP_JS/)});
 test('node editor uses fixed proxy takeover and supports viewing client addresses',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');assert.match(html,/高级设置/);assert.match(html,/开启（推荐，防止他人盗用）/);assert.doesNotMatch(html,/遇到 302 播放跳转时/);assert.doesNotMatch(js,/directStream/);assert.match(html,/代理全程接管/);assert.match(js,/addr-reveal/);assert.match(js,/addr-copy/);assert.match(js,/\/credentials/)});

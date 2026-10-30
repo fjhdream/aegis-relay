@@ -100,7 +100,9 @@ test('Rex custom video paths retain their steering identity through encrypted CD
     assert.equal(streamed.status,206);assert.equal(streamed.headers['content-range'],'bytes 0-7/32');
     assert.equal(a.sessions.size,1,'the CDN continuation belongs to the original playback');
     await get(portA,path,{...headers,range:'bytes=8-'});
-    assert(a.syncPayload([route]).bounds.some(result=>result.client==='Rex'&&result.continued));
+    const hub=new SteeringHub({store:{data:{agents:[],deployments:[{agentId:'a',routeId:route.id},{agentId:'b',routeId:route.id}]}}});
+    hub.exchange('a',a.syncPayload([route]));
+    assert.equal(hub.view().ranges.find(row=>row.client==='Rex')?.continued,1);
     session.scores.a={verdict:'starved_down',rateBps:1,at:a.now()};
     a.health.set('b',{healthy:true,at:a.now(),routes:{rex:{line:0,quotaExhausted:false}}});
     const moved=await get(portA,path,{...headers,range:'bytes=16-'});
@@ -111,7 +113,10 @@ test('Rex custom video paths retain their steering identity through encrypted CD
     assert.equal(landed.status,206);assert.equal(landed.headers['content-range'],'bytes 16-23/32');
     assert.deepEqual(seen,['bytes=0-7','bytes=8-15','bytes=16-23']);
     assert.equal([...b.sessions.values()][0].key,session.key);
-    assert.equal(b.syncPayload([route]).landings.length,1);
+    const landedPayload=b.syncPayload([route]);
+    assert.equal(landedPayload.landings.length,1);
+    hub.exchange('b',landedPayload);hub.exchange('a',a.syncPayload([route]));
+    assert.equal(hub.view().ranges.find(row=>row.client==='Rex')?.continued,2,'a real peer landing confirms the preceding cap');
   }finally{
     a?.stop();b?.stop();
     await Promise.all([relayA&&close(relayA),relayB&&close(relayB),close(origin),close(cdn)]);

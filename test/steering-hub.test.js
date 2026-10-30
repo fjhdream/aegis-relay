@@ -201,27 +201,104 @@ test('history is kept per node and client network, at most one sample a minute p
   assert.equal(other.sessions.find(item=>item.s==='S'.repeat(22)).prior,undefined);
 });
 
-test('capped ranges: a failed continuation switches a client off, a clean trial switches it on',()=>{
+test('legacy range timeouts are unconfirmed; proven trial continuations can enable a client',()=>{
   const {store,data}=fixture(),verdicts=[];
   data.settings.steering.boundedClients=['Infuse'];
   const hub=new SteeringHub({store,onBoundVerdict:(client,works)=>{verdicts.push([client,works]);(works?data.settings.steering.autoBounded||={}:data.settings.steering.autoUnbounded||={})[client]='now'}});
   const send=items=>hub.exchange('local',{bounds:items.map(([client,continued,trial])=>({s:'T'.repeat(22),r:'n1',client,continued,trial,at:1}))});
   send([['Infuse',true,false],['Infuse',false,false]]);
   assert.deepEqual(verdicts,[]);
-  assert.deepEqual(send([['Infuse',false,false]]).boundedClients,[],'2 of 3 failed: off, even though the operator listed it');
+  assert.deepEqual(send([['Infuse',false,false]]).boundedClients,['Infuse'],'older agents cannot disable a client just because no follow-up was seen');
   // trials only run with automatic detection on, in active mode, for clients that follow redirects
   assert.deepEqual(hub.exchange('local',{}).trialClients,[]);
   data.settings.steering.boundAuto=true;
   for(let i=0;i<5;i++)hub.exchange('b',{landings:[{s:String.fromCharCode(97+i).repeat(22),r:'n1',epoch:1,client:'VLC',at:1}]});
   assert.deepEqual(hub.exchange('local',{}).trialClients,['VLC']);
   send([['VLC',true,true],['VLC',true,true]]);
-  assert.equal(verdicts.length,1);
+  assert.equal(verdicts.length,0);
   const after=send([['VLC',true,true]]);
   assert.deepEqual(verdicts.at(-1),['VLC',true]);
-  assert.deepEqual([after.boundedClients,after.trialClients],[['VLC'],[]]);
+  assert.deepEqual([after.boundedClients,after.trialClients],[['Infuse','VLC'],[]]);
   send([['Kodi',false,true]]);
-  assert.deepEqual(verdicts.at(-1),['Kodi',false],'one failed trial is enough');
+  assert.deepEqual(verdicts,[['VLC',true]],'an unconfirmed trial cannot establish incompatibility');
   assert.deepEqual(hub.view().ranges.find(item=>item.client==='VLC').state,'on');
+});
+
+test('stopping or pausing a capped playback does not disable its client type',()=>{
+  let now=1_000_000_000;
+  const {store,data,route}=fixture();data.settings.steering.boundedClients=['VidHub'];
+  const hub=new SteeringHub({store,clock:()=>now,onBoundVerdict:(client,works)=>{if(!works)(data.settings.steering.autoUnbounded||={})[client]='now';}});
+  const engine=new SteeringEngine({selfId:'local',clock:()=>now});engine.bounded.add('vidhub');engine.boundBytes=1000;
+  const play=(item,start)=>{
+    const incoming=new URL(`https://entry.example.com/Videos/${item}/stream?DeviceId=device`);
+    const plan=engine.plan({route:{...route,steering:{mode:'on',peers:[]}},found:{rest:incoming.pathname,prefix:'/movie/key'},incoming,publicContext:{proto:'https'},req:{method:'GET',headers:{range:`bytes=${start}-`,'x-emby-client':'VidHub'}}});
+    plan.track.headers(206,{'content-range':`bytes ${start}-${start+999}/50000`});plan.track.bytes(1000);plan.track.close();
+  };
+  try{
+    for(let i=0;i<3;i++){
+      play('movie'+i,0);hub.exchange('local',engine.syncPayload([route]));
+      now+=121_000;engine.tick();
+      const payload=engine.syncPayload([route]);
+      assert(!(payload.bounds||[]).some(item=>item.continued===false),'absence of a follow-up is not a compatibility failure');
+      hub.exchange('local',payload);
+    }
+    assert.deepEqual(hub.exchange('local',{}).boundedClients,['VidHub']);
+    now+=300_000;play('movie2',1000);hub.exchange('local',engine.syncPayload([route]));
+    assert.equal(hub.view().ranges[0].continued,1,'a long pause can still end in a proven continuation');
+  }finally{engine.stop();}
+});
+
+test('capped playback continues across machines even when sync batches arrive out of order',()=>{
+  let now=1_000_000_000;
+  const {store,data,route}=fixture();data.settings.steering.boundedClients=['VidHub'];
+  const hub=new SteeringHub({store,clock:()=>now}),a=new SteeringEngine({selfId:'local',clock:()=>now}),b=new SteeringEngine({selfId:'b',clock:()=>now});
+  for(const engine of [a,b]){engine.bounded.add('vidhub');engine.boundBytes=1000;}
+  const play=(engine,start)=>{
+    const incoming=new URL('https://entry.example.com/Videos/movie/stream?DeviceId=device');
+    const plan=engine.plan({route:{...route,steering:{mode:'on',peers:[]}},found:{rest:incoming.pathname,prefix:'/movie/key'},incoming,publicContext:{proto:'https'},req:{method:'GET',headers:{range:`bytes=${start}-`,'x-emby-client':'VidHub'}}});
+    now+=10;plan.track.headers(206,{'content-range':`bytes ${start}-${start+999}/50000`});plan.track.bytes(1000);plan.track.close();now++;
+  };
+  try{
+    play(a,0);play(b,1000);
+    const first=a.syncPayload([route]),second=b.syncPayload([route]);
+    hub.exchange('b',second);hub.exchange('local',first);
+    assert.equal(hub.view().ranges[0]?.continued,1,'the next Range on another machine confirms the first cap');
+    hub.exchange('local',first);hub.exchange('b',second);
+    assert.equal(hub.view().ranges[0].total,1,'retrying a sync must not count the same cap twice');
+    now+=121_000;a.tick();b.tick();
+    hub.exchange('local',a.syncPayload([route]));hub.exchange('b',b.syncPayload([route]));
+    assert.equal(hub.view().ranges[0].total,1,'no follow-up leaves the last cap unconfirmed');
+    play(a,0);hub.exchange('local',a.syncPayload([route]));
+    assert.equal(hub.view().ranges[0].total,1,'an earlier request cannot confirm a later re-read of the same bytes');
+    play(b,1000);hub.exchange('b',b.syncPayload([route]));
+    assert.equal(hub.view().ranges[0].continued,2);
+  }finally{a.stop();b.stop();}
+});
+
+test('the playback view marks stale speed samples without changing decision state',()=>{
+  const now=1_000_000_000,{store}=fixture(),hub=new SteeringHub({store,clock:()=>now});
+  const session=hub.touch('A'.repeat(22),'n1',now-240_000);
+  session.scores.local={verdict:'ok',rateBps:12_000_000,at:now-45*60_000};
+  session.scores.b={verdict:'starved_down',rateBps:1000,at:now-1000};
+  const view=hub.view();
+  assert.equal(view.sessions[0].scores.local.stale,true);
+  assert.equal(view.sessions[0].scores.b.stale,false);
+  assert.equal(session.scores.local.stale,undefined,'the UI must not rewrite the engine score');
+});
+
+test('range correlation rejects malformed offsets, foreign routes and old requests, and stays bounded',()=>{
+  const now=1_000_000_000,{store}=fixture(),hub=new SteeringHub({store,clock:()=>now});
+  const s='R'.repeat(22),base={s,r:'n1',phase:'complete',start:0,end:999,requestAt:now-1000,client:'VidHub',at:now};
+  for(const change of [{start:-1},{start:0.5},{end:'999'},{end:Number.MAX_SAFE_INTEGER},{requestAt:now+1},{requestAt:0},{client:''},{at:now-31*60_000},{r:'foreign'},{s:'invalid'},{phase:'invalid'}])hub.exchange('local',{rangeEvents:[{...base,...change}]});
+  assert.equal(hub.view().ranges.length,0);
+  assert.equal(hub.sessions.get(s)?.ranges,undefined);
+  const requests=Array.from({length:100},(_,start)=>({s,r:'n1',phase:'request',start,at:now-2000}));
+  hub.exchange('b',{rangeEvents:requests});
+  assert.equal(hub.sessions.get(s).ranges.size,32);
+  hub.exchange('local',{rangeEvents:[base]});
+  assert.equal(hub.view().ranges.length,0,'an unrelated or earlier request is not a continuation');
+  hub.exchange('b',{rangeEvents:[{s,r:'n1',phase:'request',start:1000,at:now}]});
+  assert.equal(hub.view().ranges[0].continued,1);
 });
 
 test('each participating machine is told to serve the entry domain and forward ACME challenges to the others',()=>{

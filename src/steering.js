@@ -21,7 +21,7 @@ export const STEER_DEFAULTS=Object.freeze({
   switchWindowMs:600_000,maxSwitches:3,improve:1.3,penaltyMs:600_000,tokenTtlMs:30_000,sessionTtlMs:30*60_000,
   peerStaleMs:60_000,landingTimeoutMs:15_000,detachMs:15_000,reportEveryMs:5_000,
   syncActiveMs:5_000,syncIdleMs:30_000,syncDebounceMs:500,syncMaxBackoffMs:300_000,boundBytes:64*1024*1024,
-  // Prefetching players can wait a minute before requesting the next range while buffered video plays.
+  // Release an unconfirmed automatic trial after this wait; silence is not a compatibility failure.
   historyMinSamples:3,historyBadShare:0.34,historyGoodShare:0.75,boundContinueMs:120_000
 });
 
@@ -285,8 +285,11 @@ class SteerTrack {
     if(this.done)return;
     this.done=true;this.endAt=this.engine.now();this.res=null;this.engine.tracks.delete(this);
     if(this.kind==='progressive'){const prog=this.engine.localOf(this.session).prog;prog.active.delete(this);prog.lastServedAt=this.endAt;}
-    // The whole capped range reached the client: a player that handles it asks for the rest right away.
-    if(this.bound?.length&&this.sent>=this.bound.length)this.engine.localOf(this.session).boundWait={end:this.bound.end,at:this.endAt,client:this.bound.client,trial:this.bound.trial};
+    // The next Range may reach another machine, so the hub pairs delivery with the next request.
+    if(this.bound?.length&&this.sent>=this.bound.length){
+      this.engine.queueRangeEvent(this.session,{phase:'complete',start:this.bound.start,end:this.bound.end,requestAt:this.reqAt,client:this.bound.client,trial:this.bound.trial},this.endAt);
+      if(this.bound.trial)this.engine.localOf(this.session).boundWait={end:this.bound.end,at:this.endAt,client:this.bound.client};
+    }
     else if(this.bound)this.engine.dropBound(this);
   }
   // The media playlist states its segment length; read it off the wire without delaying delivery.
@@ -302,7 +305,7 @@ export class SteeringEngine {
     this.selfId=String(selfId||'');this.lineOf=lineOf;this.canServe=canServe;this.params={...STEER_DEFAULTS,...params};this.clock=clock;
     this.offsetMs=0;this.sessions=new Map();this.items=new Map();this.tracks=new Set();this.health=new Map();
     this.excluded=new Set();this.bounded=new Set();this.trials=new Set();this.trialing=new Set();this.boundBytes=this.params.boundBytes;
-    this.cursor=0;this.reports=new Map();this.decisions=[];this.landings=[];this.failures=[];this.shadow=[];this.bounds=[];
+    this.cursor=0;this.reports=new Map();this.decisions=[];this.landings=[];this.failures=[];this.shadow=[];this.rangeEvents=[];
     this.ticker=null;this.syncTimer=null;this.syncDue=0;this.syncing=false;this.send=null;this.routes=()=>[];this.syncErrors=0;this.lastSyncError='';this.lastSyncAt=0;
   }
 
@@ -363,9 +366,11 @@ export class SteeringEngine {
     const session=this.session(key,route.id,nowMs);
     session.lastSeen=nowMs;session.minRateMbps=Number(topology.params?.minRateMbps||0);if(identity.client)session.client=identity.client;
     if(!session.prefix)session.prefix=prefixKeyFor(route,clientIpOf(req));
-    // The player came back for the bytes right after a capped range: it continues on its own.
+    // Report Range starts independently of where the preceding capped response was served.
     const wait=session.local?.boundWait;
-    if(wait&&kind==='progressive'&&rangeStart(req.headers.range)===wait.end+1)this.boundResult(session,true,nowMs);
+    const start=kind==='progressive'?rangeStart(req.headers.range):null;
+    if(Number.isSafeInteger(start)&&start>=0)this.queueRangeEvent(session,{phase:'request',start},nowMs);
+    if(wait&&start===wait.end+1)this.clearBoundWait(session);
     // The next segment request marks the moment the client finished the previous one.
     if(kind==='segment')this.closeCycle(session,nowMs);
     // A request we were just steered to is always served here: one steering hop per request at most,
@@ -497,12 +502,15 @@ export class SteeringEngine {
     track.bound=null;
   }
 
-  boundResult(session, continued, nowMs) {
+  clearBoundWait(session) {
     const wait=session.local.boundWait;
     session.local.boundWait=null;
-    if(wait.trial)this.trialing.delete(String(wait.client).toLowerCase());
-    this.bounds.push({s:session.key,r:session.routeId,client:wait.client,continued,trial:wait.trial,at:nowMs});
-    if(this.bounds.length>1000)this.bounds.splice(0,this.bounds.length-1000);
+    this.trialing.delete(String(wait.client).toLowerCase());
+  }
+
+  queueRangeEvent(session, event, nowMs) {
+    this.rangeEvents.push({s:session.key,r:session.routeId,...event,at:nowMs});
+    if(this.rangeEvents.length>1000)this.rangeEvents.splice(0,this.rangeEvents.length-1000);
     this.requestSync();
   }
 
@@ -528,7 +536,7 @@ export class SteeringEngine {
         if(prog.ticks.length>=windowTicks)this.score(session,progressiveVerdict(prog.ticks,{windowTicks,minRateMbps:session.minRateMbps}),nowMs);
       }
       if(session.pending)this.checkPending(session,nowMs);
-      if(session.local?.boundWait&&nowMs-session.local.boundWait.at>this.params.boundContinueMs)this.boundResult(session,false,nowMs);
+      if(session.local?.boundWait&&nowMs-session.local.boundWait.at>this.params.boundContinueMs)this.clearBoundWait(session);
       if(nowMs-session.lastSeen>this.params.sessionTtlMs&&!prog?.active.size)this.sessions.delete(session.key);
     }
     for(const [itemKey,entry] of this.items){if(nowMs-entry.at<=this.params.sessionTtlMs)break;this.items.delete(itemKey);}
@@ -546,13 +554,13 @@ export class SteeringEngine {
     for(const route of routes)health.routes[route.id]={line:this.lineOf(route),quotaExhausted:!this.canServe(route)};
     const reports=[...this.reports.values()].slice(0,200);
     for(const report of reports)this.reports.delete(report.s);
-    return {protocolVersion:1,cursor:this.cursor,reports,decisions:this.decisions.splice(0,200),landings:this.landings.splice(0,200),failures:this.failures.splice(0,200),shadow:this.shadow.splice(0,200),bounds:this.bounds.splice(0,200),health};
+    return {protocolVersion:1,cursor:this.cursor,reports,decisions:this.decisions.splice(0,200),landings:this.landings.splice(0,200),failures:this.failures.splice(0,200),shadow:this.shadow.splice(0,200),rangeEvents:this.rangeEvents.splice(0,200),health};
   }
 
   // A failed sync must not lose decisions/landings: put them back in front (reports are superseded by
   // fresher ones anyway).
   requeue(payload) {
-    for(const list of ['decisions','landings','failures','shadow','bounds']){
+    for(const list of ['decisions','landings','failures','shadow','rangeEvents']){
       this[list].unshift(...(payload[list]||[]));
       if(this[list].length>1000)this[list].splice(0,this[list].length-1000);
     }

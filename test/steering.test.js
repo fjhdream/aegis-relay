@@ -276,18 +276,18 @@ test('a capped range is judged by whether the player comes back for the next byt
   const call=(range,client='Infuse',key='d1')=>{const u=url.replace('d1',key),q=request(u,{range,'x-emby-client':client});return a.plan({route:r,found:found(r,u),req:q.req,incoming:q.incoming,publicContext:https})};
   const serve=(plan,{status=206,contentRange='bytes 0-999/50000',sent=1000}={})=>{plan.track.headers(status,{'content-range':contentRange});plan.track.bytes(sent);plan.track.close()};
   serve(call('bytes=0-'));
-  assert.equal(a.bounds.length,0,'waiting for the player');
+  assert.deepEqual(a.rangeEvents.map(item=>item.phase),['request','complete'],'the hub can pair events across machines');
   call('bytes=1000-');
-  assert.deepEqual(a.bounds.map(item=>[item.client,item.continued,item.trial]),[['Infuse',true,false]]);
-  // the player never comes back
+  assert.equal(a.rangeEvents.at(-1).start,1000);
+  // A player that stops has no compatibility verdict.
   serve(call('bytes=0-',undefined,'d2'));clock+=121_000;a.tick();
-  assert.deepEqual(a.bounds.map(item=>item.continued),[true,false]);
+  assert(!a.rangeEvents.some(item=>item.continued===false));
   // nothing was cut (end of file, origin ignored Range, client left early): no verdict at all
   serve(call('bytes=0-',undefined,'d3'),{contentRange:'bytes 0-999/1000'});
   serve(call('bytes=0-',undefined,'d4'),{status:200,contentRange:''});
   serve(call('bytes=0-',undefined,'d5'),{sent:10});
   clock+=121_000;a.tick();
-  assert.equal(a.bounds.length,2);
+  assert.equal(a.rangeEvents.filter(item=>item.phase==='complete').length,2);
   a.stop();
 });
 
@@ -300,9 +300,10 @@ test('Rex can pause prefetching for a minute and still successfully continue a c
     const first=call('bytes=0-');
     first.track.headers(206,{'content-range':'bytes 0-7/800'});first.track.bytes(8);first.track.close();
     clock+=60_000;a.tick();
-    assert.equal(a.bounds.length,0,'a normal prefetch pause must not be reported as a failure');
+    assert(!a.rangeEvents.some(item=>item.continued===false),'a normal prefetch pause must not be reported as a failure');
     call('bytes=8-');
-    assert.deepEqual(a.bounds.map(result=>result.continued),[true]);
+    assert.deepEqual(a.rangeEvents.map(result=>result.phase),['request','complete','request']);
+    assert.equal(a.rangeEvents.at(-1).start,8);
   }finally{a.stop();}
 });
 
@@ -316,8 +317,22 @@ test('a client on trial gets one capped range per session and one session at a t
   assert.equal(call('d2').range,null,'another session waits for the running trial');
   first.track.headers(206,{'content-range':'bytes 0-999/9999'});first.track.bytes(1000);first.track.close();
   call('d1','bytes=1000-');
-  assert.deepEqual(a.bounds.map(item=>[item.continued,item.trial]),[[true,true]]);
+  assert.deepEqual(a.rangeEvents.filter(item=>item.phase==='complete').map(item=>item.trial),[true]);
   assert.equal(call('d1','bytes=5000-').range,null,'one trial per session');
   assert.equal(call('d2').range,'bytes=0-999','the next session may try');
   a.stop();
+});
+
+test('an unconfirmed trial releases its slot without failure and range events survive a failed sync',()=>{
+  let clock=13_000_000_000;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.trials.add('vlc');a.boundBytes=8;
+  const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1',q=request(url,{range:'bytes=0-','x-emby-client':'VLC'});
+  try{
+    const {track}=a.plan({route:r,found:found(r,url),req:q.req,incoming:q.incoming,publicContext:https});
+    track.headers(206,{'content-range':'bytes 0-7/800'});track.bytes(8);track.close();
+    const payload=a.syncPayload([r]);assert.equal(payload.rangeEvents.length,2);assert.equal(payload.bounds,undefined);
+    a.requeue(payload);assert.deepEqual(a.syncPayload([r]).rangeEvents,payload.rangeEvents);
+    assert(a.trialing.has('vlc'));clock+=121_000;a.tick();
+    assert(!a.trialing.has('vlc'));assert.equal(a.rangeEvents.length,0);
+  }finally{a.stop();}
 });

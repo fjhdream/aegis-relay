@@ -1,5 +1,5 @@
 import { LOCAL_AGENT_ID, remoteAgentStatus } from './agent-registry.js';
-import { STEERING_CAPABILITY, VERDICTS } from './steering.js';
+import { STEERING_CAPABILITY, STEER_DEFAULTS, VERDICTS } from './steering.js';
 import { boundedClientList, excludedClients, readSteeringSettings } from './steering-topology.js';
 
 // Panel side of automatic steering: merges what every machine measured and decided, arbitrates
@@ -16,9 +16,8 @@ const HISTORY_MAX=5000,HISTORY_TTL_MS=7*24*3600_000,HISTORY_EVERY_MS=60_000;
 // Switch outcomes. A real switch is judged by the first verdict at its target; a shadow ("would have
 // switched") one by whether the line it stayed on recovered by itself within RECOVER_MS.
 const EFFECT_RING=200,EFFECT_TIMEOUT_MS=10*60_000,RECOVER_MS=180_000,PERSIST_MS=120_000;
-// Capped ranges: a listed client that stops continuing is switched off; a client on trial is switched
-// on after TRIAL_SUCCESSES continuations in a row, and off at its first failure.
-const BOUND_SAMPLE=10,BOUND_MIN_SAMPLE=3,BOUND_MIN_RATIO=0.8,TRIAL_SUCCESSES=3,TRIAL_MIN_LANDINGS=5,TRIAL_MIN_LANDED=0.9;
+// Silence also means pause/stop/cache; only a matched next-byte request proves compatibility.
+const BOUND_SAMPLE=10,BOUND_PENDING=32,TRIAL_SUCCESSES=3,TRIAL_MIN_LANDINGS=5,TRIAL_MIN_LANDED=0.9;
 const list=value=>Array.isArray(value)?value.slice(0,BATCH):[];
 const text=(value,max=80)=>String(value||'').replace(/[\r\n\0]/g,'').trim().slice(0,max);
 const number=(value,min=0,max=Number.MAX_SAFE_INTEGER)=>{const n=Number(value);return Number.isFinite(n)?Math.min(max,Math.max(min,n)):min};
@@ -122,16 +121,33 @@ export class SteeringHub {
   }
 
   bound(client, continued, trial) {
+    // Older agents treated every timeout as failure, including normal stops and peer continuations.
+    if(continued!==true)return;
     const name=text(client);
     if(!name)return;
     const key=name.toLowerCase(),stat=this.bounds.get(key)||{client:name,results:[],trials:[]},list=trial?stat.trials:stat.results;
     list.push(continued);
     if(list.length>BOUND_SAMPLE)list.shift();
     this.bounds.set(key,stat);
-    if(trial&&!continued)return this.onBoundVerdict?.(name,false);
     if(trial&&stat.trials.length>=TRIAL_SUCCESSES&&stat.trials.slice(-TRIAL_SUCCESSES).every(Boolean))return this.onBoundVerdict?.(name,true);
-    const ok=stat.results.filter(Boolean).length;
-    if(!trial&&stat.results.length>=BOUND_MIN_SAMPLE&&ok/stat.results.length<BOUND_MIN_RATIO)this.onBoundVerdict?.(name,false);
+  }
+
+  rangeEvent(session, item, now) {
+    const complete=item.phase==='complete',start=item.start,end=item.end;
+    if(!Number.isSafeInteger(start)||start<0||complete&&(!Number.isSafeInteger(end)||end<start||!Number.isSafeInteger(end+1)))return;
+    const at=Math.min(now,number(item.at)),requestAt=complete?number(item.requestAt):at;
+    if(!at||now-at>this.sessionTtlMs||complete&&(!requestAt||requestAt>at||!text(item.client)))return;
+    const offset=complete?end+1:start,ranges=session.ranges||=new Map(),entry=ranges.get(offset)||{startedAt:0,complete:null,done:false};
+    if(complete){
+      if(entry.complete&&entry.complete.at>=at)return;
+      entry.complete={at,requestAt,client:text(item.client),trial:item.trial===true};entry.done=false;
+    }else entry.startedAt=Math.max(entry.startedAt,at);
+    ranges.delete(offset);ranges.set(offset,entry);
+    if(ranges.size>BOUND_PENDING)ranges.delete(ranges.keys().next().value);
+    const delivered=entry.complete;
+    if(!entry.done&&delivered&&entry.startedAt>=delivered.requestAt&&Math.abs(entry.startedAt-delivered.at)<=this.sessionTtlMs){
+      entry.done=true;this.bound(delivered.client,true,delivered.trial);
+    }
   }
 
   // Client types put on trial for capped ranges: only with automatic detection on, and only ones that
@@ -215,6 +231,10 @@ export class SteeringHub {
     for(const item of list(payload?.bounds)){
       if(deployed.has(String(item?.r||'')))this.bound(item.client,item.continued===true,item.trial===true);
     }
+    for(const item of list(payload?.rangeEvents)){
+      if(item?.phase!=='request'&&item?.phase!=='complete')continue;
+      const session=sessionFor(item);if(session)this.rangeEvent(session,item,now);
+    }
     return this.response(agentId,deployed,payload?.cursor,now);
   }
 
@@ -245,7 +265,7 @@ export class SteeringHub {
 
   view(now=this.clock()) {
     const sessions=[...this.sessions.values()].filter(session=>now-session.lastSeen<=10*60_000).sort((left,right)=>right.lastSeen-left.lastSeen).slice(0,100)
-      .map(session=>({session:session.key.slice(0,6),routeId:session.routeId,assigned:session.assigned,epoch:session.epoch,client:session.client,lastSeen:session.lastSeen,lastSwitchAt:session.lastSwitchAt,scores:session.scores}));
+      .map(session=>({session:session.key.slice(0,6),routeId:session.routeId,assigned:session.assigned,epoch:session.epoch,client:session.client,lastSeen:session.lastSeen,lastSwitchAt:session.lastSwitchAt,scores:Object.fromEntries(Object.entries(session.scores).map(([id,score])=>[id,{...score,stale:now-score.at>STEER_DEFAULTS.verdictTtlMs}]))}));
     const settings=readSteeringSettings(this.store.data),auto=new Set(Object.keys(settings.autoExcluded).map(item=>item.toLowerCase()));
     const clients=[...this.clients.values()].map(stat=>{const landed=stat.results.filter(Boolean).length;return{client:stat.client,total:stat.results.length,landed,autoExcluded:auto.has(stat.client.toLowerCase())}});
     const bounded=new Set(boundedClientList(settings).map(client=>client.toLowerCase())),trials=new Set(this.trialClients(settings).map(client=>client.toLowerCase()));
