@@ -1,13 +1,56 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
 import vm from 'node:vm';
-test('playback UI labels stale measurements as history and shows the last stream request',()=>{
-  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),elements=new Map();
-  const context=vm.createContext({$:id=>{if(!elements.has(id))elements.set(id,{});return elements.get(id);},$$:()=>[],setValue(){},escapeHtml:String,Date});
+function steeringUI(overrides={}){
+  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),elements=new Map(),timers=[];
+  const context=vm.createContext({$:id=>{if(!elements.has(id))elements.set(id,{});return elements.get(id);},$$:()=>[],setValue:(id,value)=>{context.$(id).value=value},escapeHtml:s=>String(s??'').replace(/</g,'&lt;'),Date,AbortSignal,
+    state:{page:'steering',csrf:'test'},document:{hidden:false},setInterval:(fn,ms)=>timers.push({fn,ms}),toast(){},...overrides});
   vm.runInContext(js.slice(js.indexOf('const STEER_MODES='),js.indexOf('async function saveSteering')),context);
-  context.data={settings:{},machines:[],routes:[],live:{sessions:[{session:'abc123',client:'VidHub',routeId:'n1',lastSeen:1_000_000,scores:{old:{verdict:'ok',rateBps:12e6,at:1000,stale:true},fresh:{verdict:'ok',rateBps:1e6,at:999000,stale:false}}}]}};
+  return {context,elements,timers};
+}
+test('steering refreshes live data without overwriting unsaved settings or overlapping requests',async()=>{
+  let resolve,calls=0;
+  const {context,elements,timers}=steeringUI({call:()=>{calls++;return new Promise(r=>{resolve=r})}});
+  assert.equal(timers.length,1,'the open steering page needs a periodic refresh');assert.equal(timers[0].ms,5000);
+  const data={settings:{boundedClients:['VidHub'],boundMB:64},machines:[],routes:[],live:{ranges:[]}};
+  context.data=data;vm.runInContext('renderSteering(data)',context);
+  context.$('#steering-bounded').value='VidHub\nRex';context.$('#steering-bound').value=32;
+  context.$('#steering-bound-auto').checked=true;
+  const pending=timers[0].fn();await timers[0].fn();assert.equal(calls,1);
+  resolve({...data,live:{ranges:[{client:'VidHub',continued:8,trialContinued:0,state:'on'}]}});await pending;
+  assert.match(elements.get('#steering-ranges').innerHTML,/8 次/);
+  assert.equal(elements.get('#steering-bounded').value,'VidHub\nRex');assert.equal(elements.get('#steering-bound').value,32);
+  assert.equal(elements.get('#steering-bound-auto').checked,true);
+  assert.match(elements.get('#steering-refresh').textContent,/更新于/);
+  for(const [field,value] of [['hidden',true],['page','dashboard'],['csrf','']]){
+    context.document.hidden=false;context.state.page='steering';context.state.csrf='test';
+    (field==='hidden'?context.document:context.state)[field]=value;await timers[0].fn();assert.equal(calls,1);
+  }
+});
+test('steering refresh keeps the last snapshot on failure and recovers on the next poll',async()=>{
+  let fail=true;
+  const {context,elements,timers}=steeringUI({call:async()=>{if(fail)throw Error('offline');return {live:{ranges:[]}}}});
+  assert.equal(timers.length,1);
+  context.$('#steering-ranges').innerHTML='previous snapshot';
+  await timers[0].fn();assert.equal(elements.get('#steering-ranges').innerHTML,'previous snapshot');
+  assert.match(elements.get('#steering-refresh').textContent,/刷新失败/);
+  fail=false;await timers[0].fn();assert.match(elements.get('#steering-refresh').textContent,/更新于/);
+});
+test('a steering response arriving after navigation does not change the hidden page',async()=>{
+  let resolve;
+  const {context,elements,timers}=steeringUI({call:()=>new Promise(r=>{resolve=r})});
+  assert.equal(timers.length,1);
+  context.$('#steering-ranges').innerHTML='previous snapshot';
+  const pending=timers[0].fn();context.state.page='dashboard';resolve({live:{ranges:[]}});await pending;
+  assert.equal(elements.get('#steering-ranges').innerHTML,'previous snapshot');
+});
+test('playback UI labels stale measurements as history and shows the last stream request',()=>{
+  const {context,elements}=steeringUI();
+  context.data={settings:{},machines:[],routes:[],live:{sessions:[{session:'abc123',client:'VidHub',routeId:'n1',lastSeen:Date.now(),scores:{old:{verdict:'ok',rateBps:12e6,at:1000,stale:true},fresh:{verdict:'ok',rateBps:1e6,at:999000,stale:false},unknown:{verdict:'unknown',rateBps:0,at:1000,stale:true}}},{session:'cached',client:'VidHub',lastSeen:Date.now()-120000,scores:{}}]}};
   vm.runInContext('renderSteering(data)',context);
   const html=elements.get('#steering-sessions').innerHTML;
-  assert.match(html,/样本已过期/);assert.match(html,/历史速率/);assert.match(html,/最近取流/);
+  assert.match(html,/历史测速已过期/);assert.match(html,/历史速率/);assert.match(html,/最近取流/);
+  assert.match(html,/近 1 分钟有取流/);assert.match(html,/近期未取流/);
+  assert.match(html,/unknown · 测速样本不足/);assert.doesNotMatch(html,/unknown · 历史测速已过期/);
   assert.match(html,/fresh · 正常 · 8\.0 Mbps/);
   assert.doesNotMatch(html,/old · 正常 · 96\.0 Mbps/);
 });
