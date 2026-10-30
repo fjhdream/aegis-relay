@@ -34,6 +34,22 @@ for own in $OWN; do
   fi
 done
 
+# A wildcard certificate or an existing operator-managed vhost already serves this entry. Peer-list
+# changes must not create a competing vhost or replace that deployment's certificate renewal.
+if command -v nginx >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+  VERIFY_DIR=$(mktemp -d /tmp/aegis-entry-verify.XXXXXX)
+  if curl -fsS --noproxy '*' --retry 2 --retry-connrefused --retry-delay 1 --connect-timeout 3 --max-time 8 \
+      --resolve "$ENTRY:443:127.0.0.1" "https://$ENTRY/" -o "$VERIFY_DIR/entry" 2>/dev/null \
+    && curl -fsS --noproxy '*' --retry 2 --retry-connrefused --retry-delay 1 --connect-timeout 3 --max-time 8 \
+      -H "Host: $ENTRY" http://127.0.0.1:8080/ -o "$VERIFY_DIR/relay" 2>/dev/null \
+    && grep -q 'AegisRelay' "$VERIFY_DIR/relay" && cmp -s "$VERIFY_DIR/entry" "$VERIFY_DIR/relay"; then
+    rm -rf "$VERIFY_DIR"
+    echo "入口域名 https://$ENTRY/ 已生效，沿用现有 HTTPS 配置与证书续期。"
+    exit 0
+  fi
+  rm -rf "$VERIFY_DIR"
+fi
+
 PEERS=""
 for peer in "$@"; do
   peer=$(printf '%s' "$peer" | tr '[:upper:]' '[:lower:]')

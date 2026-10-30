@@ -61,7 +61,8 @@ LOG=$(mktemp /tmp/aegis-entry-domain.XXXXXX)
 write_status applying "正在配置入口域名并申请证书"
 # shellcheck disable=SC2086 # PEERS is a validated, space-separated list of domains
 if sh "$CONFIGURE" "$ENTRY" "$EMAIL" $PEERS >"$LOG" 2>&1; then
-  write_status active "入口域名已生效，证书自动续期已启用"
+  SUCCESS=$(tail -n 1 "$LOG")
+  write_status active "${SUCCESS:-入口域名已生效}"
   rm -f "$REQUEST" "$LOG"
   exit 0
 fi
