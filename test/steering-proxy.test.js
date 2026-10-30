@@ -12,6 +12,38 @@ const listen=server=>new Promise(resolve=>server.listen(0,'127.0.0.1',()=>resolv
 const close=server=>new Promise(resolve=>{server.closeAllConnections?.();server.close(resolve)});
 const get=(port,path,headers={})=>new Promise((resolve,reject)=>{const req=http.request({hostname:'127.0.0.1',port,path,headers:{'x-forwarded-proto':'https','user-agent':'Infuse-Direct/8.1',...headers}},res=>{const chunks=[];res.on('data',chunk=>chunks.push(chunk));res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:Buffer.concat(chunks)}))});req.on('error',reject);req.end()});
 
+test('real proxy observation preserves progress and compressed metadata and counts only completed media ranges',async()=>{
+  let now=1_000_000_000,forwarded='';
+  const bytes=Buffer.alloc(2*1024*1024,7),info=zlib.gzipSync(JSON.stringify({MediaSources:[{Id:'private-source',Bitrate:20e6,Path:'private-file'}]}));
+  const upstream=http.createServer((req,res)=>{
+    if(req.url.includes('PlaybackInfo')){res.writeHead(200,{'content-type':'application/json','content-encoding':'gzip','content-length':info.length});return res.end(info)}
+    if(req.method==='POST'){req.on('data',c=>{forwarded+=c});req.on('end',()=>{res.writeHead(204);res.end()});return}
+    now+=1000;res.writeHead(206,{'content-type':'video/mp4','content-length':bytes.length,'content-range':`bytes 0-${bytes.length-1}/${bytes.length*10}`});
+    if(req.url.includes('abort'))res.write(bytes.subarray(0,1024));else res.end(bytes);
+  });
+  const up=await listen(upstream),engine=new SteeringEngine({selfId:'a',clock:()=>now});
+  const route={id:'n1',alias:'movie',enabled:true,accessMode:'alias_only',routeAuthKey:newRouteAuthKey(),upstreams:[`http://127.0.0.1:${up}`],allowPrivate:true,steering:{mode:'on',peers:[]}};
+  const relay=http.createServer(makeProxyHandler({getRoutes:()=>[route]},deriveKey('o'.repeat(32)),null,engine)),port=await listen(relay);
+  const headers={'x-forwarded-proto':'https','x-emby-authorization':'MediaBrowser Client="VidHub", DeviceId="private-device", Token="DO_NOT_REPORT_THIS_TOKEN"','content-type':'application/json'};
+  const body=JSON.stringify({ItemId:'private-item',MediaSourceId:'private-source',PlaySessionId:'private-session',PositionTicks:120e7,IsPaused:false,ApiKey:'DO_NOT_REPORT_THIS_TOKEN'});
+  const send=content=>new Promise((resolve,reject)=>{const req=http.request({hostname:'127.0.0.1',port,path:'/movie/emby/Sessions/Playing/Progress',method:'POST',headers},res=>{res.resume();res.on('end',resolve)});req.on('error',reject);req.end(content)});
+  try{
+    await send(body);assert.equal(forwarded,body);
+    const response=await get(port,'/movie/Items/private-item/PlaybackInfo',headers);assert(response.body.equals(info));
+    const media=await get(port,'/movie/play/video/private-item',{...headers,range:'bytes=0-'});assert(media.body.equals(bytes));
+    for(let i=0;i<50&&engine.playbackEvents.length<3;i++)await new Promise(r=>setTimeout(r,5));
+    assert.equal(engine.playbackEvents.length,3);
+    const events=engine.playbackEvents;assert.equal(new Set(events.map(e=>e.k)).size,1);
+    assert.equal(events.find(e=>e.kind==='progress').position,120);assert.equal(events.find(e=>e.kind==='metadata').bitrate,20e6);
+    assert.equal(events.find(e=>e.kind==='transfer').bytes,bytes.length);
+    assert.doesNotMatch(JSON.stringify(events),/private-|DO_NOT_REPORT|ApiKey|Token/);
+    await new Promise(resolve=>{const req=http.request({hostname:'127.0.0.1',port,path:'/movie/play/video/private-item?abort=1',headers:{...headers,range:'bytes=0-'}},res=>{res.once('data',()=>{res.destroy();resolve()})});req.on('error',resolve);req.end()});
+    await new Promise(r=>setTimeout(r,10));assert.equal(events.filter(e=>e.kind==='transfer').length,1,'a client abort cannot count as a completed or failed segment');
+    forwarded='';const large=JSON.stringify({ItemId:'private-item',PositionTicks:1,extra:'x'.repeat(300000)});await send(large);
+    assert.equal(forwarded,large);assert.equal(events.filter(e=>e.kind==='progress').length,1,'oversized JSON is forwarded without observation');
+  }finally{engine.stop();await Promise.all([close(relay),close(upstream)])}
+});
+
 async function setup() {
   const seen=[];
   const upstream=http.createServer((req,res)=>{

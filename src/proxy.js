@@ -716,6 +716,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
         // Read the HLS segment length off the playlist as it passes (after delivery is wired, so the
         // listener never switches the body into flowing mode ahead of the client).
         if(track?.kind==='manifest'&&status===200)track.manifest(upRes,enc);
+        if(!playback&&!relayed)steering?.observePlaybackInfo?.(req,incoming,found,upRes);
       });
       activeUp=up;
       const timeoutError=(message,extra)=>Object.assign(new Error(message),{code:'ETIMEDOUT'},extra);
@@ -764,7 +765,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
         if (canRetry && index+1<configured.length) return attempt(configured[index+1],index+1);
         if (!finished) { finished=true;metricDone?.(502,0,true);failResponse(res,502,`Bad Gateway\n${reason}`); }
       });
-      if (canRetry) up.end(); else pipeline(req,up,()=>{});
+      if (canRetry) up.end(); else {pipeline(req,up,()=>{});if(!relayed)steering?.observeProgress?.(req,incoming,found);}
     };
     attempt(configured[0],0);
   };

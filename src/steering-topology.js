@@ -1,6 +1,7 @@
 import { isRouteAuthKey } from './route-auth.js';
 import { LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
 import { EGRESS_CAPABILITY, STEERING_CAPABILITY, STEERING_MODES } from './steering.js';
+import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 
 // Which machines may steer a node between them, and the settings behind it. Compiled into each
 // machine's signed snapshot, so only static topology lives here; liveness travels over the steering sync.
@@ -132,9 +133,11 @@ export function egressTopology(data, route) {
 // itself; everything else compiles exactly as before, so enabling nothing changes no snapshot hash.
 export function agentSnapshotNodes(data, agentId) {
   const routes=routesForAgent(data,agentId),settings=readSteeringSettings(data);
+  const observes=agentId===LOCAL_AGENT_ID||data.agents?.find(a=>a.id===agentId)?.capabilities?.includes(PLAYBACK_OBSERVATION_CAPABILITY);
   return routes.map(route=>{
     const topology=settings.mode==='off'?null:steeringTopology(data,route,settings),egress=egressTopology(data,route);
     let node=route;
+    if(topology&&observes)node={...node,playbackObservation:true};
     if(topology&&topology.peers.some(peer=>peer.id===agentId))node={...node,steering:topology};
     if(egress&&egress.id!==agentId)node={...node,egress};
     return node;

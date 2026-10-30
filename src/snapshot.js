@@ -88,6 +88,7 @@ function normalizeNode(route) {
     showOnHome:route.showOnHome===true,clientProfile:clientProfile(route.clientProfile),streamRewrite:streamRewrite(route.streamRewrite),
     speedLimitMbps:Number(route.speedLimitMbps||0),monthlyQuotaGB:Number(route.monthlyQuotaGB||0),access,
     ...(route.steering?{steering:steering(route.steering)}:{}),
+    ...(route.playbackObservation===true?{playbackObservation:true}:{}),
     ...(route.egress?{egress:egress(route.egress)}:{})
   };
 }

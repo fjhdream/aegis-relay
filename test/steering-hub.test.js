@@ -5,6 +5,8 @@ import { SteeringEngine } from '../src/steering.js';
 import { agentSnapshotNodes, agentSteeringIssues, cleanEntryRequest, desiredEntry, egressIssues, egressTopology, entryAttempt, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
 import { compileAgentDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
+import { runtimeRoutes } from '../src/local-agent.js';
+import { PLAYBACK_OBSERVATION_CAPABILITY } from '../src/playback-observation.js';
 
 const KEY=/^[A-Za-z0-9_-]{22}$/;
 function fixture({mode='on',entryDomain='entry.example.com'}={}) {
@@ -66,6 +68,18 @@ test('entry domains are validated and only steered nodes are handed out on them'
   assert.equal(steeringEntryBaseUrl(data,{...route,autoSteer:{enabled:false}}),'');
   assert.equal(steeringEntryBaseUrl({...data,settings:{steering:{mode:'off',entryDomain:'entry.example.com'}}},route),'','not while steering is off');
   assert.equal(steeringEntryBaseUrl(data,{...route,speedLimitMbps:5}),'','not for a node that cannot steer');
+});
+
+test('an observation-capable machine can report progress without becoming a steering target',()=>{
+  const {data}=fixture(),agent=data.agents.find(a=>a.id==='b');
+  agent.steerTarget=false;data.agents[2].capabilities.push('steering-v1');
+  assert.equal(agentSnapshotNodes(data,'b')[0].playbackObservation,undefined,'old agents receive no new observation field');
+  agent.capabilities.push(PLAYBACK_OBSERVATION_CAPABILITY);
+  const node=agentSnapshotNodes(data,'b')[0];
+  assert.equal(node.playbackObservation,true);assert.equal(node.steering,undefined);
+  const snapshot=compileAgentDesiredSnapshot({data,agentId:'b',signingIdentity:generatePanelSigningIdentity()}).snapshot;
+  assert.equal(runtimeRoutes(snapshot.nodes)[0].playbackObservation,true);assert.equal(runtimeRoutes(snapshot.nodes)[0].steering,undefined);
+  data.settings.steering.mode='off';assert.equal(agentSnapshotNodes(data,'b')[0].playbackObservation,undefined);
 });
 
 test('the entry address is only handed out when every machine behind the entry domain serves the node',()=>{

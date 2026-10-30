@@ -1,6 +1,7 @@
 import { LOCAL_AGENT_ID, remoteAgentStatus } from './agent-registry.js';
 import { STEERING_CAPABILITY, STEER_DEFAULTS, VERDICTS } from './steering.js';
 import { boundedClientList, excludedClients, readSteeringSettings } from './steering-topology.js';
+import { PlaybackObservation } from './playback-observation.js';
 
 // Panel side of automatic steering: merges what every machine measured and decided, arbitrates
 // conflicting reassignments by epoch, and hands each machine back the sessions of the nodes it serves
@@ -28,6 +29,7 @@ export class SteeringHub {
     this.store=store;this.clock=clock;this.sessionTtlMs=sessionTtlMs;this.onAutoExclude=onAutoExclude;this.onBoundVerdict=onBoundVerdict;
     this.sessions=new Map();this.seq=0;this.health=new Map();this.events=[];this.clients=new Map();
     this.history=new Map();this.effects={on:[],shadow:[]};this.bounds=new Map();
+    this.playback=new PlaybackObservation();
   }
 
   deployedRoutes(agentId) {
@@ -235,6 +237,7 @@ export class SteeringHub {
       if(item?.phase!=='request'&&item?.phase!=='complete')continue;
       const session=sessionFor(item);if(session)this.rangeEvent(session,item,now);
     }
+    for(const item of list(payload?.playbackEvents))if(deployed.has(String(item?.r||'')))this.playback.ingest(agentId,item,now);
     return this.response(agentId,deployed,payload?.cursor,now);
   }
 
@@ -270,7 +273,7 @@ export class SteeringHub {
     const clients=[...this.clients.values()].map(stat=>{const landed=stat.results.filter(Boolean).length;return{client:stat.client,total:stat.results.length,landed,autoExcluded:auto.has(stat.client.toLowerCase())}});
     const bounded=new Set(boundedClientList(settings).map(client=>client.toLowerCase())),trials=new Set(this.trialClients(settings).map(client=>client.toLowerCase()));
     const ranges=[...this.bounds.values()].map(stat=>{const key=stat.client.toLowerCase();return{client:stat.client,continued:stat.results.filter(Boolean).length,total:stat.results.length,trialContinued:stat.trials.filter(Boolean).length,trialTotal:stat.trials.length,state:bounded.has(key)?'on':trials.has(key)?'trial':'off'}});
-    return {sessions,events:this.events.slice(-50).reverse(),clients,ranges,effects:this.effectSummary(),networks:this.history.size,machines:this.peers()};
+    return {sessions,events:this.events.slice(-50).reverse(),clients,ranges,effects:this.effectSummary(),networks:this.history.size,machines:this.peers(),playback:this.playback.view(now)};
   }
 
   effectSummary() {

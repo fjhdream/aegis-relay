@@ -6,6 +6,7 @@ import { LOCAL_AGENT_ID, normalizeAgentDomain, replaceAgentDeployments } from '.
 import { sealAgentSnapshot } from './agent-config.js';
 import { sanitizeTelemetry } from './telemetry.js';
 import { EGRESS_CAPABILITY, STEERING_CAPABILITY } from './steering.js';
+import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 import { cleanEntryStatus, desiredEntry, ENTRY_CAPABILITY, readSteeringSettings } from './steering-topology.js';
 
 export const AGENT_PROTOCOL_VERSION=1;
@@ -62,7 +63,7 @@ export function consumeEnrollment(data,token,agentInput,now=Date.now()) {
 }
 
 // The parts of a machine record that feed the steering topology compiled into every snapshot.
-const steeringTopologyKey=agent=>{const has=name=>Array.isArray(agent.capabilities)&&agent.capabilities.includes(name)?1:0;return `${has(STEERING_CAPABILITY)}|${has(EGRESS_CAPABILITY)}|${agent.domain||''}|${agent.proxyMode||''}`};
+const steeringTopologyKey=agent=>{const has=name=>Array.isArray(agent.capabilities)&&agent.capabilities.includes(name)?1:0;return `${has(STEERING_CAPABILITY)}|${has(EGRESS_CAPABILITY)}|${has(PLAYBACK_OBSERVATION_CAPABILITY)}|${agent.domain||''}|${agent.proxyMode||''}`};
 
 function cleanCapabilities(value) {
   return [...new Set((Array.isArray(value)?value:[]).map(item=>String(item)).filter(item=>/^[a-z0-9-]{1,32}$/.test(item)))].slice(0,16);

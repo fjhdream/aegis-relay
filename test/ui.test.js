@@ -7,6 +7,16 @@ function steeringUI(overrides={}){
   vm.runInContext(js.slice(js.indexOf('const STEER_MODES='),js.indexOf('async function saveSteering')),context);
   return {context,elements,timers};
 }
+test('cache-aware advice remains explicitly observational and escapes client names',()=>{
+  const {context,elements}=steeringUI();
+  context.data={machines:[{id:'a',name:'ZGO'}],routes:[],live:{playback:[{session:'abc123',client:'<VidHub>',routeId:'n1',state:'possible_stall',lastProgressAt:Date.now(),machines:[{id:'a',samples:3,rateBps:1e6,bitrate:20e6,margin:0.4,advice:'would_switch'}]}]}};
+  vm.runInContext('renderSteeringLive(data)',context);
+  const html=elements.get('#steering-playback').innerHTML;
+  assert.match(html,/建议试切（未执行）/);assert.match(html,/疑似停滞/);assert.match(html,/最近 3 段/);
+  assert.match(html,/&lt;VidHub>/);assert.doesNotMatch(html,/<VidHub>/);
+  context.data.live.playback=[];vm.runInContext('renderSteeringLive(data)',context);
+  assert.match(elements.get('#steering-playback').innerHTML,/已有缓存的播放可能暂时没有新取流请求/);
+});
 test('steering refreshes live data without overwriting unsaved settings or overlapping requests',async()=>{
   let resolve,calls=0;
   const {context,elements,timers}=steeringUI({call:()=>{calls++;return new Promise(r=>{resolve=r})}});

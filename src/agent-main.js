@@ -11,6 +11,7 @@ import { verifySnapshot } from './snapshot.js';
 import { coalescedWriter, writeAtomic } from './store.js';
 import { activeUpstreamLine, handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS } from './proxy.js';
 import { EGRESS_CAPABILITY, SteeringEngine, STEERING_CAPABILITY } from './steering.js';
+import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 import { cleanEntryRequest, cleanEntryStatus, entryAttempt, ENTRY_CAPABILITY } from './steering-topology.js';
 import { Metrics } from './metrics.js';
 import { telemetryFromMetrics } from './telemetry.js';
@@ -29,7 +30,7 @@ const AGENT_PROXY_MODE=String(process.env.AGENT_PROXY_MODE||'').trim().toLowerCa
 // steering-v1: this machine runs the steering engine and can be a steering target.
 // entry-v1: it sets up the steering entry domain itself when the panel asks (no command to run by hand).
 // egress-v1: it relays a node's upstream traffic through the node's egress machine (see proxy.js).
-const CAPABILITIES=['registry-v1','config-v1','proxy-v1','telemetry-v1','config-longpoll-v1',STEERING_CAPABILITY,ENTRY_CAPABILITY,EGRESS_CAPABILITY];
+const CAPABILITIES=['registry-v1','config-v1','proxy-v1','telemetry-v1','config-longpoll-v1',STEERING_CAPABILITY,ENTRY_CAPABILITY,EGRESS_CAPABILITY,PLAYBACK_OBSERVATION_CAPABILITY];
 const sha256=value=>b64u(crypto.createHash('sha256').update(value).digest());
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 

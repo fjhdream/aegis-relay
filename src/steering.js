@@ -3,6 +3,7 @@ import net from 'node:net';
 import zlib from 'node:zlib';
 import { isRouteAuthKey } from './route-auth.js';
 import { b64u } from './security.js';
+import { observeJson } from './playback-observation.js';
 
 // Automatic playback steering (docs/AUTO_STEERING.md). Every machine runs this engine on its own data
 // plane: it measures how well each playback session is being served here, and at request boundaries
@@ -259,6 +260,7 @@ function manifestTargetDuration(buffer, encoding) {
 class SteerTrack {
   constructor(engine, session, kind, nowMs) {
     this.engine=engine;this.session=session;this.kind=kind;this.reqAt=nowMs;this.hdrAt=0;this.endAt=0;this.sent=0;this.blockedTicks=0;this.res=null;this.done=false;this.bound=null;
+    this.observation=session.observation;this.responseRange=null;
     const local=engine.localOf(session);
     if(kind==='segment')local.hls.open=this;
     else if(kind==='progressive'){
@@ -272,6 +274,8 @@ class SteerTrack {
   attach(res) { this.res=res;res.once('close',()=>this.close()); }
   headers(status, headers={}) {
     if(!this.hdrAt)this.hdrAt=this.engine.now();
+    const range=/^bytes (\d+)-(\d+)\/(?:\d+|\*)$/.exec(String(headers['content-range']||''));
+    if(this.kind==='progressive'&&status===206&&range){const start=Number(range[1]),end=Number(range[2]);if(Number.isSafeInteger(start)&&Number.isSafeInteger(end)&&end>=start)this.responseRange={start,end}}
     // A capped Range only counts when the origin really cut the file there; near the end of a file, or
     // from an origin that ignores Range, nothing was cut and there is nothing to continue.
     if(this.bound){
@@ -283,7 +287,11 @@ class SteerTrack {
   bytes(count) { this.sent+=count;if(this.kind==='progressive')this.engine.localOf(this.session).prog.tickBytes+=count; }
   close() {
     if(this.done)return;
+    const complete=this.res?.writableFinished===true,range=this.responseRange;
     this.done=true;this.endAt=this.engine.now();this.res=null;this.engine.tracks.delete(this);
+    if(complete&&this.observation&&range&&this.sent===range.end-range.start+1&&this.sent>=1024*1024&&this.endAt-this.reqAt>=250){
+      this.engine.observe({...this.observation,kind:'transfer',...range,bytes:this.sent,requestAt:this.reqAt,at:this.endAt});
+    }
     if(this.kind==='progressive'){const prog=this.engine.localOf(this.session).prog;prog.active.delete(this);prog.lastServedAt=this.endAt;}
     // The next Range may reach another machine, so the hub pairs delivery with the next request.
     if(this.bound?.length&&this.sent>=this.bound.length){
@@ -305,13 +313,54 @@ export class SteeringEngine {
     this.selfId=String(selfId||'');this.lineOf=lineOf;this.canServe=canServe;this.params={...STEER_DEFAULTS,...params};this.clock=clock;
     this.offsetMs=0;this.sessions=new Map();this.items=new Map();this.tracks=new Set();this.health=new Map();
     this.excluded=new Set();this.bounded=new Set();this.trials=new Set();this.trialing=new Set();this.boundBytes=this.params.boundBytes;
-    this.cursor=0;this.reports=new Map();this.decisions=[];this.landings=[];this.failures=[];this.shadow=[];this.rangeEvents=[];
+    this.cursor=0;this.reports=new Map();this.decisions=[];this.landings=[];this.failures=[];this.shadow=[];this.rangeEvents=[];this.playbackEvents=[];
     this.ticker=null;this.syncTimer=null;this.syncDue=0;this.syncing=false;this.send=null;this.routes=()=>[];this.syncErrors=0;this.lastSyncError='';this.lastSyncAt=0;
   }
 
   // Panel time: tokens and scores are compared across machines, so every engine runs on the clock the
   // panel hands back with each sync.
   now() { return this.clock()+this.offsetMs; }
+
+  observationContext(route,item,identity){
+    const key=steerKey(route),device=identity.deviceId?`device:${identity.deviceId}`:identity.playSessionId?`play:${identity.playSessionId}`:'';
+    if(!key||!item||!device)return null;
+    const digest=(label,value)=>b64u(mac(key,label,value).subarray(0,16));
+    return {k:digest('playback-observation',`${item.toLowerCase()}\n${device}`),r:route.id,client:identity.client,
+      source:identity.mediaSourceId?digest('playback-source',identity.mediaSourceId):''};
+  }
+
+  observe(event){this.playbackEvents.push(event);if(this.playbackEvents.length>1000)this.playbackEvents.splice(0,this.playbackEvents.length-1000);this.requestSync()}
+
+  observeProgress(req,incoming,found){
+    const match=/^\/(?:emby\/)?Sessions\/Playing(?:\/(Progress|Stopped))?\/?$/i.exec(found.rest),route=found.route;
+    if(!match||req.method!=='POST'||!route.steering&&!route.playbackObservation)return;
+    const identity=playIdentity(req,incoming);if(this.clientExcluded(identity))return;
+    observeJson(req,req.headers,body=>{
+      if(typeof body.ItemId!=='string'||!body.ItemId||body.ItemId.length>128)return;
+      const ctx=this.observationContext(route,body.ItemId,{...identity,playSessionId:clip(body.PlaySessionId||identity.playSessionId),mediaSourceId:clip(body.MediaSourceId||identity.mediaSourceId)});
+      if(!ctx)return;
+      const phase=!match[1]?'start':match[1].toLowerCase()==='stopped'?'stop':'progress';
+      const position=typeof body.PositionTicks==='number'&&Number.isSafeInteger(body.PositionTicks)&&body.PositionTicks>=0?body.PositionTicks/1e7:null;
+      if(position===null&&phase!=='stop')return;
+      const rate=body.PlaybackRate===undefined?1:body.PlaybackRate;
+      if(typeof rate!=='number'||!Number.isFinite(rate)||rate<0.1||rate>4)return;
+      this.observe({...ctx,kind:'progress',phase,position,paused:typeof body.IsPaused==='boolean'?body.IsPaused:null,rate,at:this.now()});
+    });
+  }
+
+  observePlaybackInfo(req,incoming,found,response){
+    const match=/^\/(?:emby\/)?Items\/([^/]+)\/PlaybackInfo\/?$/i.exec(found.rest),route=found.route;
+    if(!match||!['GET','POST'].includes(req.method)||response.statusCode!==200||!route.steering&&!route.playbackObservation)return;
+    const identity=playIdentity(req,incoming);if(this.clientExcluded(identity))return;
+    observeJson(response,response.headers,body=>{
+      if(!Array.isArray(body.MediaSources))return;
+      for(const source of body.MediaSources.slice(0,16)){
+        if(!source||typeof source.Bitrate!=='number'||!Number.isFinite(source.Bitrate)||source.Bitrate<1000||source.Bitrate>1e9)continue;
+        const ctx=this.observationContext(route,match[1],{...identity,playSessionId:clip(body.PlaySessionId||identity.playSessionId),mediaSourceId:typeof source.Id==='string'?clip(source.Id):''});
+        if(ctx)this.observe({...ctx,kind:'metadata',bitrate:source.Bitrate,unique:body.MediaSources.length===1,at:this.now()});
+      }
+    });
+  }
 
   session(key, routeId, nowMs) {
     let session=this.sessions.get(key);
@@ -364,6 +413,7 @@ export class SteeringEngine {
     if(!key)return null;
     if(itemKey)this.rememberItem(itemKey,key,nowMs);
     const session=this.session(key,route.id,nowMs);
+    session.observation=this.observationContext(route,item,identity);
     session.lastSeen=nowMs;session.minRateMbps=Number(topology.params?.minRateMbps||0);if(identity.client)session.client=identity.client;
     if(!session.prefix)session.prefix=prefixKeyFor(route,clientIpOf(req));
     // Report Range starts independently of where the preceding capped response was served.
@@ -554,13 +604,13 @@ export class SteeringEngine {
     for(const route of routes)health.routes[route.id]={line:this.lineOf(route),quotaExhausted:!this.canServe(route)};
     const reports=[...this.reports.values()].slice(0,200);
     for(const report of reports)this.reports.delete(report.s);
-    return {protocolVersion:1,cursor:this.cursor,reports,decisions:this.decisions.splice(0,200),landings:this.landings.splice(0,200),failures:this.failures.splice(0,200),shadow:this.shadow.splice(0,200),rangeEvents:this.rangeEvents.splice(0,200),health};
+    return {protocolVersion:1,cursor:this.cursor,reports,decisions:this.decisions.splice(0,200),landings:this.landings.splice(0,200),failures:this.failures.splice(0,200),shadow:this.shadow.splice(0,200),rangeEvents:this.rangeEvents.splice(0,200),playbackEvents:this.playbackEvents.splice(0,200),health};
   }
 
   // A failed sync must not lose decisions/landings: put them back in front (reports are superseded by
   // fresher ones anyway).
   requeue(payload) {
-    for(const list of ['decisions','landings','failures','shadow','rangeEvents']){
+    for(const list of ['decisions','landings','failures','shadow','rangeEvents','playbackEvents']){
       this[list].unshift(...(payload[list]||[]));
       if(this[list].length>1000)this[list].splice(0,this[list].length-1000);
     }
@@ -626,7 +676,7 @@ export class SteeringEngine {
 
   async runSync() {
     if(!this.send)return;
-    const routes=this.routes().filter(route=>route.steering);
+    const routes=this.routes().filter(route=>route.steering||route.playbackObservation);
     if(!routes.length){this.scheduleSync(this.params.syncIdleMs);return;}
     this.syncing=true;
     const payload=this.syncPayload(routes);
