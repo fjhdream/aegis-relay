@@ -6,7 +6,8 @@ import path from 'node:path';
 import { b64u, randomToken, timingEqual } from './security.js';
 import { agentRequestInput, panelResponseInput } from './agent-api.js';
 import { openAgentSnapshot } from './agent-config.js';
-import { AtomicRouteSource, runtimeRoutes } from './local-agent.js';
+import { AtomicRouteSource } from './local-agent.js';
+import { decodeNodes } from './node-wire.js';
 import { verifySnapshot } from './snapshot.js';
 import { coalescedWriter, writeAtomic } from './store.js';
 import { handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS } from './proxy.js';
@@ -14,7 +15,7 @@ import { activeUpstreamLine } from './upstream-exchange.js';
 import { EGRESS_CAPABILITY, SteeringEngine, STEERING_CAPABILITY } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 import { cleanEntryRequest, cleanEntryStatus, entryAttempt, ENTRY_CAPABILITY } from './steering-topology.js';
-import { cleanLines, LINE_SYNC_CAPABILITY } from './line-sync.js';
+import { LINE_SYNC_CAPABILITY } from './line-sync.js';
 import { Metrics } from './metrics.js';
 import { telemetryFromMetrics } from './telemetry.js';
 
@@ -91,12 +92,11 @@ function sealLocal(snapshot,identity){const iv=crypto.randomBytes(12),cipher=cry
 function openLocal(payload,identity){const env=JSON.parse(payload),decipher=crypto.createDecipheriv('aes-256-gcm',storageKey(identity),Buffer.from(env.iv,'base64url'));decipher.setAuthTag(Buffer.from(env.tag,'base64url'));return JSON.parse(Buffer.concat([decipher.update(Buffer.from(env.data,'base64url')),decipher.final()]).toString('utf8'))}
 function loadMetricStore(identity){let data={};if(fs.existsSync(METRICS_FILE)){try{const loaded=openLocal(fs.readFileSync(METRICS_FILE,'utf8'),identity);if(loaded&&typeof loaded==='object'&&!Array.isArray(loaded))data=loaded}catch(error){console.error(`[aegis-agent] cached metrics rejected: ${error.message}`)}}const writer=coalescedWriter(METRICS_FILE,()=>sealLocal(data,identity));return{data,save:writer.save}}
 
-function validateRoutes(routes){if(!Array.isArray(routes)||routes.length>100)throw new Error('invalid route count');const aliases=new Set();for(const route of routes){if(!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(route.alias)||aliases.has(route.alias))throw new Error('invalid or duplicate route alias');aliases.add(route.alias);for(const target of [...(route.upstreams||[])]){const url=new URL(target);if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error('invalid route upstream');}for(const peer of route.steering?.peers||[]){const url=new URL(peer.base);if(url.protocol!=='https:'||url.origin!==peer.base)throw new Error('invalid steering peer')}if(route.egress){const url=new URL(route.egress.base);if(url.protocol!=='https:'||url.origin!==route.egress.base)throw new Error('invalid egress machine');}if(route.lines!==undefined)cleanLines(route.lines);if(route.lineSyncUpstream!==undefined&&(route.lineSyncUpstream!==true||!Array.isArray(route.lines)))throw new Error('invalid line sync');}return routes;}
 
 class RemoteConfig {
   constructor(identity){this.identity=identity;this.routeSource=new AtomicRouteSource([]);this.revision=0;this.hash=null;this.applyState='waiting';this.error='';}
-  load(){if(!fs.existsSync(CURRENT_FILE))return false;const snapshot=openLocal(fs.readFileSync(CURRENT_FILE,'utf8'),this.identity);verifySnapshot(snapshot,panelIdentity(this.identity));this.routeSource.apply(validateRoutes(runtimeRoutes(snapshot.nodes)));this.revision=snapshot.revision;this.hash=snapshot.hash;this.applyState='active';return true;}
-  apply(snapshot){const decision=verifySnapshot(snapshot,panelIdentity(this.identity),{currentRevision:this.revision,currentHash:this.hash});if(decision.status==='noop')return decision;const routes=validateRoutes(runtimeRoutes(snapshot.nodes));if(fs.existsSync(CURRENT_FILE))writeAtomic(PREVIOUS_FILE,fs.readFileSync(CURRENT_FILE));writeAtomic(CURRENT_FILE,sealLocal(snapshot,this.identity));this.routeSource.apply(routes);this.revision=snapshot.revision;this.hash=snapshot.hash;this.applyState='active';this.error='';return decision;}
+  load(){if(!fs.existsSync(CURRENT_FILE))return false;const snapshot=openLocal(fs.readFileSync(CURRENT_FILE,'utf8'),this.identity);verifySnapshot(snapshot,panelIdentity(this.identity));this.routeSource.apply(decodeNodes(snapshot.nodes));this.revision=snapshot.revision;this.hash=snapshot.hash;this.applyState='active';return true;}
+  apply(snapshot){const decision=verifySnapshot(snapshot,panelIdentity(this.identity),{currentRevision:this.revision,currentHash:this.hash});if(decision.status==='noop')return decision;const routes=decodeNodes(snapshot.nodes);if(fs.existsSync(CURRENT_FILE))writeAtomic(PREVIOUS_FILE,fs.readFileSync(CURRENT_FILE));writeAtomic(CURRENT_FILE,sealLocal(snapshot,this.identity));this.routeSource.apply(routes);this.revision=snapshot.revision;this.hash=snapshot.hash;this.applyState='active';this.error='';return decision;}
 }
 
 function readDomainStatus(){

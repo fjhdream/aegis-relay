@@ -131,7 +131,21 @@ function cleanAutoSteer(value={}){if(!value||typeof value!=='object')return{enab
 // machines; an explicit edit naming an unknown one is rejected.
 const knownEgressAgent=value=>{const id=String(value||'').trim().slice(0,64);return id&&store.data.agents.some(agent=>agent.id===id&&agent.state!=='revoked')?id:''};
 function cleanEgressAgent(value){const id=knownEgressAgent(value);if(String(value||'').trim()&&!id)throw Object.assign(new Error('unknown egress machine'),{status:400});return id}
-function publicRoute(r) { return { id:r.id, alias:r.alias, name:r.name, enabled:r.enabled, upstreams:routeUpstreams(r), allowPrivate:r.allowPrivate, tlsVerify:r.tlsVerify, accessMode:r.accessMode||'key', authMigrationRequired:r.authMigrationRequired===true, showOnHome:r.showOnHome===true, clientProfile:r.clientProfile||{enabled:false},streamRewrite:r.streamRewrite||{enabled:false,domains:[]},autoSteer:r.autoSteer||{enabled:false,minRateMbps:0},egressAgentId:r.egressAgentId||'',lineSync:r.lineSync!==false,lineSyncUpstream:r.lineSyncUpstream===true,tags:r.tags||[],notes:r.notes||'',favorite:r.favorite===true,sortOrder:Number(r.sortOrder||0),speedLimitMbps:Number(r.speedLimitMbps||0),monthlyQuotaGB:Number(r.monthlyQuotaGB||0),reminderDays:Number(r.reminderDays||0),accessAlertThreshold:Number(r.accessAlertThreshold||0),channels:channelList(r),reminderLastAt:r.reminderLastAt||null,createdAt:r.createdAt,updatedAt:r.updatedAt }; }
+// A node's simple settings: one cleaner per field, shared by create (and import), PATCH and the admin
+// view, so each field's default and limits are written once. A field may clean differently on PATCH:
+// an imported config may name a machine of another panel (dropped), but an explicit edit naming an
+// unknown machine is a mistake (rejected). The identity fields (alias, upstreams, access mode and key,
+// name, enabled) have checks of their own and are set where those run.
+const ROUTE_FIELDS={
+  tlsVerify:{clean:v=>v!==false},showOnHome:{clean:v=>v===true},clientProfile:{clean:cleanProfile},streamRewrite:{clean:cleanStreamRewrite},autoSteer:{clean:cleanAutoSteer},
+  egressAgentId:{clean:knownEgressAgent,patch:cleanEgressAgent,view:v=>String(v||'')},lineSync:{clean:v=>v!==false},lineSyncUpstream:{clean:v=>v===true},
+  tags:{clean:cleanTags},notes:{clean:v=>String(v||'').slice(0,500)},favorite:{clean:v=>v===true},
+  sortOrder:{clean:v=>numeric(v,-10000,10000)},speedLimitMbps:{clean:v=>numeric(v,0,100000)},monthlyQuotaGB:{clean:v=>numeric(v,0,1000000)},reminderDays:{clean:v=>numeric(v,0,365)},accessAlertThreshold:{clean:v=>numeric(v,0,100000)}
+};
+const createdFields=input=>Object.fromEntries(Object.entries(ROUTE_FIELDS).map(([field,{clean}])=>[field,clean(input[field])]));
+// Shown as stored; a value the cleaner no longer accepts (an old record) shows as the field's default.
+const viewedFields=r=>Object.fromEntries(Object.entries(ROUTE_FIELDS).map(([field,{clean,view}])=>{const read=view||clean;try{return [field,read(r[field])]}catch{return [field,read(undefined)]}}));
+function publicRoute(r) { return { id:r.id, alias:r.alias, name:r.name, enabled:r.enabled, upstreams:routeUpstreams(r), allowPrivate:r.allowPrivate, accessMode:r.accessMode||'key', authMigrationRequired:r.authMigrationRequired===true, ...viewedFields(r), channels:channelList(r), reminderLastAt:r.reminderLastAt||null, createdAt:r.createdAt, updatedAt:r.updatedAt }; }
 function localDomainStatus(){const status=readDomainStatus(cfg.dataFile);if(!status)return null;if(status.state==='active'&&status.currentDomain&&status.currentDomain!==configuredLocalDomain)return{...status,state:'applying',message:'Nginx 已切换，面板服务正在重新载入配置'};return status}
 // A switch that finished and already matches the live endpoint is not news: the "当前生效域名"
 // field and the sync pill already show it, so surfacing a permanent green "已生效" banner is just
@@ -205,16 +219,9 @@ const findRoute=id=>store.data.routes.find(x=>x.id===id);
 // The node record shared by create and import. Callers validate the alias and upstreams and pick the key.
 function buildRoute(input,{alias,upstreams,accessMode,accessKey,enabled}){
   const now=new Date().toISOString();
-  return {id:randomToken(12),alias,name:String(input.name||alias).slice(0,80),upstreams,allowPrivate:input.allowPrivate===true,tlsVerify:input.tlsVerify!==false,enabled,accessMode,
-    showOnHome:input.showOnHome===true,clientProfile:cleanProfile(input.clientProfile),streamRewrite:cleanStreamRewrite(input.streamRewrite),autoSteer:cleanAutoSteer(input.autoSteer),egressAgentId:knownEgressAgent(input.egressAgentId),lineSync:input.lineSync!==false,lineSyncUpstream:input.lineSyncUpstream===true,tags:cleanTags(input.tags),notes:String(input.notes||'').slice(0,500),favorite:input.favorite===true,
-    sortOrder:numeric(input.sortOrder,-10000,10000),speedLimitMbps:numeric(input.speedLimitMbps,0,100000),monthlyQuotaGB:numeric(input.monthlyQuotaGB,0,1000000),reminderDays:numeric(input.reminderDays,0,365),accessAlertThreshold:numeric(input.accessAlertThreshold,0,100000),
-    ...routeAuthFields(accessKey),createdAt:now,updatedAt:now};
+  return {id:randomToken(12),alias,name:String(input.name||alias).slice(0,80),upstreams,allowPrivate:input.allowPrivate===true,enabled,accessMode,
+    ...createdFields(input),...routeAuthFields(accessKey),createdAt:now,updatedAt:now};
 }
-// Node fields a PATCH sets directly, applied in this order.
-const ROUTE_PATCH_FIELDS={
-  name:v=>String(v).slice(0,80),enabled:v=>v===true,tlsVerify:v=>v===true,showOnHome:v=>v===true,clientProfile:cleanProfile,streamRewrite:cleanStreamRewrite,autoSteer:cleanAutoSteer,egressAgentId:cleanEgressAgent,lineSync:v=>v!==false,lineSyncUpstream:v=>v===true,tags:cleanTags,notes:v=>String(v).slice(0,500),favorite:v=>v===true,
-  sortOrder:v=>numeric(v,-10000,10000),speedLimitMbps:v=>numeric(v,0,100000),monthlyQuotaGB:v=>numeric(v,0,1000000),reminderDays:v=>numeric(v,0,365),accessAlertThreshold:v=>numeric(v,0,100000)
-};
 
 // --- Endpoints answered before any session exists ---
 async function setupAdmin(req,res){
@@ -405,7 +412,9 @@ async function updateRoute(req,res,r){
   let mode=null,accessKey;
   if(b.accessMode!==undefined){const wanted=b.accessMode==='alias_only'?'alias_only':'key';if(wanted!==r.accessMode){mode=wanted;if(mode==='key')accessKey=connectionKey(b.accessKey);}}
   const fields={};
-  for(const [field,clean] of Object.entries(ROUTE_PATCH_FIELDS))if(b[field]!==undefined)fields[field]=clean(b[field]);
+  if(b.name!==undefined)fields.name=String(b.name).slice(0,80);
+  if(b.enabled!==undefined)fields.enabled=b.enabled===true;
+  for(const [field,{clean,patch}] of Object.entries(ROUTE_FIELDS))if(b[field]!==undefined)fields[field]=(patch||clean)(b[field]);
   const alias=b.alias===undefined?undefined:checkedAlias(b.alias);
   let allowPrivate=r.allowPrivate,upstreams;
   if(b.upstreams!==undefined||b.upstream!==undefined||b.allowPrivate!==undefined){allowPrivate=b.allowPrivate===undefined?r.allowPrivate:b.allowPrivate===true;upstreams=await validateUpstreamList(b.upstreams||b.upstream||routeUpstreams(r),allowPrivate);}

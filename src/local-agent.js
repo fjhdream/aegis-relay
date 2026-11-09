@@ -5,6 +5,7 @@ import { b64u, randomToken, timingEqual } from './security.js';
 import { writeAtomic } from './store.js';
 import { ensureAgentRegistry, LOCAL_AGENT_ID, routeIdsForAgent, routesForAgent } from './agent-registry.js';
 import { DesiredSnapshots } from './desired-snapshots.js';
+import { decodeNodes } from './node-wire.js';
 
 function freeze(value) {
   if(value&&typeof value==='object'&&!Object.isFrozen(value)){
@@ -42,17 +43,6 @@ function open(payload, encodedKey) {
   return JSON.parse(Buffer.concat([decipher.update(Buffer.from(env.data,'base64url')),decipher.final()]));
 }
 
-export function runtimeRoutes(nodes) {
-  return nodes.map(node=>({
-    id:node.id,alias:node.alias,name:node.name,enabled:node.enabled,upstreams:node.upstreams,
-    allowPrivate:node.allowPrivate,tlsVerify:node.tlsVerify,showOnHome:node.showOnHome,
-    clientProfile:node.clientProfile,streamRewrite:node.streamRewrite,speedLimitMbps:node.speedLimitMbps,monthlyQuotaGB:node.monthlyQuotaGB,
-    accessMode:node.access.mode,...(node.steering?{steering:node.steering}:{}),...(node.egress?{egress:node.egress}:{}),...(Array.isArray(node.lines)?{lines:node.lines,...(node.lineSyncUpstream===true?{lineSyncUpstream:true}:{})}:{}),
-    ...(node.playbackObservation===true?{playbackObservation:true}:{}),
-    ...(node.access.mode==='key'?{authVersion:node.access.algorithm,routeAuthKey:node.access.routeAuthKey,keyDigest:node.access.digest,...(Array.isArray(node.access.channels)&&node.access.channels.length?{channels:node.access.channels.map(c=>({id:c.id,routeAuthKey:c.routeAuthKey,keyDigest:c.digest,authVersion:node.access.algorithm}))}:{})}:{})
-  }));
-}
-
 // The panel machine's own agent. It follows its desired snapshot like a remote machine does, only over
 // a direct call: whenever the panel machine is among the machines a refresh changed, it pulls the
 // snapshot, verifies it against the pinned panel key and applies it.
@@ -88,7 +78,7 @@ export class LocalAgent {
     if(!fs.existsSync(this.cacheFile))return false;
     const snapshot=open(fs.readFileSync(this.cacheFile,'utf8'),this.record.agentStorageKey);
     verifySnapshot(snapshot,this.pinnedIdentity());
-    this.routeSource.apply(runtimeRoutes(snapshot.nodes));
+    this.routeSource.apply(decodeNodes(snapshot.nodes));
     this.record.appliedRevision=snapshot.revision;this.record.appliedHash=snapshot.hash;
     return true;
   }
@@ -96,7 +86,7 @@ export class LocalAgent {
   apply(snapshot) {
     const decision=verifySnapshot(snapshot,this.pinnedIdentity(),{currentRevision:this.record.appliedRevision||0,currentHash:this.record.appliedHash||null});
     if(decision.status==='noop')return decision;
-    const routes=runtimeRoutes(snapshot.nodes);
+    const routes=decodeNodes(snapshot.nodes);
     cloneRoutes(routes);
     if(fs.existsSync(this.cacheFile))writeAtomic(this.previousFile,fs.readFileSync(this.cacheFile));
     writeAtomic(this.cacheFile,seal(snapshot,this.record.agentStorageKey));

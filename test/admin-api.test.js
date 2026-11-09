@@ -128,6 +128,22 @@ test('node PATCH applies its fields in place and reports conflicts',async()=>{
   assert.equal((await call('GET',`/routes/${edge.id}/rotate-key`)).status,404);
 });
 
+test('each simple setting has one default and one cleaner, on create, on PATCH and in the list',async()=>{
+  const created=await call('POST','/routes',{alias:'fields',upstreams:upstream,allowPrivate:true,egressAgentId:'ghost'});
+  assert.equal(created.status,201,'an unknown egress machine on create is dropped, as an imported config may name another panel\'s');
+  const defaults=created.body.route;
+  assert.deepEqual({tlsVerify:defaults.tlsVerify,showOnHome:defaults.showOnHome,clientProfile:defaults.clientProfile,streamRewrite:defaults.streamRewrite,autoSteer:defaults.autoSteer,egressAgentId:defaults.egressAgentId,lineSync:defaults.lineSync,lineSyncUpstream:defaults.lineSyncUpstream,tags:defaults.tags,notes:defaults.notes,favorite:defaults.favorite,sortOrder:defaults.sortOrder},
+    {tlsVerify:true,showOnHome:false,clientProfile:{enabled:false},streamRewrite:{enabled:false,domains:[]},autoSteer:{enabled:false,minRateMbps:0},egressAgentId:'',lineSync:true,lineSyncUpstream:false,tags:[],notes:'',favorite:false,sortOrder:0});
+  const id=defaults.id;
+  assert.equal((await call('PATCH',`/routes/${id}`,{egressAgentId:'ghost'})).status,400,'an explicit edit naming an unknown machine is rejected');
+  const patched=(await call('PATCH',`/routes/${id}`,{tlsVerify:false,lineSync:false,autoSteer:{enabled:true,minRateMbps:'12'},streamRewrite:{enabled:true,domains:'https://VOD.example.net/x, cdn.example.net:8443'},clientProfile:{enabled:true,client:' Emby Web '}})).body.route;
+  assert.deepEqual([patched.tlsVerify,patched.lineSync,patched.autoSteer,patched.streamRewrite,patched.clientProfile],[false,false,{enabled:true,minRateMbps:12},{enabled:true,domains:['vod.example.net','cdn.example.net:8443']},{enabled:true,client:'Emby Web'}]);
+  assert.equal((await call('PATCH',`/routes/${id}`,{tlsVerify:true})).body.route.tlsVerify,true);
+  const listed=(await call('GET','/routes')).body.routes.find(r=>r.id===id);
+  const {syncLines,...view}=listed,again=(await call('PATCH',`/routes/${id}`,{})).body.route;
+  assert.deepEqual(view,{...again,updatedAt:view.updatedAt},'the list shows exactly what the edit returned');
+});
+
 test('distribution channels and their parameterised 404s',async()=>{
   const {routes}=(await call('GET','/routes')).body,edge=routes.find(r=>r.alias==='edge'),quiet=routes.find(r=>r.alias==='quiet');
   assert.equal((await call('POST',`/routes/${quiet.id}/channels`,{label:'x'})).status,409,'alias-only nodes have no keys to hand out');
