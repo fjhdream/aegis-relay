@@ -208,21 +208,26 @@ test('a node that appends the upstream lines asks for them only once the token i
   } finally { await Promise.all([close(relay),close(upstream.server)]); }
 });
 
-test('a missing, malformed, compressed, oversized or slow upstream list leaves the node lines alone',async()=>{
+test('an unusable upstream list falls back to the configured primary with its port and path',async()=>{
   let mode='';
   const upstream=await emby({domains:(req,res)=>{
     if(mode==='missing'){res.writeHead(404);return res.end('not found')}
+    if(mode==='empty'){res.writeHead(200);return res.end('{"data":[],"ok":true}')}
     if(mode==='html'){res.writeHead(200,{'content-type':'text/html'});return res.end('<html>emby</html>')}
     if(mode==='gzip'){res.writeHead(200,{'content-type':'application/json','content-encoding':'gzip'});return res.end(zlib.gzipSync(ORIGIN_LINES))}
     if(mode==='huge'){res.writeHead(200,{'content-type':'application/json'});return res.end(JSON.stringify({ok:true,data:[{name:'x',url:'https://x.example.net'}],pad:'x'.repeat(70*1024)}))}
     if(mode==='slow'){res.writeHead(200,{'content-type':'application/json'});return res.write('{"data":[')}
   }});
-  const routes=[keyRoute({upstreams:[`http://127.0.0.1:${upstream.port}`],allowPrivate:true,lines:LINES,lineSyncUpstream:true})];
+  const primary=`http://127.0.0.1:${upstream.port}/media`;
+  const routes=[keyRoute({upstreams:[primary,'https://backup.example.net'],allowPrivate:true,lines:LINES,lineSyncUpstream:true})];
   const relay=http.createServer(makeProxyHandler({getRoutes:()=>routes},deriveKey('k'.repeat(32)))),port=await listen(relay);
   try {
-    for(mode of ['missing','html','gzip','huge','slow']){
+    for(mode of ['missing','empty','html','gzip','huge','slow']){
       const started=Date.now(),res=await get(port,'/movie/key123/emby/System/Ext/ServerDomains',{'x-emby-token':'good'});
-      assert.deepEqual([res.status,JSON.parse(res.body).data.map(line=>line.name)],[200,LINES.map(line=>line.name)],mode);
+      assert.equal(res.status,200,mode);
+      const data=JSON.parse(res.body).data;
+      assert.deepEqual(data.map(line=>line.name),[...LINES.map(line=>line.name),'上游·主线路'],mode);
+      assert.equal(data.at(-1).url,primary,mode);
       if(mode==='slow')assert.ok(Date.now()-started<6000,'a stalled upstream list is given up on');
     }
   } finally { await Promise.all([close(relay),close(upstream.server)]); }

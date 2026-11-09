@@ -6,7 +6,7 @@ import { agentEntryUrl, LOCAL_AGENT_ID } from './agent-registry.js';
 // node itself, with the node's own addresses: the steering entry domain and every machine serving it.
 // Each address carries the client's own access prefix, so a line works with the key the client already
 // has. Passed through, the request would instead hand out the upstream's direct domains, if any; a node
-// can opt into appending those after its own lines (lineSyncUpstream), labelled as the upstream's.
+// can opt into appending those after its own lines, with its configured primary as a fallback.
 
 export const LINE_SYNC_CAPABILITY='line-sync-v1';
 export const LINE_SYNC_MAX=32;
@@ -56,8 +56,7 @@ function upstreamUrl(value) {
 }
 
 // The upstream's reply to the same line request, as reference-format JSON. Anything else (a stock Emby
-// 404 page, HTML, a malformed list) reads as no lines: the token has already been accepted, so the
-// node's own lines are answered regardless.
+// 404 page, HTML, a malformed list) reads as no lines so the configured primary can be used.
 export function upstreamLines(body) {
   let payload;
   try{payload=JSON.parse(Buffer.isBuffer(body)?body.toString('utf8'):String(body||''))}catch{return []}
@@ -104,13 +103,18 @@ const JSON_HEADERS={'content-type':'application/json; charset=utf-8','cache-cont
 
 // The answer once the upstream has judged the token. Shaped like the reference service's, so clients
 // built against it read it unchanged. The upstream's own lines, if any, follow the node's, minus repeats.
-export function lineSyncReply(upstreamStatus, lines, prefix, upstream=[]) {
+export function lineSyncReply(upstreamStatus, lines, prefix, upstream=[], primaryUpstream) {
   let status=200,payload;
   if(upstreamStatus===200){
     const data=[],seen=new Set();
     const add=(name,url)=>{if(seen.has(url))return;seen.add(url);data.push({name,url})};
     for(const line of lines)add(line.name,`${line.base}${prefix}`);
+    const relayLineCount=data.length;
     for(const line of upstream)add(line.name,line.url);
+    if(data.length===relayLineCount&&primaryUpstream){
+      const url=upstreamUrl(primaryUpstream);
+      if(url)add(`${UPSTREAM_LINE_PREFIX}主线路`,url);
+    }
     payload={data,ok:true};
   }
   else if(upstreamStatus===401||upstreamStatus===403){status=401;payload={error:'Invalid token',ok:false};}

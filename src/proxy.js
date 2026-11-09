@@ -626,7 +626,8 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
           finished=true;upRes.resume();
           const answer=(extra=[])=>{
             if(res.destroyed||res.headersSent){metricDone?.(status,0,false);return;}
-            const reply=lineSyncReply(status,route.lines,found.prefix,extra);
+            const primaryUpstream=route.lineSyncUpstream===true?normalizedUpstreams(route)[0]:undefined;
+            const reply=lineSyncReply(status,route.lines,found.prefix,extra,primaryUpstream);
             metricDone?.(reply.status,reply.body.length,reply.status>=500);res.writeHead(reply.status,reply.headers);res.end(reply.body);
           };
           // The upstream's own lines are asked for only once it has accepted the token, on the same
