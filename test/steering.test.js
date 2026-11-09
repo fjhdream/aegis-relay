@@ -7,7 +7,8 @@ const route=(extra={})=>({id:'n1',alias:'movie',routeAuthKey:newRouteAuthKey(),s
 const request=(url,headers={})=>({req:{method:'GET',headers:{'user-agent':'ExoPlayerLib/2.18',...headers}},incoming:new URL(url,'http://relay.invalid')});
 const found=(r,url)=>{const path=new URL(url,'http://relay.invalid').pathname,rest=path.replace(/^\/movie\/key123/,'');return {route:r,rest,prefix:'/movie/key123'}};
 const https={proto:'https',host:'entry.example.com'};
-const healthy=(engine,at,ids=['b'],routeId='n1')=>{for(const id of ids)engine.health.set(id,{healthy:true,at,routes:{[routeId]:{line:0,quotaExhausted:false}}})};
+// Peer health arrives with the panel's sync answer, as it does in production.
+const healthy=(engine,at,ids=['b'],routeId='n1',peer={})=>engine.applySync({peers:ids.map(id=>({id,healthy:true,at,routes:{[routeId]:{line:0,quotaExhausted:false}},...peer}))});
 
 test('the steer parameter is removed without touching any other query bytes',()=>{
   assert.equal(stripSteerParam('?api_key=a%20b&aegis_steer=xyz&Static=true'),'?api_key=a%20b&Static=true');
@@ -147,7 +148,7 @@ test('steering never applies to plain HTTP, browsers, excluded clients, other me
   assert.equal(plan({authorization:'MediaBrowser Token="x"'}),null);
   assert.equal(plan({},https,'HEAD'),null);
   assert.equal(plan({},https,'GET','/movie/key123/Videos/abc/abc/Subtitles/1/Stream.vtt?DeviceId=d1'),null);
-  a.excluded=new Set(['vlc']);
+  a.applySync({excludedClients:['VLC']});
   assert.equal(plan({'x-emby-client':'VLC'}),null);
   assert.equal(a.plan({route:{...r,steering:undefined},found:found(r,url),req:request(url).req,incoming:request(url).incoming,publicContext:https}),null);
   a.stop();
@@ -160,9 +161,9 @@ test('a peer that is unhealthy, stale, on another upstream line or out of quota 
   assert.equal(eligible(),false);
   healthy(a,clock);assert.equal(eligible(),true);
   clock+=STEER_DEFAULTS.peerStaleMs+1;assert.equal(eligible(),false);
-  healthy(a,clock);a.health.get('b').routes.n1.line=1;assert.equal(eligible(),false);
-  healthy(a,clock);a.health.get('b').routes.n1.quotaExhausted=true;assert.equal(eligible(),false);
-  healthy(a,clock);a.health.get('b').healthy=false;assert.equal(eligible(),false);
+  healthy(a,clock,['b'],'n1',{routes:{n1:{line:1,quotaExhausted:false}}});assert.equal(eligible(),false);
+  healthy(a,clock,['b'],'n1',{routes:{n1:{line:0,quotaExhausted:true}}});assert.equal(eligible(),false);
+  healthy(a,clock,['b'],'n1',{healthy:false});assert.equal(eligible(),false);
   a.stop();
 });
 
@@ -220,7 +221,7 @@ test('bounded ranges are only applied to opted-in clients in active mode',()=>{
   const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1';
   const call=headers=>{const q=request(url,headers);return a.plan({route:r,found:found(r,url),req:q.req,incoming:q.incoming,publicContext:https})};
   assert.equal(call({range:'bytes=100-','x-emby-client':'Infuse'}).range,null);
-  a.bounded=new Set(['infuse']);a.boundBytes=1024*1024;
+  a.applySync({boundedClients:['infuse'],boundBytes:1024*1024});
   assert.equal(call({range:'bytes=100-','x-emby-client':'Infuse'}).range,`bytes=100-${100+1024*1024-1}`);
   assert.equal(call({range:'bytes=100-200','x-emby-client':'Infuse'}).range,null);
   a.stop();
@@ -271,7 +272,7 @@ test('the engine reports the client network digest and adopts the panel history 
 
 test('a capped range is judged by whether the player comes back for the next byte',()=>{
   let clock=10_000_000_000;
-  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.bounded=new Set(['infuse']);a.boundBytes=1000;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock,params:{boundBytes:1000}});a.applySync({boundedClients:['infuse']});
   const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1&PlaySessionId=p1';
   const call=(range,client='Infuse',key='d1')=>{const u=url.replace('d1',key),q=request(u,{range,'x-emby-client':client});return a.plan({route:r,found:found(r,u),req:q.req,incoming:q.incoming,publicContext:https})};
   const serve=(plan,{status=206,contentRange='bytes 0-999/50000',sent=1000}={})=>{plan.track.headers(status,{'content-range':contentRange});plan.track.bytes(sent);plan.track.close()};
@@ -293,7 +294,7 @@ test('a capped range is judged by whether the player comes back for the next byt
 
 test('Rex can pause prefetching for a minute and still successfully continue a capped range',()=>{
   let clock=12_000_000_000;
-  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.bounded.add('rex');a.boundBytes=8;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock,params:{boundBytes:8}});a.applySync({boundedClients:['rex']});
   const url='/movie/key123/emby/play/video/abc';
   const call=range=>{const q=request(url,{range,'x-emby-client':'Rex','x-emby-device-id':'rex-device'});return a.plan({route:r,found:found(r,url),req:q.req,incoming:q.incoming,publicContext:https})};
   try{
@@ -309,7 +310,7 @@ test('Rex can pause prefetching for a minute and still successfully continue a c
 
 test('a client on trial gets one capped range per session and one session at a time',()=>{
   let clock=11_000_000_000;
-  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.trials=new Set(['vlc']);a.boundBytes=1000;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock,params:{boundBytes:1000}});a.applySync({trialClients:['vlc']});
   const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1&PlaySessionId=p1';
   const call=(key,range='bytes=0-')=>{const u=url.replace('d1',key),q=request(u,{range,'x-emby-client':'VLC'});return a.plan({route:r,found:found(r,u),req:q.req,incoming:q.incoming,publicContext:https})};
   const first=call('d1');
@@ -325,7 +326,7 @@ test('a client on trial gets one capped range per session and one session at a t
 
 test('an unconfirmed trial releases its slot without failure and range events survive a failed sync',()=>{
   let clock=13_000_000_000;
-  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock});a.trials.add('vlc');a.boundBytes=8;
+  const r=route(),a=new SteeringEngine({selfId:'a',clock:()=>clock,params:{boundBytes:8}});a.applySync({trialClients:['vlc']});
   const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1',q=request(url,{range:'bytes=0-','x-emby-client':'VLC'});
   try{
     const {track}=a.plan({route:r,found:found(r,url),req:q.req,incoming:q.incoming,publicContext:https});

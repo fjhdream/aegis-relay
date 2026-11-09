@@ -392,7 +392,7 @@ export class Panel {
     if(input.boundMB!==undefined)settings.boundMB=Math.round(numeric(input.boundMB,8,1024));
     if(input.clearAutoExcluded===true)settings.autoExcluded={};
     if(input.boundAuto!==undefined)settings.boundAuto=input.boundAuto===true;
-    if(input.clearRangeAuto===true){settings.autoBounded={};settings.autoUnbounded={};this.steeringHub?.bounds.clear();}
+    if(input.clearRangeAuto===true){settings.autoBounded={};settings.autoUnbounded={};this.steeringHub?.clearRangeVerdicts();}
     this.commit('steering.updated',actor,settings.mode);
     return this.steering();
   }

@@ -69,7 +69,7 @@ test('a steered request is redirected to the peer, served there, and the token n
     assert.equal(first.status,200);assert.equal(first.body.toString(),'media');
     const session=[...a.sessions.values()][0];
     session.scores.a={verdict:'starved_down',rateBps:1e6,at:a.now()};
-    a.health.set('b',{healthy:true,at:a.now(),routes:{n1:{line:0,quotaExhausted:false}}});
+    a.applySync({peers:[{id:'b',healthy:true,at:a.now(),routes:{n1:{line:0,quotaExhausted:false}}}]});
     const steered=await get(portA,path);
     assert.equal(steered.status,302);assert.equal(steered.headers['cache-control'],'no-store');
     const location=new URL(steered.headers.location);
@@ -117,8 +117,8 @@ test('Rex custom video paths retain their steering identity through encrypted CD
     await listen(cdn);const up=await listen(origin),routeAuthKey=newRouteAuthKey();
     const route={id:'rex',alias:'movie',enabled:true,accessMode:'key',authVersion:ROUTE_AUTH_VERSION,routeAuthKey,keyDigest:routeTokenDigest('key123',routeAuthKey),upstreams:[`http://127.0.0.1:${up}`],allowPrivate:true,
       steering:{mode:'on',peers:[{id:'a',base:'https://a.example.com'},{id:'b',base:'https://b.example.com'}],params:{minRateMbps:0}}};
-    a=new SteeringEngine({selfId:'a'});b=new SteeringEngine({selfId:'b'});
-    for(const engine of [a,b]){engine.bounded.add('rex');engine.boundBytes=8;}
+    a=new SteeringEngine({selfId:'a',params:{boundBytes:8}});b=new SteeringEngine({selfId:'b',params:{boundBytes:8}});
+    for(const engine of [a,b])engine.applySync({boundedClients:['rex']});
     relayA=http.createServer(makeProxyHandler({getRoutes:()=>[route]},deriveKey('s'.repeat(32)),null,a));
     relayB=http.createServer(makeProxyHandler({getRoutes:()=>[route]},deriveKey('t'.repeat(32)),null,b));
     const portA=await listen(relayA),portB=await listen(relayB);
@@ -136,7 +136,7 @@ test('Rex custom video paths retain their steering identity through encrypted CD
     hub.exchange('a',a.syncPayload([route]));
     assert.equal(hub.view().ranges.find(row=>row.client==='Rex')?.continued,1);
     session.scores.a={verdict:'starved_down',rateBps:1,at:a.now()};
-    a.health.set('b',{healthy:true,at:a.now(),routes:{rex:{line:0,quotaExhausted:false}}});
+    a.applySync({peers:[{id:'b',healthy:true,at:a.now(),routes:{rex:{line:0,quotaExhausted:false}}}]});
     const moved=await get(portA,path,{...headers,range:'bytes=16-'});
     assert.equal(moved.status,302);
     const target=new URL(moved.headers.location);
@@ -172,7 +172,7 @@ test('plain HTTP requests are never steered',async()=>{
     await get(portA,path);
     const session=[...a.sessions.values()][0];
     session.scores.a={verdict:'starved_down',rateBps:1e6,at:a.now()};
-    a.health.set('b',{healthy:true,at:a.now(),routes:{n1:{line:0,quotaExhausted:false}}});
+    a.applySync({peers:[{id:'b',healthy:true,at:a.now(),routes:{n1:{line:0,quotaExhausted:false}}}]});
     assert.equal((await get(portA,path,{'x-forwarded-proto':'http'})).status,200);
   } finally { await cleanup(); }
 });
