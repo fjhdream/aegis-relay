@@ -47,16 +47,16 @@ export function runtimeRoutes(nodes) {
     id:node.id,alias:node.alias,name:node.name,enabled:node.enabled,upstreams:node.upstreams,
     allowPrivate:node.allowPrivate,tlsVerify:node.tlsVerify,showOnHome:node.showOnHome,
     clientProfile:node.clientProfile,streamRewrite:node.streamRewrite,speedLimitMbps:node.speedLimitMbps,monthlyQuotaGB:node.monthlyQuotaGB,
-    accessMode:node.access.mode,...(node.steering?{steering:node.steering}:{}),...(node.egress?{egress:node.egress}:{}),
+    accessMode:node.access.mode,...(node.steering?{steering:node.steering}:{}),...(node.egress?{egress:node.egress}:{}),...(Array.isArray(node.lines)?{lines:node.lines,...(node.lineSyncUpstream===true?{lineSyncUpstream:true}:{})}:{}),
     ...(node.playbackObservation===true?{playbackObservation:true}:{}),
     ...(node.access.mode==='key'?{authVersion:node.access.algorithm,routeAuthKey:node.access.routeAuthKey,keyDigest:node.access.digest,...(Array.isArray(node.access.channels)&&node.access.channels.length?{channels:node.access.channels.map(c=>({id:c.id,routeAuthKey:c.routeAuthKey,keyDigest:c.digest,authVersion:node.access.algorithm}))}:{})}:{})
   }));
 }
 
 export class LocalAgent {
-  constructor({store,cacheFile=`${store.file}.local-agent.snapshot`}) {
+  constructor({store,cacheFile=`${store.file}.local-agent.snapshot`,localBase=''}) {
     const registered=Array.isArray(store.data.agents)&&store.data.agents.some(agent=>agent.id===LOCAL_AGENT_ID);
-    this.store=store;this.cacheFile=cacheFile;this.previousFile=`${cacheFile}.previous`;this.routeSource=new AtomicRouteSource(registered?routesForAgent(store.data,LOCAL_AGENT_ID):store.data.routes);
+    this.store=store;this.cacheFile=cacheFile;this.localBase=localBase;this.previousFile=`${cacheFile}.previous`;this.routeSource=new AtomicRouteSource(registered?routesForAgent(store.data,LOCAL_AGENT_ID):store.data.routes);
     this.panelIdentity=null;this.record=null;this.lastError='';this.applyState='starting';this.lastSeen=null;
   }
 
@@ -115,7 +115,7 @@ export class LocalAgent {
     if(agent){agent.lastSeen=this.lastSeen;agent.applyState=status==='applied'?'active':'error';agent.desiredRevision=snapshot?.revision||0;agent.appliedRevision=status==='applied'?(snapshot?.revision||0):(this.record.appliedRevision||0);agent.proxyHealthy=status==='applied';agent.updatedAt=this.lastSeen;}
   }
 
-  reconcile(nodes=agentSnapshotNodes(this.store.data,LOCAL_AGENT_ID)) {
+  reconcile(nodes=agentSnapshotNodes(this.store.data,LOCAL_AGENT_ID,{localBase:this.localBase})) {
     let snapshot;
     try {
       snapshot=this.pull(nodes);

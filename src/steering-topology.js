@@ -2,6 +2,7 @@ import { isRouteAuthKey } from './route-auth.js';
 import { LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
 import { EGRESS_CAPABILITY, STEERING_CAPABILITY, STEERING_MODES } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
+import { LINE_SYNC_CAPABILITY, lineSyncUpstream, nodeLines } from './line-sync.js';
 
 // Which machines may steer a node between them, and the settings behind it. Compiled into each
 // machine's signed snapshot, so only static topology lives here; liveness travels over the steering sync.
@@ -131,15 +132,21 @@ export function egressTopology(data, route) {
 // The node list compiled into a machine's snapshot. A node only carries a steering block on machines
 // that are themselves part of its topology, and an egress block on every machine but the egress
 // itself; everything else compiles exactly as before, so enabling nothing changes no snapshot hash.
-export function agentSnapshotNodes(data, agentId) {
+// Machines that know line-sync-v1 also get each node's line list (empty when the node does not share
+// it) and whether to append the upstream's own; older ones keep their previous snapshot. localBase is
+// where the panel machine serves nodes.
+export function agentSnapshotNodes(data, agentId, {localBase=''}={}) {
   const routes=routesForAgent(data,agentId),settings=readSteeringSettings(data);
-  const observes=agentId===LOCAL_AGENT_ID||data.agents?.find(a=>a.id===agentId)?.capabilities?.includes(PLAYBACK_OBSERVATION_CAPABILITY);
+  const capabilities=agentId===LOCAL_AGENT_ID?null:data.agents?.find(a=>a.id===agentId)?.capabilities;
+  const knows=name=>agentId===LOCAL_AGENT_ID||(Array.isArray(capabilities)&&capabilities.includes(name));
+  const observes=knows(PLAYBACK_OBSERVATION_CAPABILITY),syncsLines=knows(LINE_SYNC_CAPABILITY);
   return routes.map(route=>{
     const topology=settings.mode==='off'?null:steeringTopology(data,route,settings),egress=egressTopology(data,route);
     let node=route;
     if(topology&&observes)node={...node,playbackObservation:true};
     if(topology&&topology.peers.some(peer=>peer.id===agentId))node={...node,steering:topology};
     if(egress&&egress.id!==agentId)node={...node,egress};
+    if(syncsLines)node={...node,lines:nodeLines(data,route,{entryBase:steeringEntryBaseUrl(data,route),localBase}),lineSyncUpstream:lineSyncUpstream(route)};
     return node;
   });
 }

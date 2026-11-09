@@ -248,3 +248,22 @@ test('saving node deployment on a remote machine watches until it is applied',()
   assert.match(watch[0],/!a\.inSync/);
   assert.match(watch[0],/syncWatchUntil/,'the poll must be time-bounded, not endless');
 });
+test('the node editor previews the lines a client syncs, with the key hidden and names escaped',()=>{
+  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),start=js.indexOf('function renderLinePreview('),end=js.indexOf('\n',start);
+  const elements=new Map(),el=id=>{if(!elements.has(id))elements.set(id,{checked:true,innerHTML:'',hiddenState:false,classList:{toggle(name,on){if(name==='hidden')elements.get(id).hiddenState=on}}});return elements.get(id)};
+  const context=vm.createContext({$:el,escapeHtml:s=>String(s??'').replace(/</g,'&lt;')});
+  vm.runInContext(js.slice(start,end),context);
+  context.route={alias:'movie',accessMode:'key',syncLines:[{name:'<香港>',base:'https://hk.example.com'},{name:'IP 机',base:'http://203.0.113.9:8080'}]};
+  vm.runInContext('renderLinePreview(route)',context);
+  const html=el('#line-sync-preview').innerHTML;
+  assert.match(html,/这 2 条线路/);assert.match(html,/https:\/\/hk\.example\.com\/movie\/••••••/);assert.match(html,/&lt;香港>/);assert.doesNotMatch(html,/<香港>/);
+  context.route={alias:'open',accessMode:'alias_only',syncLines:[]};vm.runInContext('renderLinePreview(route)',context);
+  assert.match(el('#line-sync-preview').innerHTML,/还没有可同步的线路/);
+  assert.equal(el('#line-sync-upstream-hint').hiddenState,false,'the upstream warning shows while that switch is on');
+  el('#line-sync-upstream').checked=false;el('#line-sync-enabled').checked=false;vm.runInContext('renderLinePreview(null)',context);
+  assert.match(el('#line-sync-preview').innerHTML,/保存后/);assert.equal(el('#line-sync-options').hiddenState,true,'hidden while the switch is off');
+  assert.equal(el('#line-sync-upstream-hint').hiddenState,true);
+  const html2=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');
+  assert.match(html2,/id="line-sync-options"><div id="line-sync-preview"[^]*id="line-sync-upstream"[^]*不经过 relay/,'the upstream switch sits inside the section the main switch hides, with its warning');
+  assert.match(js,/lineSyncUpstream:\$\('#line-sync-upstream'\)\.checked/);
+});

@@ -13,6 +13,7 @@ import { activeUpstreamLine, handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIO
 import { EGRESS_CAPABILITY, SteeringEngine, STEERING_CAPABILITY } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 import { cleanEntryRequest, cleanEntryStatus, entryAttempt, ENTRY_CAPABILITY } from './steering-topology.js';
+import { cleanLines, LINE_SYNC_CAPABILITY } from './line-sync.js';
 import { Metrics } from './metrics.js';
 import { telemetryFromMetrics } from './telemetry.js';
 
@@ -30,7 +31,8 @@ const AGENT_PROXY_MODE=String(process.env.AGENT_PROXY_MODE||'').trim().toLowerCa
 // steering-v1: this machine runs the steering engine and can be a steering target.
 // entry-v1: it sets up the steering entry domain itself when the panel asks (no command to run by hand).
 // egress-v1: it relays a node's upstream traffic through the node's egress machine (see proxy.js).
-const CAPABILITIES=['registry-v1','config-v1','proxy-v1','telemetry-v1','config-longpoll-v1',STEERING_CAPABILITY,ENTRY_CAPABILITY,EGRESS_CAPABILITY,PLAYBACK_OBSERVATION_CAPABILITY];
+// line-sync-v1: it answers a client's line request for a node with the node's lines (see line-sync.js).
+const CAPABILITIES=['registry-v1','config-v1','proxy-v1','telemetry-v1','config-longpoll-v1',STEERING_CAPABILITY,ENTRY_CAPABILITY,EGRESS_CAPABILITY,PLAYBACK_OBSERVATION_CAPABILITY,LINE_SYNC_CAPABILITY];
 const sha256=value=>b64u(crypto.createHash('sha256').update(value).digest());
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
@@ -88,7 +90,7 @@ function sealLocal(snapshot,identity){const iv=crypto.randomBytes(12),cipher=cry
 function openLocal(payload,identity){const env=JSON.parse(payload),decipher=crypto.createDecipheriv('aes-256-gcm',storageKey(identity),Buffer.from(env.iv,'base64url'));decipher.setAuthTag(Buffer.from(env.tag,'base64url'));return JSON.parse(Buffer.concat([decipher.update(Buffer.from(env.data,'base64url')),decipher.final()]).toString('utf8'))}
 function loadMetricStore(identity){let data={};if(fs.existsSync(METRICS_FILE)){try{const loaded=openLocal(fs.readFileSync(METRICS_FILE,'utf8'),identity);if(loaded&&typeof loaded==='object'&&!Array.isArray(loaded))data=loaded}catch(error){console.error(`[aegis-agent] cached metrics rejected: ${error.message}`)}}const writer=coalescedWriter(METRICS_FILE,()=>sealLocal(data,identity));return{data,save:writer.save}}
 
-function validateRoutes(routes){if(!Array.isArray(routes)||routes.length>100)throw new Error('invalid route count');const aliases=new Set();for(const route of routes){if(!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(route.alias)||aliases.has(route.alias))throw new Error('invalid or duplicate route alias');aliases.add(route.alias);for(const target of [...(route.upstreams||[])]){const url=new URL(target);if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error('invalid route upstream');}for(const peer of route.steering?.peers||[]){const url=new URL(peer.base);if(url.protocol!=='https:'||url.origin!==peer.base)throw new Error('invalid steering peer')}if(route.egress){const url=new URL(route.egress.base);if(url.protocol!=='https:'||url.origin!==route.egress.base)throw new Error('invalid egress machine');}}return routes;}
+function validateRoutes(routes){if(!Array.isArray(routes)||routes.length>100)throw new Error('invalid route count');const aliases=new Set();for(const route of routes){if(!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(route.alias)||aliases.has(route.alias))throw new Error('invalid or duplicate route alias');aliases.add(route.alias);for(const target of [...(route.upstreams||[])]){const url=new URL(target);if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error('invalid route upstream');}for(const peer of route.steering?.peers||[]){const url=new URL(peer.base);if(url.protocol!=='https:'||url.origin!==peer.base)throw new Error('invalid steering peer')}if(route.egress){const url=new URL(route.egress.base);if(url.protocol!=='https:'||url.origin!==route.egress.base)throw new Error('invalid egress machine');}if(route.lines!==undefined)cleanLines(route.lines);if(route.lineSyncUpstream!==undefined&&(route.lineSyncUpstream!==true||!Array.isArray(route.lines)))throw new Error('invalid line sync');}return routes;}
 
 class RemoteConfig {
   constructor(identity){this.identity=identity;this.routeSource=new AtomicRouteSource([]);this.revision=0;this.hash=null;this.applyState='waiting';this.error='';}

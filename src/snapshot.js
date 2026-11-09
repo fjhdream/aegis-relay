@@ -3,6 +3,7 @@ import { canonicalJson } from './canonical-json.js';
 import { isRouteAuthKey, ROUTE_AUTH_VERSION } from './route-auth.js';
 import { b64u, timingEqual } from './security.js';
 import { agentSnapshotNodes } from './steering-topology.js';
+import { cleanLines } from './line-sync.js';
 
 export const SNAPSHOT_SCHEMA_VERSION=1;
 
@@ -89,7 +90,8 @@ function normalizeNode(route) {
     speedLimitMbps:Number(route.speedLimitMbps||0),monthlyQuotaGB:Number(route.monthlyQuotaGB||0),access,
     ...(route.steering?{steering:steering(route.steering)}:{}),
     ...(route.playbackObservation===true?{playbackObservation:true}:{}),
-    ...(route.egress?{egress:egress(route.egress)}:{})
+    ...(route.egress?{egress:egress(route.egress)}:{}),
+    ...(Array.isArray(route.lines)?{lines:cleanLines(route.lines),...(route.lineSyncUpstream===true?{lineSyncUpstream:true}:{})}:{})
   };
 }
 
@@ -164,10 +166,10 @@ export function compileDesiredSnapshot({nodes,previousState=null,signingIdentity
   return {snapshot,state:Object.freeze({revision,contentHash,snapshotHash:snapshot.hash,keyId:signingIdentity.keyId})};
 }
 
-export function compileAgentDesiredSnapshot({data,agentId,previousState=null,signingIdentity}) {
+export function compileAgentDesiredSnapshot({data,agentId,previousState=null,signingIdentity,localBase=''}) {
   if(!data||typeof data!=='object')throw new Error('agent snapshot requires store data');
   if(!String(agentId||'').trim())throw new Error('agent snapshot requires agentId');
-  return compileDesiredSnapshot({nodes:agentSnapshotNodes(data,agentId),previousState,signingIdentity});
+  return compileDesiredSnapshot({nodes:agentSnapshotNodes(data,agentId,{localBase}),previousState,signingIdentity});
 }
 
 export function verifySnapshot(snapshot, signingIdentity, {currentRevision=0,currentHash=null}={}) {

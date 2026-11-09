@@ -12,7 +12,7 @@ import { totp } from '../src/security.js';
 // session/CSRF gate, the 404s of the parameterised routes and the node-record validation.
 const ROOT=new URL('..',import.meta.url).pathname;
 const freePort=()=>new Promise(resolve=>{const s=net.createServer();s.listen(0,'127.0.0.1',()=>{const {port}=s.address();s.close(()=>resolve(port))})});
-let server,emby,work,base,upstream,session={cookie:'',csrf:''};
+let server,emby,work,base,proxyBase,upstream,session={cookie:'',csrf:''};
 
 async function call(method,p,body,{auth=true,raw,contentType='application/json',prefix='/api'}={}){
   const headers={};
@@ -30,12 +30,12 @@ async function signIn(password){
 }
 
 before(async()=>{
-  emby=http.createServer((_q,s)=>{s.setHeader('content-type','application/json');s.end('{"ServerName":"Fake","Version":"4.8.0.0","Id":"fake"}')});
+  emby=http.createServer((q,s)=>{s.setHeader('content-type','application/json');s.end(/ServerDomains/.test(q.url)?'{"data":[{"name":"直连","url":"https://origin.example.net"}],"ok":true}':'{"ServerName":"Fake","Version":"4.8.0.0","Id":"fake"}')});
   await new Promise(resolve=>emby.listen(0,'127.0.0.1',resolve));upstream=`http://127.0.0.1:${emby.address().port}`;
   work=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-admin-api-'));
   const [adminPort,proxyPort]=[await freePort(),await freePort()];
   server=spawn(process.execPath,['src/server.js'],{cwd:ROOT,stdio:'ignore',env:{...process.env,APP_MASTER_KEY:'admin-api-test-master-key-0123456789',SETUP_TOKEN:'setup-token',ADMIN_HOST:'127.0.0.1',ADMIN_PORT:String(adminPort),PROXY_HOST:'127.0.0.1',PROXY_PORT:String(proxyPort),DATA_FILE:path.join(work,'data','aegis.enc.json'),SECURE_COOKIES:'false',PUBLIC_BASE_URL:'https://panel.example.com',CERTIFICATE_EMAIL:'ops@example.com'}});
-  base=`http://127.0.0.1:${adminPort}/_aegis`;
+  base=`http://127.0.0.1:${adminPort}/_aegis`;proxyBase=`http://127.0.0.1:${proxyPort}`;
   for(let i=0;i<200;i++){try{if((await fetch(`${base}/api/status`)).ok)break}catch{}await new Promise(resolve=>setTimeout(resolve,50))}
 });
 after(async()=>{
@@ -239,4 +239,21 @@ test('automatic steering settings are validated before anything is written',asyn
   assert.equal((await call('PATCH',`/routes/${quiet.id}`,{egressAgentId:''})).body.route.egressAgentId,'');
   assert.equal((await call('PATCH','/agents/local',{steerTarget:false})).status,200);
   assert.match((await call('GET','/steering')).body.machines.find(m=>m.id==='local').issues.join(),/已关闭/);
+});
+
+test('a node hands its lines to signed-in clients through the proxy, and stops when switched off',async()=>{
+  const created=await call('POST','/routes',{alias:'lines',upstreams:upstream,allowPrivate:true});
+  assert.equal(created.status,201);assert.equal(created.body.route.lineSync,true,'new nodes share their lines');
+  const route=(await call('GET','/routes')).body.routes.find(r=>r.alias==='lines');
+  assert.deepEqual(route.syncLines,[{name:route.syncLines[0]?.name,base:'https://panel.example.com'}],'served by the panel machine only, on its public address');
+  const linesUrl=`${proxyBase}${created.body.clientPath}emby/System/Ext/ServerDomains`;
+  const res=await fetch(linesUrl,{headers:{'x-emby-token':'client-token'}});
+  assert.equal(res.status,200);
+  const own={name:route.syncLines[0].name,url:`https://panel.example.com${created.body.clientPath.replace(/\/$/,'')}`};
+  assert.deepEqual(await res.json(),{data:[own],ok:true},'the upstream list stays out unless asked for');
+  assert.equal(route.lineSyncUpstream,false);
+  assert.equal((await call('PATCH',`/routes/${route.id}`,{lineSyncUpstream:true})).body.route.lineSyncUpstream,true);
+  assert.deepEqual(await (await fetch(linesUrl,{headers:{'x-emby-token':'client-token'}})).json(),{data:[own,{name:'上游·直连',url:'https://origin.example.net'}],ok:true});
+  assert.equal((await call('PATCH',`/routes/${route.id}`,{lineSync:false})).body.route.lineSync,false);
+  assert.equal((await fetch(linesUrl,{headers:{'x-emby-token':'client-token'}})).status,404);
 });
