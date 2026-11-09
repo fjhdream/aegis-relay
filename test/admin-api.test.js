@@ -253,7 +253,11 @@ test('a node hands its lines to signed-in clients through the proxy, and stops w
   assert.deepEqual(await res.json(),{data:[own],ok:true},'the upstream list stays out unless asked for');
   assert.equal(route.lineSyncUpstream,false);
   assert.equal((await call('PATCH',`/routes/${route.id}`,{lineSyncUpstream:true})).body.route.lineSyncUpstream,true);
-  assert.deepEqual(await (await fetch(linesUrl,{headers:{'x-emby-token':'client-token'}})).json(),{data:[own,{name:'上游·直连',url:'https://origin.example.net'}],ok:true});
+  assert.deepEqual(await (await fetch(linesUrl,{headers:{'x-emby-token':'client-token'}})).json(),{data:[
+    own,
+    {name:'上游·主线路',url:upstream},
+    {name:'上游·直连',url:'https://origin.example.net'}
+  ],ok:true});
   assert.equal((await call('PATCH',`/routes/${route.id}`,{lineSync:false})).body.route.lineSync,false);
   assert.equal((await fetch(linesUrl,{headers:{'x-emby-token':'client-token'}})).status,404);
 });

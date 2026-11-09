@@ -115,9 +115,19 @@ test('the line reply follows the reference service: data on success, ok:false ot
   assert.deepEqual(JSON.parse(ok.body),{data:[{name:'香港',url:'https://hk.example.com/movie/key123'}],ok:true});
   assert.deepEqual([lineSyncReply(401,lines,'').status,JSON.parse(lineSyncReply(403,lines,'').body)],[401,{error:'Invalid token',ok:false}]);
   assert.deepEqual([lineSyncReply(500,lines,'').status,JSON.parse(lineSyncReply(404,lines,'').body).ok],[502,false]);
-  const merged=lineSyncReply(200,lines,'/movie/key123',[{name:'上游·直连',url:'https://origin.example.net'},{name:'上游·重复',url:'https://hk.example.com/movie/key123'}]);
-  assert.deepEqual(JSON.parse(merged.body).data,[{name:'香港',url:'https://hk.example.com/movie/key123'},{name:'上游·直连',url:'https://origin.example.net'}],'upstream lines follow, minus repeats');
-  assert.equal(JSON.parse(lineSyncReply(401,lines,'',[{name:'上游·x',url:'https://x.example.net'}]).body).data,undefined);
+  const primary='https://primary.example.net:8443/media';
+  const upstream=[
+    {name:'上游·直连',url:'https://origin.example.net'},
+    {name:'上游·重复代理',url:'https://hk.example.com/movie/key123'},
+    {name:'上游·重复主线路',url:primary}
+  ];
+  const merged=lineSyncReply(200,lines,'/movie/key123',upstream,primary);
+  assert.deepEqual(JSON.parse(merged.body).data,[
+    {name:'香港',url:'https://hk.example.com/movie/key123'},
+    {name:'上游·主线路',url:primary},
+    {name:'上游·直连',url:'https://origin.example.net'}
+  ]);
+  assert.equal(JSON.parse(lineSyncReply(401,lines,'',upstream,primary).body).data,undefined);
 });
 
 test('the upstream line list is read leniently, but only http(s) addresses without credentials survive',()=>{
@@ -194,7 +204,8 @@ test('a node that appends the upstream lines asks for them only once the token i
     assert.equal(ok.status,200);
     assert.deepEqual(JSON.parse(ok.body).data,[
       {name:'智能入口',url:'https://entry.example.com/movie/key123'},{name:'香港',url:'https://hk.example.com/movie/key123'},{name:'IP 机',url:'http://203.0.113.9:8080/movie/key123'},
-      {name:'上游·origin',url:'https://direct-origin.example.net'}],'the node lines first; an upstream line repeating one of them is dropped');
+      {name:'上游·主线路',url:at},
+      {name:'上游·origin',url:'https://direct-origin.example.net'}],'the configured primary precedes the advertised upstream lines');
     assert.deepEqual(upstream.seen.map(item=>[item.url,item.token]),[['/emby/Items?Limit=1','good'],['/emby/System/Ext/ServerDomains','good']]);
     assert.equal(upstream.seen[1].encoding,'identity','the list is read here, so it is asked for uncompressed');
     upstream.seen.length=0;
@@ -204,11 +215,11 @@ test('a node that appends the upstream lines asks for them only once the token i
     assert.equal((await get(port,'/movie/key123/emby/System/Ext/ServerDomains?api_key=good')).status,200);
     assert.equal(upstream.seen[1].url,'/emby/System/Ext/ServerDomains?api_key=good','the client query rides along');
     const only=await get(port,'/only/key123/emby/System/Ext/ServerDomains',{'x-emby-token':'good'});
-    assert.deepEqual([only.status,JSON.parse(only.body).data.map(line=>line.name)],[200,['上游·origin','上游·重复']],'no machine address yet: the upstream lines alone');
+    assert.deepEqual([only.status,JSON.parse(only.body).data.map(line=>line.name)],[200,['上游·主线路','上游·origin','上游·重复']],'no machine address yet: the upstream lines alone');
   } finally { await Promise.all([close(relay),close(upstream.server)]); }
 });
 
-test('an unusable upstream list falls back to the configured primary with its port and path',async()=>{
+test('the configured primary keeps its port and path when the upstream list is unusable',async()=>{
   let mode='';
   const upstream=await emby({domains:(req,res)=>{
     if(mode==='missing'){res.writeHead(404);return res.end('not found')}
@@ -268,7 +279,7 @@ test('through a unified egress, the upstream lines are fetched via the egress ma
   try {
     const res=await get(portB,'/movie/key123/emby/System/Ext/ServerDomains',{'x-emby-token':'good'});
     assert.equal(res.status,200);
-    assert.deepEqual(JSON.parse(res.body).data.map(line=>line.name),['香港','IP 机','上游·origin']);
+    assert.deepEqual(JSON.parse(res.body).data.map(line=>line.name),['香港','IP 机','上游·主线路','上游·origin']);
     assert.deepEqual([counts.b,counts.a],[1,2],'both upstream calls went through the egress machine');
     assert.deepEqual(upstream.seen.map(item=>item.url),['/emby/Items?Limit=1','/emby/System/Ext/ServerDomains']);
   } finally { a.stop();b.stop();await Promise.all([relayA,relayB,upstream.server].map(close)); }
