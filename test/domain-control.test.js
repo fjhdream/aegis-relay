@@ -21,16 +21,18 @@ test('split-domain routing rejects old proxy names and unrelated subdomains',()=
 });
 
 test('domain switch writes a constrained atomic host request and readable pending status',()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-domain-')),dataFile=path.join(dir,'aegis.enc.json');
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-domain-'));
   try{
-    const status=requestDomainSwitch({dataFile,domain:'EmbyUS.Example.com',email:'Admin@Example.com',currentDomain:'old.example.com'});
+    const status=requestDomainSwitch({dir,domain:'EmbyUS.Example.com',email:'Admin@Example.com',currentDomain:'old.example.com'});
     assert.equal(status.state,'pending');
     const request=JSON.parse(fs.readFileSync(path.join(dir,DOMAIN_REQUEST_FILE),'utf8'));
     assert.equal(request.desiredDomain,'embyus.example.com');
     assert.equal(request.certificateEmail,'admin@example.com');
-    assert.deepEqual(readDomainStatus(dataFile),status);
-    assert.throws(()=>requestDomainSwitch({dataFile,domain:'panel.example.com/x',email:'admin@example.com'}));
-    assert.throws(()=>requestDomainSwitch({dataFile,domain:'panel.example.com:8443',email:'admin@example.com'}));
-    assert.throws(()=>requestDomainSwitch({dataFile,domain:'bad_domain.example.com',email:'admin@example.com'}));
+    assert.deepEqual(readDomainStatus(dir),status);
+    assert.equal(fs.statSync(path.join(dir,DOMAIN_REQUEST_FILE)).mode&0o777,0o600,'only the owner and the root host unit read it');
+    assert.deepEqual(fs.readdirSync(dir).filter(name=>name.endsWith('.tmp')),[],'no half-written file is left behind');
+    assert.throws(()=>requestDomainSwitch({dir,domain:'panel.example.com/x',email:'admin@example.com'}));
+    assert.throws(()=>requestDomainSwitch({dir,domain:'panel.example.com:8443',email:'admin@example.com'}));
+    assert.throws(()=>requestDomainSwitch({dir,domain:'bad_domain.example.com',email:'admin@example.com'}));
   }finally{fs.rmSync(dir,{recursive:true,force:true})}
 });

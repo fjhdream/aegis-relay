@@ -496,7 +496,7 @@ mac   = HMAC-SHA256(steerKey, "token\n" ‖ 前面各字段)[0:16]
 | `src/steering-sync.js` | 机器与面板之间的切流同步格式（两个方向的编码与清洗），以及面板本机和测试用的 `localTransport` |
 | `src/steering-hub.js` | 面板侧会话仲裁、对端健康、决策事件、客户端落地率、切换效果、网段历史、分段接续统计 |
 | `src/steering-topology.js` | 设置的规范化、机器/节点能否参与及原因、快照拓扑（含统一出口）、入口域名地址与各机器的入口配置 |
-| `src/domain-control.js` | 面板本机的入口域名请求文件 |
+| `src/domain-control.js` | 面板本机和探针共用的主机请求 / 状态文件：域名切换状态、入口域名请求 |
 | `scripts/host-entry-apply.sh` | 受限主机单元：复核请求后配置入口域名 |
 | `src/proxy.js` | `makeProxyHandler(…, steering)`：所有请求删除 `aegis_steer`；取流请求调用 `plan`；向测速对象报告响应头、字节和清单内容 |
 | `src/upstream-exchange.js` | 发往上游的每个请求：线路顺序与熔断（`activeUpstreamLine`）、统一出口一跳、请求头与凭据规则、连接与超时、故障转移、续拉重连 |

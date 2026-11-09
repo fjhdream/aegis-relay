@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { cleanAlias, randomToken } from './security.js';
 import { validateUpstreamList } from './proxy.js';
 import { dropRouteRuntime } from './upstream-exchange.js';
@@ -71,7 +72,8 @@ function ongoingDomainChange(change,liveEndpoint){
 export class Panel {
   // dataFile locates the panel machine's host request and status files (domain switch, entry domain).
   constructor({store,snapshots,localAgent,steeringHub=null,metrics=null,dataFile,publicBaseUrl='',localProxyBaseUrl='',configuredLocalDomain=''}) {
-    Object.assign(this,{store,snapshots,localAgent,steeringHub,metrics,dataFile,publicBaseUrl,localProxyBaseUrl,configuredLocalDomain});
+    Object.assign(this,{store,snapshots,localAgent,steeringHub,metrics,publicBaseUrl,localProxyBaseUrl,configuredLocalDomain});
+    this.dataDir=path.dirname(dataFile);
     // The machine a node's upstream traffic all leaves from (see egressTopology). Import keeps only known
     // machines; an explicit edit naming an unknown one is rejected.
     const knownEgressAgent=value=>{const id=String(value||'').trim().slice(0,64);return id&&this.data.agents.some(agent=>agent.id===id&&agent.state!=='revoked')?id:''};
@@ -103,7 +105,7 @@ export class Panel {
   // The panel machine serves the entry domain like every other participating machine; its host unit
   // applies the request (agents do the same from their check-in).
   syncEntry() {
-    try{followEntry({dataFile:this.dataFile,entry:desiredEntry(this.data,LOCAL_AGENT_ID)})}
+    try{followEntry({dir:this.dataDir,entry:desiredEntry(this.data,LOCAL_AGENT_ID)})}
     catch(error){console.error('[aegis] entry domain request failed',error?.message||error)}
   }
 
@@ -279,7 +281,7 @@ export class Panel {
   findAgent(id) { return this.data.agents.find(agent=>agent.id===id)||null; }
 
   localDomainStatus() {
-    const status=readDomainStatus(this.dataFile);if(!status)return null;
+    const status=readDomainStatus(this.dataDir);if(!status)return null;
     if(status.state==='active'&&status.currentDomain&&status.currentDomain!==this.configuredLocalDomain)return {...status,state:'applying',message:'Nginx 已切换，面板服务正在重新载入配置'};
     return status;
   }
@@ -329,7 +331,7 @@ export class Panel {
     // input before writing anything.
     if(domain!==undefined){
       if(local){
-        if(domain!==this.configuredLocalDomain&&!switching)requestDomainSwitch({dataFile:this.dataFile,domain,email:this.data.settings.certificateEmail,currentDomain:this.configuredLocalDomain});
+        if(domain!==this.configuredLocalDomain&&!switching)requestDomainSwitch({dir:this.dataDir,domain,email:this.data.settings.certificateEmail,currentDomain:this.configuredLocalDomain});
         else if(domain===this.configuredLocalDomain)agent.domain=domain;
       }else{
         const currentMode=agent.proxyMode||(agent.domain?'domain':'ip');
@@ -372,7 +374,7 @@ export class Panel {
     for(const machine of machines){
       const agent=data.agents.find(item=>item.id===machine.id),entry=desiredEntry(data,machine.id);
       if(!entry)continue;
-      const status=machine.local?readEntryStatus(this.dataFile):agent.entryStatus||null,current=!!status&&status.entryDomain===entry.domain&&status.peers.join(' ')===entry.peers.join(' ');
+      const status=machine.local?readEntryStatus(this.dataDir):agent.entryStatus||null,current=!!status&&status.entryDomain===entry.domain&&status.peers.join(' ')===entry.peers.join(' ');
       entryCommands.push({id:machine.id,name:machine.name,command:entryCommand(entry,machine.local),auto:agentKnows(agent,ENTRY_CAPABILITY),state:current?status.state:'waiting',message:current?status.message:'',attempt:current?status.attempt:0,updatedAt:current?status.updatedAt:''});
     }
     const routes=data.routes.map(route=>{const issues=routeSteeringIssues(data,route,settings),gaps=settings.entryDomain&&!issues.length?entryCoverageGaps(data,route,settings):[];return{id:route.id,alias:route.alias,name:route.name,enabled:route.autoSteer?.enabled===true,issues,entryGaps:gaps.map(agent=>agent.name||agent.id),entryAddress:!!steeringEntryBaseUrl(data,route),egressAgentId:route.egressAgentId||'',egressIssues:egressIssues(data,route),egressActive:!!egressTopology(data,route)}});
