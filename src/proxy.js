@@ -1,56 +1,27 @@
-import http from 'node:http';
-import https from 'node:https';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { pipeline, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import dnsPromises from 'node:dns/promises';
-import net from 'node:net';
 import { isPrivateIP } from './security.js';
-import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-auth.js';
+import { isRouteAuthKey, matchRouteChannel } from './route-auth.js';
 import { ThrottleTransform } from './metrics.js';
-import { guardedLookup } from './lookup.js';
-import { EGRESS_HEADER, EGRESS_HOST_HEADER, egressToken, itemOf, relayedEgress, stripSteerParam } from './steering.js';
-import { lineSyncAuthPath, lineSyncReply, UPSTREAM_LINES_MAX_BYTES, UPSTREAM_LINES_TIMEOUT_MS, upstreamLines } from './line-sync.js';
+import { itemOf, relayedEgress, stripSteerParam } from './steering.js';
+import { answerLineRequest, lineSyncAuthPath } from './line-sync.js';
+import { hopFree, MEDIA_REUSED_PROBATION_MS, MEDIA_STALL_TIMEOUT_MS, RELAY_HIGH_WATER_MARK, routeUpstreams, streamRewriteDomains, UpstreamExchange } from './upstream-exchange.js';
 
-// SNI carries host names only. Node 22 merely warns about an IP address there (DEP0123); newer Node
-// rejects the request outright, which broke every HTTPS upstream configured by IP.
-function tlsServername(hostname){const host=String(hostname||'').replace(/^\[|\]$/g,'');return net.isIP(host)?undefined:host;}
-const HOP = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
-const RETRY_STATUS = new Set([502, 503, 504]);
+// The relay's request policy: which node a request is for, whether it may be served (key, quota),
+// where it goes (steering, line sync, continuations), and what the client gets back (redirect and
+// stream-URL rewriting, speed limits, the invisible media resume). How a request reaches the upstream
+// is upstream-exchange.js's business.
+
 const RELAY_REDIRECT_SEGMENT = '.aegis-relay';
 // Front/back-split Emby servers hand the client a stream URL on a *different* domain than the one it
 // logged in through. We rewrite those absolute URLs in text/API responses to route through this
 // relay under a dedicated path so the client never leaves our domain, and proxy the path back to the
 // real stream domain. Only operator-declared stream hosts are ever reachable through it (SSRF guard).
 const RELAY_VOD_SEGMENT = '.aegis-vod';
-const runtime = new Map();
-// A larger socket backpressure window avoids repeatedly stopping the zero-copy pipeline after only
-// a few small chunks on high-bandwidth/high-latency routes. It is a threshold (allocated on demand),
-// not a per-connection reservation, and stays deliberately bounded for small VPSes.
-export const RELAY_HIGH_WATER_MARK=256*1024;
 export const RELAY_SERVER_OPTIONS=Object.freeze({highWaterMark:RELAY_HIGH_WATER_MARK,noDelay:true,keepAlive:true,keepAliveInitialDelay:15_000});
-// Two warm pools, so playback and control never poison each other's sockets. API/control traffic is
-// short and bursty; media bodies, HLS segments and Range seeks are long. Fresh sockets are murder on
-// startup and seek latency because every one repays TCP slow-start from a tiny congestion window
-// ("shows a few dozen KiB and can't ramp up"), so media keeps its own keep-alive pool to stay warm.
-// The invisible byte-resume net below opens a one-shot socket the moment a reused connection stalls,
-// so the specific frontends/CDNs that deliver only a few KiB on a re-used socket still recover cleanly
-// — pooling gives the fast warm-window path without ever trapping playback on a misbehaving origin.
-const API_AGENT_OPTIONS = { keepAlive:true, keepAliveMsecs:15_000, maxSockets:512, maxFreeSockets:64, maxTotalSockets:1024, timeout:75_000, scheduling:'lifo', highWaterMark:RELAY_HIGH_WATER_MARK };
-const MEDIA_AGENT_OPTIONS = { keepAlive:true, keepAliveMsecs:30_000, maxSockets:256, maxFreeSockets:48, maxTotalSockets:512, timeout:75_000, scheduling:'lifo', highWaterMark:RELAY_HIGH_WATER_MARK };
-const httpAgent = new http.Agent(API_AGENT_OPTIONS);
-const httpsAgent = new https.Agent(API_AGENT_OPTIONS);
-const httpMediaAgent = new http.Agent(MEDIA_AGENT_OPTIONS);
-const httpsMediaAgent = new https.Agent(MEDIA_AGENT_OPTIONS);
-// Clean media sockets still resume the cached TLS session, avoiding a full handshake without
-// reintroducing unsafe HTTP connection reuse. API traffic and every completed HTTPS media request
-// feed this cache.
-const TLS_SESSION_MAX=1024;
-const tlsSessions=new Map();
-function tlsSessionKey(target){ return `${target.hostname}\0${target.port||'443'}`; }
-function rememberTlsSession(key,session){ if(!key||!session)return; tlsSessions.delete(key); tlsSessions.set(key,session); if(tlsSessions.size>TLS_SESSION_MAX)tlsSessions.delete(tlsSessions.keys().next().value); }
-export function clearTlsSessions(){ tlsSessions.clear(); }
 // Who is using a node — for the operator to spot a relay that has been redistributed. The real client
 // IP comes from the X-Real-IP the fronting Nginx sets (the relay strips it before going upstream, so
 // the upstream never sees it); the device fields come from the Emby headers / auth line / query.
@@ -69,24 +40,6 @@ function accessInfoFrom(req,incoming){
     deviceId:clipText(h['x-emby-device-id']||field(/DeviceId="([^"]*)"/i)||q.get('X-Emby-Device-Id')||q.get('DeviceId')||''),
     ua:clipText(h['user-agent']||'',160) };
 }
-const CONNECT_TIMEOUT_MS=10_000;
-const RESPONSE_HEADER_TIMEOUT_MS=60_000;
-const FAILOVER_HEADER_TIMEOUT_MS=15_000;
-const PLAYBACK_HEADER_TIMEOUT_MS=45_000;
-// A WebSocket handshake answers right after connect; nothing legitimate takes this long.
-const UPGRADE_HANDSHAKE_TIMEOUT_MS=15_000;
-// Byte-addressable media can be resumed safely. Do not leave the player frozen for the previous
-// 30-second window after an origin has stopped producing bytes — but on-the-fly transcode legitimately
-// pauses for several seconds while it renders ahead, so the watchdog must be slower than a transcode
-// gap or it churns needless reconnects mid-play.
-const MEDIA_STALL_TIMEOUT_MS=15_000;
-const MEDIA_RESUME_HEADER_TIMEOUT_MS=8_000;
-// A *reused* pooled media socket is on probation: if a warm connection stalls before headers, or
-// dribbles only a few KiB before the stream has ramped up, that is the "delivers a handful of KiB then
-// hangs" frontend/CDN pathology — not a slow transcode (which is slow on a fresh socket too). Give it
-// a short leash and reconnect clean once. Fresh sockets keep the full patient windows below, so slow
-// transcode starts and paused streams are never clipped.
-const MEDIA_REUSED_PROBATION_MS=8_000;
 // The first slice of a body is the ramp-up window where "only a few dozen KiB then it won't speed up"
 // shows itself; past it a reused socket has proven healthy and reverts to the normal stall timeout.
 const MEDIA_STARTUP_BYTES=512*1024;
@@ -102,18 +55,9 @@ const MEDIA_RESUME_PROGRESS_BYTES=512*1024;
 const MEDIA_RESUME_PER_MINUTE=8;
 const MEDIA_RESUME_TOTAL_CAP=48;
 
-const strip = headers => Object.fromEntries(Object.entries(headers).filter(([k]) => !HOP.has(k.toLowerCase()) && !['cookie2','x-forwarded-host'].includes(k.toLowerCase())));
 const safeMethod = method => method === 'GET' || method === 'HEAD';
 const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const routesFrom = source => typeof source?.getRoutes==='function'?source.getRoutes():source?.data?.routes||[];
-
-export function stripAdminCredentials(headers) {
-  delete headers['x-csrf-token'];
-  if (!headers.cookie) return headers;
-  const cookies=String(headers.cookie).split(';').map(value=>value.trim()).filter(Boolean).filter(value=>!value.toLowerCase().startsWith('aegis_session='));
-  if(cookies.length)headers.cookie=cookies.join('; ');else delete headers.cookie;
-  return headers;
-}
 
 export function stripAdminSetCookies(headers) {
   const current=headers['set-cookie'];
@@ -144,11 +88,6 @@ export async function validateUpstreamList(value, allowPrivate = false) {
   const list = parseUpstreamList(value), result = [];
   for (const item of list) result.push(await validateUpstream(item, allowPrivate));
   return result;
-}
-
-function normalizedUpstreams(route) {
-  if (route.upstreams?.length) return route.upstreams;
-  return route.upstream ? [route.upstream] : [];
 }
 
 function isPlaybackPath(pathname) {
@@ -230,73 +169,10 @@ function routeFor(pathname, routes, key) {
   return { route, rest:`/${parts.slice(offset + 2).join('/')}`, suppliedKey, prefix:accessPrefix(route, suppliedKey), channelId:channel.id };
 }
 
-function stateKey(route, target) { return `${route.id || route.alias}\0${target}`; }
-// Circuit state would otherwise outlive its route forever: every delete or upstream edit left an
-// orphan entry in the map for the lifetime of the process.
-export function dropRouteRuntime(routeId) {
-  const prefix = `${routeId}\0`;
-  for (const key of runtime.keys()) if (key.startsWith(prefix)) runtime.delete(key);
-}
-function stateFor(route, target) {
-  const k = stateKey(route, target);
-  if (!runtime.has(k)) runtime.set(k, { failures:0, openUntil:0, lastError:'', lastSuccess:null });
-  return runtime.get(k);
-}
-function markSuccess(route, target) { const s=stateFor(route,target); s.failures=0; s.openUntil=0; s.lastError=''; s.lastSuccess=new Date().toISOString(); }
-function markFailure(route, target, reason) {
-  // Only trip after several consecutive genuine upstream failures. A short fuse used to open the
-  // circuit on transient blips and then serve 502s to healthy nodes, which read as instability.
-  const s=stateFor(route,target); s.failures++; s.lastError=String(reason || 'request failed').slice(0,120);
-  if (s.failures >= 4) s.openUntil=Date.now() + Math.min(120_000, 10_000 * 2 ** Math.min(s.failures - 4, 4));
-}
 // Writing to a response the client already dropped throws and would take the process down.
 function failResponse(res, status, body) {
   if (res.headersSent || res.destroyed || res.writableEnded) return;
   try { res.writeHead(status,{'cache-control':'no-store','content-type':'text/plain; charset=utf-8'}); res.end(body); } catch {}
-}
-function safeUpstreamError(error) {
-  const code=String(error?.code||''),message=String(error?.message||'').toLowerCase();
-  if(code==='ECONNREFUSED')return'上游拒绝连接，请检查地址、端口和防火墙';
-  if(code==='ENOTFOUND'||code==='EAI_AGAIN')return'上游域名解析失败';
-  if(code==='ETIMEDOUT'||message.includes('timeout'))return'上游连接超时';
-  if(code==='ECONNRESET'||message.includes('socket hang up'))return'上游提前断开连接';
-  if(code.includes('CERT')||message.includes('certificate')||message.includes('self-signed'))return'上游 TLS 证书验证失败';
-  if(code==='EPROTO'||message.includes('wrong version number')||message.includes('ssl routines'))return'上游协议不匹配，请检查 HTTP/HTTPS';
-  return'上游连接失败';
-}
-function orderedTargets(route) {
-  // Deterministic order — always prefer the primary line. Rotating upstreams per request sent a
-  // client's seeks to a different Emby server than the one holding its playback/transcode session,
-  // which showed up as long buffering and dropped streams. Extra lines are failover, not balancing.
-  const all=normalizedUpstreams(route);
-  if (!all.length) return [];
-  const available=all.filter(t=>stateFor(route,t).openUntil<=Date.now());
-  return available.length?available:all;
-}
-
-// Index of the upstream line this machine currently serves a node from. Steering only moves a session
-// to a machine on the same line, so a seek never lands on an Emby server without its transcode session.
-export function activeUpstreamLine(route) {
-  const all=normalizedUpstreams(route),now=Date.now(),index=all.findIndex(t=>stateFor(route,t).openUntil<=now);
-  return index<0?0:index;
-}
-
-export function getRuntimeStatus(routes) {
-  return routes.map(route => ({ id:route.id, alias:route.alias, upstreams:normalizedUpstreams(route).map(target=>{
-    const s=stateFor(route,target); return { target:'[encrypted upstream]', failures:s.failures, circuitOpen:s.openUntil>Date.now(), retryAt:s.openUntil?new Date(s.openUntil).toISOString():null, lastSuccess:s.lastSuccess, lastError:s.lastError };
-  }) }));
-}
-
-// Optional client-compatibility hint for upstreams you own or are authorized to proxy. This only
-// sets the declared X-Emby-* hint headers when the operator enables the profile; it deliberately
-// never rewrites the MediaBrowser auth header, the tokens, or the identity carried in query params.
-// Rewriting the authenticated Client/Device/Version desynchronizes the request from Emby's
-// token/session binding, which is exactly what broke playback on servers running device-management
-// or anti-proxy plugins — so the authenticated identity and tokens are always left untouched.
-function applyClientProfile(headers, profile = {}) {
-  if (!profile || profile.enabled !== true) return;
-  const mapping = { userAgent:'user-agent', client:'x-emby-client', deviceName:'x-emby-device-name', deviceId:'x-emby-device-id' };
-  for (const [field,header] of Object.entries(mapping)) if (profile[field]) headers[header]=profile[field];
 }
 
 function publicIndex(routes) {
@@ -305,18 +181,6 @@ function publicIndex(routes) {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>AegisRelay 节点</title><style>body{max-width:720px;margin:60px auto;padding:0 20px;background:#08111e;color:#e8eef8;font:16px system-ui}h1{color:#54d1b2}ul{padding:0}li{list-style:none;border:1px solid #24344b;border-radius:12px;padding:18px;margin:12px 0;background:#111d2e}strong,code,span{display:block;margin:5px 0}code{color:#54d1b2}span{color:#91a0b7;font-size:13px}</style><h1>AegisRelay</h1><p>可用 Emby 节点</p><ul>${cards||'<li>暂无公开展示的节点</li>'}</ul></html>`;
 }
 
-function joinTarget(target, rest, search) {
-  const base=new URL(target), left=base.pathname.replace(/\/$/,''), right=rest.startsWith('/')?rest:`/${rest}`;
-  base.pathname=`${left}${right}`.replace(/\/{2,}/g,'/'); base.search=search; return base;
-}
-
-// Operator-declared backend stream hosts for this node (host or host:port), only when the feature is
-// enabled. These are the sole domains the /.aegis-vod/ path may reach and the only ones we rewrite.
-function streamRewriteDomains(route) {
-  const sr=route&&route.streamRewrite;
-  if(!sr||sr.enabled!==true||!Array.isArray(sr.domains))return [];
-  return sr.domains.map(d=>String(d||'').trim().toLowerCase()).filter(Boolean);
-}
 // Resolve a /.aegis-vod/<scheme>/<host>/<rest> request back to the real stream domain. The scheme is
 // the upstream transport (http|https) and the host must be one the operator declared for this node —
 // anything else is rejected so the path can't be turned into an open proxy. Returns null when the
@@ -335,28 +199,22 @@ function vodTarget(found, search) {
   target.pathname='/'+seg.slice(2).join('/'); target.search=search||'';
   return {target,token};
 }
-// What the request path derives from a route: the origins that may receive the client's credentials,
-// and the stream-URL pattern (null when the feature is off). Snapshot routes (AtomicRouteSource) are
-// deep-frozen and replaced wholesale on every apply, so a frozen route is derived once instead of on
-// every request; a mutable route object is derived afresh each time.
-const derivedRoutes=new WeakMap();
-function routeDerived(route) {
-  let derived=derivedRoutes.get(route);
-  if(derived)return derived;
-  // Declared stream hosts are trusted parts of the same deployment, so keep credentials flowing to
-  // them just like the configured upstreams (the /.aegis-vod/ proxy target lives on one of these).
+// The stream-URL pattern a route derives (null when the feature is off). Snapshot routes
+// (AtomicRouteSource) are deep-frozen and replaced wholesale on every apply, so a frozen route is
+// derived once instead of on every request; a mutable route object is derived afresh each time.
+const rewritePatterns=new WeakMap();
+function rewritePattern(route) {
+  if(rewritePatterns.has(route))return rewritePatterns.get(route);
   const domains=streamRewriteDomains(route);
-  const origins=new Set([...normalizedUpstreams(route),...domains.flatMap(h=>[`https://${h}`,`http://${h}`])].map(value=>{try{return new URL(value).origin}catch{return''}}).filter(Boolean));
-  let rewrite=null;
+  let pattern=null;
   if(domains.length){
     const alt=domains.map(d=>d.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|');
     // Longest possible match: scheme + longest declared host + ":65535". Carry this many trailing chars
     // between chunks so a URL split across chunk boundaries is never mis-emitted.
-    rewrite={regex:new RegExp('(https?|wss?):\\/\\/('+alt+')(:\\d+)?(?=[/"\'?#\\\\]|$)','g'),keep:Math.max(...domains.map(d=>d.length))+16};
+    pattern={regex:new RegExp('(https?|wss?):\\/\\/('+alt+')(:\\d+)?(?=[/"\'?#\\\\]|$)','g'),keep:Math.max(...domains.map(d=>d.length))+16};
   }
-  derived={origins,rewrite};
-  if(Object.isFrozen(route))derivedRoutes.set(route,derived);
-  return derived;
+  if(Object.isFrozen(route))rewritePatterns.set(route,pattern);
+  return pattern;
 }
 // A text/manifest rewriter that turns absolute stream-domain URLs into paths on this relay, or null
 // when the feature is off or the public host is unknown. Scheme-qualified and boundary-guarded so a
@@ -481,34 +339,13 @@ function publicRequestContext(req) {
 }
 
 function cleanResponseHeaders(input) {
-  const out=strip(input); delete out.server; delete out.via; delete out['x-powered-by'];
+  const out=hopFree(input); delete out.server; delete out.via; delete out['x-powered-by'];
   stripAdminSetCookies(out);out['referrer-policy']='no-referrer'; out['x-content-type-options']='nosniff'; return out;
 }
 // Header block for a response hand-written onto a hijacked upgrade socket. Multi-value headers go out
 // one line each: joining Set-Cookie values with commas corrupts the cookies.
 function rawHeaderBlock(headers) {
   return Object.entries(headers).flatMap(([k,v])=>v===undefined?[]:(Array.isArray(v)?v:[v]).map(item=>`${k}: ${item}\r\n`)).join('');
-}
-
-// The upstream's own line list, for a node that appends it (see line-sync.js). Best effort and bounded
-// in size and time: anything off resolves to no lines, since the client's token is already accepted.
-function fetchUpstreamLines(transport, options) {
-  return new Promise(resolve=>{
-    let settled=false;
-    const done=lines=>{if(settled)return;settled=true;clearTimeout(timer);resolve(lines)};
-    const up=transport.request(options,upRes=>{
-      const encoding=String(upRes.headers['content-encoding']||'identity').toLowerCase();
-      if(upRes.statusCode!==200||encoding!=='identity'){upRes.resume();return done([])}
-      const chunks=[];let size=0;
-      upRes.on('data',chunk=>{size+=chunk.length;if(size>UPSTREAM_LINES_MAX_BYTES){up.destroy();return done([])}chunks.push(chunk)});
-      upRes.on('end',()=>done(upstreamLines(Buffer.concat(chunks))));
-      upRes.on('error',()=>done([]));
-    });
-    const timer=setTimeout(()=>{up.destroy();done([])},UPSTREAM_LINES_TIMEOUT_MS);
-    timer.unref?.();
-    up.on('error',()=>done([]));
-    up.end();
-  });
 }
 
 export function makeProxyHandler(routeSource, key, metrics = null, steering = null) {
@@ -528,13 +365,11 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     // Or the other way round: this is the egress machine, and another machine relayed the request.
     const relayed=egress?null:relayedEgress(route,req.headers,Date.now());
     // Line sync (see line-sync.js): answered here with the node's own lines once the upstream accepts
-    // the client's token, which is checked by asking for a single library item. A node that does
-    // not share its lines answers 404 like a stock Emby server, instead of passing on the upstream's.
-    // A line request relayed by another machine is that machine's to answer: it is fetching the
-    // upstream's own list, so it goes on untouched.
+    // the client's token. A node that does not share its lines answers 404 like a stock Emby server,
+    // instead of passing on the upstream's. A line request relayed by another machine is that machine's
+    // to answer: it is fetching the upstream's own list, so it goes on untouched.
     const lineRest=found.rest,lineAuth=!relayed&&req.method==='GET'&&Array.isArray(route.lines)?lineSyncAuthPath(lineRest):null;
     if (lineAuth&&!route.lines.length&&route.lineSyncUpstream!==true) { res.writeHead(404,{'cache-control':'no-store'}); return res.end('not found'); }
-    if (lineAuth) found.rest=lineAuth;
     // The steering token is addressed to this relay; it never reaches an upstream.
     const search=stripSteerParam(incoming.search);
     let continuation, vod;
@@ -546,284 +381,158 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     // CDN URLs often contain no item/session identifiers. Keep the original stream URL inside the
     // encrypted continuation so range requests and peer redirects remain one playback session.
     const playbackSource=continuation?.source||`${found.rest}${search}`;
-    const configured=egress?[egress.base]:continuation?[continuation.target.href]:vod?[vod.target.href]:orderedTargets(route);
     // A relayed request was counted, logged and quota-checked by the machine the client talks to.
     if(!relayed&&metrics&&!metrics.canServe(route)){res.writeHead(509,{'cache-control':'no-store','retry-after':'3600'});return res.end('monthly traffic quota exceeded');}
     const metricDone=relayed?null:metrics?.begin(route,{playback,bytesIn:Number(req.headers['content-length']||0)});
     // Log the viewer (IP + device) once per identifiable request, before the client IP is stripped.
     if (!relayed && metrics && (playback || hasViewerIdentity(req,incoming))) { const info=accessInfoFrom(req,incoming); if(info){ info.channelId=found.channelId||'default'; metrics.recordAccess(route,info); } }
-    if (!configured.length) { metricDone?.(502,0,true);res.writeHead(502,{'cache-control':'no-store'}); return res.end('no upstream available'); }
-    // Mirror the proven Nginx gateway: advertise the public host/scheme so the upstream builds
-    // correct redirects, but strip the client IP for privacy. A relayed request is answered for the
-    // host the client actually used, so every link it carries leads back to that machine.
+    if (!egress&&!continuation&&!vod&&!routeUpstreams(route).length) { metricDone?.(502,0,true);res.writeHead(502,{'cache-control':'no-store'}); return res.end('no upstream available'); }
+    // The upstream builds its redirects for the host the client used. A relayed request is answered for
+    // the host the client actually used, so every link it carries leads back to that machine.
     const publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req);
     // Automatic steering: serve here, or send this playback request to a peer machine's direct domain.
     const steer=playback&&!relayed&&route.steering&&steering?steering.plan({route,found,req,incoming,publicContext,source:continuation?.source?new URL(continuation.source,'http://relay.invalid'):undefined}):null;
     if (steer?.redirect) { metricDone?.(302,0,false); res.writeHead(302,{location:steer.redirect,'cache-control':'no-store','referrer-policy':'no-referrer'}); return res.end(); }
     const track=steer?.track||null;
     track?.attach(res);
-    const originalHeaders=stripAdminCredentials(strip(req.headers));
-    delete originalHeaders['x-forwarded-for']; delete originalHeaders.forwarded; delete originalHeaders['x-real-ip'];
-    delete originalHeaders[EGRESS_HEADER]; delete originalHeaders[EGRESS_HOST_HEADER];
-    if(publicContext.host)originalHeaders['x-forwarded-host']=publicContext.host;
-    originalHeaders['x-forwarded-proto']=publicContext.proto;
-    // Apply the optional client-compat header hint (owned/authorized upstreams only). Query string
-    // is relayed verbatim — we never rewrite the authenticated identity or tokens. Through an egress
-    // machine, that machine applies it.
-    if(!egress)applyClientProfile(originalHeaders,route.clientProfile);
-    if(steer?.range)originalHeaders.range=steer.range;
+    const exchange=new UpstreamExchange({route,prefix:found.prefix,egress,publicContext,clientHeaders:req.headers,method:req.method,playback});
     // Prepared only when the node opts into stream-URL rewriting; null (no effect) otherwise. We do
     // NOT touch Accept-Encoding here — the media path and every non-rewritten response keep their
     // normal compression, so playback speed on a rewrite-enabled node matches one without it.
-    const derived=routeDerived(route),rewriter=egress?null:buildStreamRewriter(derived.rewrite,publicContext,found.prefix);
-    const relaySearch=search;
-    let upstreamSearch=relaySearch;
-    if(lineAuth){
-      const query=new URLSearchParams();
-      for(const [name,value] of new URLSearchParams(relaySearch)){
-        if(['api_key','x-emby-token','x-mediabrowser-token'].includes(name.toLowerCase()))query.append(name,value);
-      }
-      query.set('Limit','1');
-      upstreamSearch=`?${query}`;
-    }
-    const canRetry=safeMethod(req.method); let finished=false, clientGone=false, activeUp=null;
+    const rewriter=egress?null:buildStreamRewriter(rewritePattern(route),publicContext,found.prefix);
     // Emby clients abort constantly (seeking, stopping, backgrounding). Nginx tears the upstream
     // down with the client; without this the upstream kept streaming into a dead socket and leaked
     // sockets and memory until the process fell over.
-    const releaseClient=()=>{ if(clientGone||res.writableFinished)return; clientGone=true; if(activeUp&&!activeUp.destroyed)activeUp.destroy(); };
+    let clientGone=false;
+    const releaseClient=()=>{ if(clientGone||res.writableFinished)return; clientGone=true; exchange.abort(); };
     res.on('close',releaseClient);
     res.on('error',()=>{});
     req.on('error',()=>{});
-
-    const routeOrigins=egress?new Set([egress.base]):derived.origins,upstreamRest=egress?`${found.prefix}${found.rest}`:found.rest;
-    const attempt=(targetValue,index,freshSocket=false)=>{
-      if (finished || clientGone) return;
-      const directTarget=(continuation&&index===0&&continuation.target)||(vod&&index===0&&vod.target)||null;
-      const target=directTarget||joinTarget(targetValue,upstreamRest,upstreamSearch), base=new URL(targetValue), requestHeaders={...originalHeaders};
-      if(egress){requestHeaders[EGRESS_HEADER]=egressToken(route,Date.now());if(publicContext.host)requestHeaders[EGRESS_HOST_HEADER]=publicContext.host;}
-      requestHeaders.host=target.host;
-      if (!routeOrigins.has(target.origin)) { delete requestHeaders.authorization; delete requestHeaders.cookie; delete requestHeaders['x-emby-token']; }
-      const secure=target.protocol==='https:';
-      // A failover/stale-socket retry (freshSocket) forces a clean one-shot socket; otherwise media
-      // rides its own warm pool and control traffic rides the API pool. Keeping the two pools apart
-      // means a long media body can never inherit — or hand off — a poisoned API socket.
-      const pool=freshSocket?null:(playback?(secure?httpsMediaAgent:httpMediaAgent):(secure?httpsAgent:httpAgent));
-      const usesPool=!!pool;
-      requestHeaders.connection=usesPool?'keep-alive':'close';
-      const tlsKey=secure?tlsSessionKey(target):'';
-      const options={protocol:target.protocol,hostname:target.hostname,port:target.port,method:req.method,path:target.pathname+target.search,headers:requestHeaders,servername:tlsServername(target.hostname),rejectUnauthorized:egress?true:route.tlsVerify!==false,lookup:guardedLookup(egress?false:route.allowPrivate),highWaterMark:RELAY_HIGH_WATER_MARK,agent:pool||false};
-      // Pooled agents handle TLS resumption themselves. The one-shot recovery/failover sockets fall
-      // back to the shared session cache so even a fresh connection skips the full handshake.
-      if(secure&&!usesPool){ const sess=tlsSessions.get(tlsKey); if(sess)options.session=sess; }
-      // Short guard for the TCP connect only; once connected, allow a long idle window so slow
-      // transcode starts and paused streams are not killed (Nginx uses proxy_read_timeout 3600s).
-      const up=(target.protocol==='https:'?https:http).request(options,upRes=>{
-        clearTimeout(connectTimer);
-        const status=upRes.statusCode||502;
-        if (canRetry && RETRY_STATUS.has(status) && index+1<configured.length) { markFailure(route,targetValue,`HTTP ${status}`); upRes.resume(); return attempt(configured[index+1],index+1); }
-        if(RETRY_STATUS.has(status))markFailure(route,targetValue,`HTTP ${status}`);else markSuccess(route,targetValue);
-        if(lineAuth){
-          finished=true;upRes.resume();
-          const answer=(extra=[])=>{
-            if(res.destroyed||res.headersSent){metricDone?.(status,0,false);return;}
-            const primaryUpstream=route.lineSyncUpstream===true?normalizedUpstreams(route)[0]:undefined;
-            const reply=lineSyncReply(status,route.lines,found.prefix,extra,primaryUpstream);
-            metricDone?.(reply.status,reply.body.length,reply.status>=500);res.writeHead(reply.status,reply.headers);res.end(reply.body);
-          };
-          // The upstream's own lines are asked for only once it has accepted the token, on the same
-          // upstream (or through the same egress machine) and with the client's own request.
-          if(status!==200||route.lineSyncUpstream!==true||res.destroyed)return answer();
-          const linesTarget=joinTarget(targetValue,egress?`${found.prefix}${lineRest}`:lineRest,relaySearch);
-          const linesHeaders={...requestHeaders,'accept-encoding':'identity'};
-          if(egress)linesHeaders[EGRESS_HEADER]=egressToken(route,Date.now());
-          return void fetchUpstreamLines(target.protocol==='https:'?https:http,{...options,path:linesTarget.pathname+linesTarget.search,headers:linesHeaders}).then(answer);
-        }
-        const out=cleanResponseHeaders(upRes.headers);
-        // The egress machine already built its links for this machine's public host.
-        if (out.location && !egress) {
-          try {
-            const loc=new URL(out.location,target);
-            if(!['http:','https:'].includes(loc.protocol)||loc.username||loc.password)delete out.location;
-            else if(!continuation&&!vod&&loc.origin===base.origin){
-              const redirectedPath=externalRedirectPath(loc,base);
-              // Keep ordinary login/navigation redirects readable. A redirect outside the configured
-              // upstream base is wrapped below so the client must return through this relay.
-              out.location=redirectedPath===null?publicRelayLocation(found,loc,publicContext,key,playback,playbackSource):(publicContext.host?`${publicContext.proto}://${publicContext.host}${found.prefix}${redirectedPath}${loc.search}${loc.hash}`:`${found.prefix}${redirectedPath}${loc.search}${loc.hash}`);
-            }
-            else out.location=publicRelayLocation(found,loc,publicContext,key,playback,playbackSource);
-          }
-          catch { delete out.location; }
-        }
-        finished=true;track?.headers(status,out);
-        if (res.destroyed || res.headersSent) { up.destroy(); metricDone?.(status,0,false); return; }
-        const speed=Number(route.speedLimitMbps||0);
-        let measured=false,streamed=0;
-        const finishMetric=(failed=false)=>{if(measured)return;measured=true;metricDone?.(status,metricDone?.addBytes?0:streamed,failed||status>=500)};
-        // pipeline (unlike .pipe) tears every stream down on failure and never leaves a dangling
-        // half-open response. Short API responses return to the API pool; media responses are
-        // intentionally one-shot so the next segment/seek cannot inherit a poisoned connection.
-        // pipe upRes through any transforms, then to the client. `stages` is [source, ...transforms];
-        // nothing is ever fully buffered, so the client starts receiving bytes immediately.
-        const deliver=(...stages)=>{
-          res.writeHead(status,out);
-          res.flushHeaders?.();
-          const done=err=>{ if(err&&!up.destroyed)up.destroy(); finishMetric(); };
-          const tail=stages[stages.length-1];
-          if(speed>0){
-            const counter=new ThrottleTransform(speed*1024*1024/8,bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes);track?.bytes(bytes)});
-            pipeline(...stages,counter,res,done);
-          }else{
-            // No rate limit means no throttling transform. Count bytes off the last stage (what the
-            // client actually receives) with a listener instead of parking a transform in the path.
-            // Attach pipeline first: adding a data listener puts a pre-buffered IncomingMessage into
-            // flowing mode, so the destination must already be subscribed before accounting begins.
-            pipeline(...stages,res,done);
-            tail.on('data',chunk=>{streamed+=chunk.length;metricDone?.addBytes?.(chunk.length);track?.bytes(chunk.length)});
-          }
-        };
-        const openResume=(plan,next)=>new Promise((resolve,reject)=>{
-          const resumeHeaders={...requestHeaders,range:`bytes=${next}-${plan.end}`,connection:'close'};
-          if(egress)resumeHeaders[EGRESS_HEADER]=egressToken(route,Date.now());
-          delete resumeHeaders['if-none-match'];delete resumeHeaders['if-modified-since'];
-          if(plan.validator)resumeHeaders['if-range']=plan.validator;
-          const resumeOptions={...options,method:'GET',headers:resumeHeaders,agent:false};
-          if(secure){const sess=tlsSessions.get(tlsKey);if(sess)resumeOptions.session=sess;}
-          let settled=false,connectGuard,headerGuard;
-          const fail=error=>{clearTimeout(connectGuard);clearTimeout(headerGuard);if(settled)return;settled=true;reject(error)};
-          const resumeReq=(target.protocol==='https:'?https:http).request(resumeOptions,resumeRes=>{
-            clearTimeout(connectGuard);clearTimeout(headerGuard);
-            const resumeStatus=resumeRes.statusCode||0,resumeHeadersOut=cleanResponseHeaders(resumeRes.headers);
-            if(!compatibleResume(resumeStatus,resumeHeadersOut,plan,next)){
-              resumeRes.destroy();return fail(Object.assign(new Error('upstream rejected byte resume'),{code:'ERESUMEREJECTED'}));
-            }
-            settled=true;activeUp=resumeReq;resolve(resumeRes);
-          });
-          activeUp=resumeReq;
-          connectGuard=setTimeout(()=>resumeReq.destroy(timeoutError('resume connect timeout')),CONNECT_TIMEOUT_MS);
-          headerGuard=setTimeout(()=>resumeReq.destroy(timeoutError('resume headers timeout')),MEDIA_RESUME_HEADER_TIMEOUT_MS);
-          connectGuard.unref?.();headerGuard.unref?.();
-          resumeReq.on('socket',socket=>{
-            socket.setNoDelay(true);socket.setKeepAlive(true,15_000);
-            if(secure&&socket.connecting)socket.on('session',session=>rememberTlsSession(tlsKey,session));
-            if(socket.connecting)socket.once(secure?'secureConnect':'connect',()=>clearTimeout(connectGuard));else clearTimeout(connectGuard);
-          });
-          resumeReq.setTimeout(MEDIA_STALL_TIMEOUT_MS,()=>resumeReq.destroy(timeoutError('resumed media stalled')));
-          resumeReq.on('error',fail);resumeReq.end();
-        });
-        const deliverResumable=(source,plan)=>{
-          res.writeHead(status,out);res.flushHeaders?.();
-          // Only watchdog a byte-addressable body. During downstream backpressure pumpMedia disables
-          // this timer, so a paused/slow viewer is not mistaken for a dead origin. The original leg may
-          // be a warm pooled socket: give it the short probation leash until the stream ramps past the
-          // startup window, so "a few dozen KiB then it hangs" is evicted fast and re-fetched clean.
-          // openResume always dials a fresh clean socket, so resume legs keep the full stall timeout.
-          const sourceReused=up.reusedSocket===true;
-          const sourceStall=()=>(sourceReused&&streamed<MEDIA_STARTUP_BYTES)?MEDIA_REUSED_PROBATION_MS:MEDIA_STALL_TIMEOUT_MS;
-          const onBytes=bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes);track?.bytes(bytes)};
-          const run=async()=>{
-            let current=source,isSource=true,retries=0,lastError=null,marker=streamed,totalResumes=0;
-            const resumeTimes=[];
-            while(!clientGone&&!res.destroyed&&streamed<plan.length){
-              if(current){
-                try{await pumpMedia(current,res,onBytes,isSource?sourceStall:MEDIA_STALL_TIMEOUT_MS);lastError=null;}
-                catch(error){lastError=error;}
-                current=null;isSource=false;
-              }
-              if(streamed>=plan.length)break;
-              // Refund the no-progress budget only after real progress (>=512 KiB), so an origin
-              // dribbling a few bytes per socket cannot keep buying it back; a long movie with scattered
-              // real stalls still never runs out and drops the stream.
-              if(streamed-marker>=MEDIA_RESUME_PROGRESS_BYTES){retries=0;marker=streamed;}
-              const nowMs=Date.now();
-              while(resumeTimes.length&&nowMs-resumeTimes[0]>=60_000)resumeTimes.shift();
-              // Any hard rail hit means the origin is pathological — break to the terminal branch, which
-              // destroys the response so the player sees a real disconnect and reconnects, never a fake
-              // completed end.
-              if(retries>=MEDIA_RESUME_ATTEMPTS||totalResumes>=MEDIA_RESUME_TOTAL_CAP||resumeTimes.length>=MEDIA_RESUME_PER_MINUTE)break;
-              const next=plan.start+streamed;retries++;totalResumes++;resumeTimes.push(nowMs);
-              try{current=await openResume(plan,next);markSuccess(route,targetValue);}
-              catch(error){lastError=error;}
-            }
-            if(clientGone||res.destroyed){finishMetric();return;}
-            if(streamed===plan.length){res.end();finishMetric();return;}
-            const error=lastError||Object.assign(new Error('upstream media ended before content-length'),{code:'ECONNRESET'});
-            markFailure(route,targetValue,safeUpstreamError(error));finishMetric(true);
-            if(!res.destroyed)res.destroy(error);
-          };
-          run().catch(error=>{markFailure(route,targetValue,safeUpstreamError(error));finishMetric(true);if(!res.destroyed)res.destroy(error)});
-        };
-        // The stream-URL rewrite only touches API bodies and explicit HLS/DASH manifests. Every other
-        // playback response is passed straight through, including non-Range HTTP 200 bodies with a
-        // wrong text/JSON MIME type. The rewrite itself streams and decompresses on the fly.
-        const enc=out['content-encoding'];
-        const rewriteBody=!!rewriter&&shouldRewriteStreamBody({method:req.method,status,headers:{...out,range:req.headers.range},playback,pathname:target.pathname});
-        const gunzip=rewriteBody?decompressor(enc):null;
-        if (rewriteBody && gunzip!==undefined) {
-          // Length and encoding change as we rewrite/decompress, so drop them and let the response chunk.
-          delete out['content-encoding']; delete out['content-length'];
-          const rewrite=new StreamRewrite(rewriter);
-          // pipeline (inside deliver) tears every stage down together if the decoder hits a mislabeled
-          // body, so a bad response fails cleanly instead of stalling.
-          deliver(...(gunzip?[upRes,gunzip,rewrite]:[upRes,rewrite]));
-        } else {
-          const resumePlan=playback&&speed<=0?mediaResumePlan(req.method,status,out):null;
-          if(resumePlan)deliverResumable(upRes,resumePlan);else deliver(upRes);
-        }
-        // Read the HLS segment length off the playlist as it passes (after delivery is wired, so the
-        // listener never switches the body into flowing mode ahead of the client).
-        if(track?.kind==='manifest'&&status===200)track.manifest(upRes,enc);
-        if(!playback&&!relayed)steering?.observePlaybackInfo?.(req,incoming,found,upRes);
-      });
-      activeUp=up;
-      const timeoutError=(message,extra)=>Object.assign(new Error(message),{code:'ETIMEDOUT'},extra);
-      const connectTimer=setTimeout(()=>up.destroy(timeoutError('connect timeout')),CONNECT_TIMEOUT_MS);
-      connectTimer.unref?.();
-      // The header wait is armed once the socket is assigned, because only then is up.reusedSocket
-      // known. A reused pooled media socket (client sent a Range) is on probation: no headers within
-      // the short leash means a poisoned pooled connection, re-fetched clean once. A fresh socket keeps
-      // the full patient window so a slow transcode start is never clipped.
-      const clientRange=!!req.headers.range;
-      let headerTimer=null;
-      const armHeaderTimer=()=>{
-        const reusedProbation=playback&&clientRange&&up.reusedSocket===true;
-        const ms=reusedProbation?MEDIA_REUSED_PROBATION_MS:(playback?PLAYBACK_HEADER_TIMEOUT_MS:(configured.length>1?FAILOVER_HEADER_TIMEOUT_MS:RESPONSE_HEADER_TIMEOUT_MS));
-        headerTimer=setTimeout(()=>up.destroy(timeoutError('response headers timeout',reusedProbation?{reusedProbation:true}:null)),ms);
-        headerTimer.unref?.();
-      };
-      up.on('response',()=>{clearTimeout(connectTimer);clearTimeout(headerTimer)});
-      up.on('socket',s=>{
-        s.setNoDelay(true);s.setKeepAlive(true,15_000);
-        armHeaderTimer();
-        if(!s.connecting)return clearTimeout(connectTimer);
-        // Capture TLS session tickets from every new connection (API and media) so later unpooled
-        // playback sockets to the same origin can resume instead of doing a full handshake.
-        if(secure)s.on('session',sess=>rememberTlsSession(tlsKey,sess));
-        // TCP connect is not enough for HTTPS: keep the guard running until the TLS handshake has
-        // completed, otherwise a stalled secureConnect can hold playback for the full idle timeout.
-        s.once(secure?'secureConnect':'connect',()=>clearTimeout(connectTimer));
-      });
-      up.setTimeout(3600_000,()=>up.destroy(new Error('upstream idle timeout')));
-      up.on('error',err=>{
-        clearTimeout(connectTimer);clearTimeout(headerTimer);
-        // A client that walked away is not an upstream fault; counting it opened circuits on
-        // perfectly healthy nodes and produced sporadic 502s mid-session.
-        if (clientGone) { if(!finished){finished=true;metricDone?.(499,0,false);} return; }
-        // Precisely the two ways a *reused* pooled socket fails before headers: the origin had already
-        // half-closed it (reset/broken pipe on reuse), or it stayed silent past the short probation
-        // leash. Either is a poisoned pooled connection — re-fetch once on a clean same-line socket.
-        // Everything else (a fresh socket's error, or a plain timeout on a socket that was never
-        // reused) is a slow or dead line, not a stale connection: do not burn a second window retrying
-        // the exact same thing. `usesPool` alone is not proof of reuse — a pool's first socket is new.
-        const resettable=err.code==='ECONNRESET'||err.code==='EPIPE';
-        const staleSocket=(( up.reusedSocket===true&&resettable )||err.reusedProbation===true)&&!freshSocket&&!finished&&canRetry&&!res.headersSent;
-        if (staleSocket) return attempt(targetValue,index,true);
-        const reason=safeUpstreamError(err);markFailure(route,targetValue,reason);
-        if (canRetry && index+1<configured.length) return attempt(configured[index+1],index+1);
-        if (!finished) { finished=true;metricDone?.(502,0,true);failResponse(res,502,`Bad Gateway\n${reason}`); }
-      });
-      if (canRetry) up.end(); else {pipeline(req,up,()=>{});if(!relayed)steering?.observeProgress?.(req,incoming,found);}
+    // No line answered at all: say why, unless the client has already gone.
+    const unanswered=error=>{
+      if(error?.aborted){metricDone?.(499,0,false);return;}
+      metricDone?.(502,0,true);failResponse(res,502,`Bad Gateway\n${error?.reason||'上游连接失败'}`);
     };
-    attempt(configured[0],0);
+    if(lineAuth){
+      let reply;
+      try { reply=await answerLineRequest({exchange,route,prefix:found.prefix,authRest:lineAuth,lineRest,search}); }
+      catch(error) { return unanswered(error); }
+      if(res.destroyed||res.headersSent){metricDone?.(reply.status,0,false);return;}
+      metricDone?.(reply.status,reply.body.length,reply.status>=500);res.writeHead(reply.status,reply.headers);return res.end(reply.body);
+    }
+    let upstream;
+    try {
+      const opening=exchange.open({rest:found.rest,search,target:continuation?.target||vod?.target||null,headers:steer?.range?{range:steer.range}:null,body:safeMethod(req.method)?null:req});
+      if(!safeMethod(req.method)&&!relayed)steering?.observeProgress?.(req,incoming,found);
+      upstream=await opening;
+    } catch(error) { return unanswered(error); }
+    const status=upstream.status,target=upstream.target,base=new URL(upstream.line),upRes=upstream.body;
+    const out=cleanResponseHeaders(upstream.headers);
+    // The egress machine already built its links for this machine's public host.
+    if (out.location && !egress) {
+      try {
+        const loc=new URL(out.location,target);
+        if(!['http:','https:'].includes(loc.protocol)||loc.username||loc.password)delete out.location;
+        else if(!continuation&&!vod&&loc.origin===base.origin){
+          const redirectedPath=externalRedirectPath(loc,base);
+          // Keep ordinary login/navigation redirects readable. A redirect outside the configured
+          // upstream base is wrapped below so the client must return through this relay.
+          out.location=redirectedPath===null?publicRelayLocation(found,loc,publicContext,key,playback,playbackSource):(publicContext.host?`${publicContext.proto}://${publicContext.host}${found.prefix}${redirectedPath}${loc.search}${loc.hash}`:`${found.prefix}${redirectedPath}${loc.search}${loc.hash}`);
+        }
+        else out.location=publicRelayLocation(found,loc,publicContext,key,playback,playbackSource);
+      }
+      catch { delete out.location; }
+    }
+    track?.headers(status,out);
+    if (res.destroyed || res.headersSent) { upstream.destroy(); metricDone?.(status,0,false); return; }
+    const speed=Number(route.speedLimitMbps||0);
+    let measured=false,streamed=0;
+    const finishMetric=(failed=false)=>{if(measured)return;measured=true;metricDone?.(status,metricDone?.addBytes?0:streamed,failed||status>=500)};
+    // pipeline (unlike .pipe) tears every stream down on failure and never leaves a dangling
+    // half-open response. Short API responses return to the API pool; media responses are
+    // intentionally one-shot so the next segment/seek cannot inherit a poisoned connection.
+    // pipe upRes through any transforms, then to the client. `stages` is [source, ...transforms];
+    // nothing is ever fully buffered, so the client starts receiving bytes immediately.
+    const deliver=(...stages)=>{
+      res.writeHead(status,out);
+      res.flushHeaders?.();
+      const done=err=>{ if(err)upstream.destroy(); finishMetric(); };
+      const tail=stages[stages.length-1];
+      if(speed>0){
+        const counter=new ThrottleTransform(speed*1024*1024/8,bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes);track?.bytes(bytes)});
+        pipeline(...stages,counter,res,done);
+      }else{
+        // No rate limit means no throttling transform. Count bytes off the last stage (what the
+        // client actually receives) with a listener instead of parking a transform in the path.
+        // Attach pipeline first: adding a data listener puts a pre-buffered IncomingMessage into
+        // flowing mode, so the destination must already be subscribed before accounting begins.
+        pipeline(...stages,res,done);
+        tail.on('data',chunk=>{streamed+=chunk.length;metricDone?.addBytes?.(chunk.length);track?.bytes(chunk.length)});
+      }
+    };
+    const deliverResumable=(source,plan)=>{
+      res.writeHead(status,out);res.flushHeaders?.();
+      // Only watchdog a byte-addressable body. During downstream backpressure pumpMedia disables
+      // this timer, so a paused/slow viewer is not mistaken for a dead origin. The original leg may
+      // be a warm pooled socket: give it the short probation leash until the stream ramps past the
+      // startup window, so "a few dozen KiB then it hangs" is evicted fast and re-fetched clean.
+      // A reopened leg always dials a fresh clean socket, so it keeps the full stall timeout.
+      const sourceReused=upstream.reusedSocket;
+      const sourceStall=()=>(sourceReused&&streamed<MEDIA_STARTUP_BYTES)?MEDIA_REUSED_PROBATION_MS:MEDIA_STALL_TIMEOUT_MS;
+      const onBytes=bytes=>{streamed+=bytes;metricDone?.addBytes?.(bytes);track?.bytes(bytes)};
+      const run=async()=>{
+        let current=source,isSource=true,retries=0,lastError=null,marker=streamed,totalResumes=0;
+        const resumeTimes=[];
+        while(!clientGone&&!res.destroyed&&streamed<plan.length){
+          if(current){
+            try{await pumpMedia(current,res,onBytes,isSource?sourceStall:MEDIA_STALL_TIMEOUT_MS);lastError=null;}
+            catch(error){lastError=error;}
+            current=null;isSource=false;
+          }
+          if(streamed>=plan.length)break;
+          // Refund the no-progress budget only after real progress (>=512 KiB), so an origin
+          // dribbling a few bytes per socket cannot keep buying it back; a long movie with scattered
+          // real stalls still never runs out and drops the stream.
+          if(streamed-marker>=MEDIA_RESUME_PROGRESS_BYTES){retries=0;marker=streamed;}
+          const nowMs=Date.now();
+          while(resumeTimes.length&&nowMs-resumeTimes[0]>=60_000)resumeTimes.shift();
+          // Any hard rail hit means the origin is pathological — break to the terminal branch, which
+          // destroys the response so the player sees a real disconnect and reconnects, never a fake
+          // completed end.
+          if(retries>=MEDIA_RESUME_ATTEMPTS||totalResumes>=MEDIA_RESUME_TOTAL_CAP||resumeTimes.length>=MEDIA_RESUME_PER_MINUTE)break;
+          const next=plan.start+streamed;retries++;totalResumes++;resumeTimes.push(nowMs);
+          try{current=await upstream.reopen({from:next,to:plan.end,validator:plan.validator,accept:(resumeStatus,headers)=>compatibleResume(resumeStatus,cleanResponseHeaders(headers),plan,next)});}
+          catch(error){lastError=error;}
+        }
+        if(clientGone||res.destroyed){finishMetric();return;}
+        if(streamed===plan.length){res.end();finishMetric();return;}
+        const error=lastError||Object.assign(new Error('upstream media ended before content-length'),{code:'ECONNRESET'});
+        upstream.failed(error);finishMetric(true);
+        if(!res.destroyed)res.destroy(error);
+      };
+      run().catch(error=>{upstream.failed(error);finishMetric(true);if(!res.destroyed)res.destroy(error)});
+    };
+    // The stream-URL rewrite only touches API bodies and explicit HLS/DASH manifests. Every other
+    // playback response is passed straight through, including non-Range HTTP 200 bodies with a
+    // wrong text/JSON MIME type. The rewrite itself streams and decompresses on the fly.
+    const enc=out['content-encoding'];
+    const rewriteBody=!!rewriter&&shouldRewriteStreamBody({method:req.method,status,headers:{...out,range:req.headers.range},playback,pathname:target.pathname});
+    const gunzip=rewriteBody?decompressor(enc):null;
+    if (rewriteBody && gunzip!==undefined) {
+      // Length and encoding change as we rewrite/decompress, so drop them and let the response chunk.
+      delete out['content-encoding']; delete out['content-length'];
+      const rewrite=new StreamRewrite(rewriter);
+      // pipeline (inside deliver) tears every stage down together if the decoder hits a mislabeled
+      // body, so a bad response fails cleanly instead of stalling.
+      deliver(...(gunzip?[upRes,gunzip,rewrite]:[upRes,rewrite]));
+    } else {
+      const resumePlan=playback&&speed<=0?mediaResumePlan(req.method,status,out):null;
+      if(resumePlan)deliverResumable(upRes,resumePlan);else deliver(upRes);
+    }
+    // Read the HLS segment length off the playlist as it passes (after delivery is wired, so the
+    // listener never switches the body into flowing mode ahead of the client).
+    if(track?.kind==='manifest'&&status===200)track.manifest(upRes,enc);
+    if(!playback&&!relayed)steering?.observePlaybackInfo?.(req,incoming,found,upRes);
   };
 }
 
@@ -835,28 +544,16 @@ export function handleUpgrade(req, socket, head, routeSource, key) {
   // A rewritten live socket (wss://…/.aegis-vod/<host>/…) tunnels straight to the declared stream
   // host; otherwise use the node's primary upstream. An unknown/blocked stream host is dropped.
   let vod; if(!egress){ try { vod=vodTarget(found,relaySearch); } catch { return socket.destroy(); } }
-  const targets=egress?[egress.base]:vod?[vod.target.href]:orderedTargets(found.route); if(!targets.length)return socket.destroy();
-  const target=vod?vod.target:joinTarget(targets[0],egress?`${found.prefix}${found.rest}`:found.rest,relaySearch), publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req), headers=stripAdminCredentials(strip(req.headers));
-  delete headers['x-forwarded-for']; delete headers.forwarded; delete headers['x-real-ip']; delete headers[EGRESS_HEADER]; delete headers[EGRESS_HOST_HEADER];
-  if(egress){headers[EGRESS_HEADER]=egressToken(found.route,Date.now());if(publicContext.host)headers[EGRESS_HOST_HEADER]=publicContext.host;}
-  else applyClientProfile(headers,found.route.clientProfile);
-  if(publicContext.host)headers['x-forwarded-host']=publicContext.host; headers['x-forwarded-proto']=publicContext.proto;
-  headers.host=target.host; headers.connection='Upgrade'; headers.upgrade=req.headers.upgrade;
-  const transport=target.protocol==='https:'?https:http;
-  // agent:false — an upgraded socket is hijacked for the WebSocket and must never return to a pool.
-  const up=transport.request({protocol:target.protocol,hostname:target.hostname,port:target.port,path:target.pathname+target.search,headers,servername:tlsServername(target.hostname),rejectUnauthorized:egress?true:found.route.tlsVerify!==false,lookup:guardedLookup(egress?false:found.route.allowPrivate),agent:false});
+  if(!egress&&!vod&&!routeUpstreams(found.route).length)return socket.destroy();
+  const publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req);
+  const exchange=new UpstreamExchange({route:found.route,prefix:found.prefix,egress,publicContext,clientHeaders:req.headers,method:req.method});
+  const up=exchange.upgrade({rest:found.rest,search:relaySearch,target:vod?.target||null,protocol:req.headers.upgrade});
   // Unhandled socket errors on either leg would surface as an uncaught exception and restart the
   // whole relay, and a client that vanished used to leave the upstream socket open forever.
   let clientGone=false;
   socket.on('error',()=>socket.destroy());
-  socket.on('close',()=>{clientGone=true;if(!up.destroyed)up.destroy()});
-  // A dead or silent origin would otherwise hold the client's socket open until the OS gave up.
-  const handshake=setTimeout(()=>up.destroy(Object.assign(new Error('upgrade handshake timeout'),{code:'ETIMEDOUT'})),UPGRADE_HANDSHAKE_TIMEOUT_MS);
-  handshake.unref?.();
-  up.on('close',()=>clearTimeout(handshake));
+  socket.on('close',()=>{clientGone=true;exchange.abort()});
   up.on('upgrade',(r,s,h)=>{
-    clearTimeout(handshake);
-    markSuccess(found.route,targets[0]);
     s.on('error',()=>s.destroy());
     if(clientGone||socket.destroyed)return s.destroy();
     const out={...cleanResponseHeaders(r.headers),connection:'Upgrade'};if(r.headers.upgrade)out.upgrade=r.headers.upgrade;
@@ -871,12 +568,10 @@ export function handleUpgrade(req, socket, head, routeSource, key) {
   // listener Node silently discards it and the client is left hanging with no reply at all, so relay
   // the status and body, then close.
   up.on('response',r=>{
-    clearTimeout(handshake);
-    if(RETRY_STATUS.has(r.statusCode))markFailure(found.route,targets[0],`HTTP ${r.statusCode}`);else markSuccess(found.route,targets[0]);
     if(clientGone||socket.destroyed)return r.destroy();
     socket.write(`HTTP/1.1 ${r.statusCode} ${r.statusMessage||''}\r\n${rawHeaderBlock({...cleanResponseHeaders(r.headers),connection:'close'})}\r\n`);
     r.on('error',()=>socket.destroy());
     r.pipe(socket);
   });
-  up.on('error',err=>{if(!clientGone)markFailure(found.route,targets[0],err.message);socket.destroy()});up.end();
+  up.on('error',()=>socket.destroy());up.end();
 }

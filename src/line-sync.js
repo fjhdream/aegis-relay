@@ -1,4 +1,5 @@
 import { agentEntryUrl, LOCAL_AGENT_ID } from './agent-registry.js';
+import { routeUpstreams } from './upstream-exchange.js';
 
 // Line sync: Emby clients that support "extension lines" ask the server they were configured with for
 // every other address of it, at GET /emby/System/Ext/ServerDomains (the convention of
@@ -15,8 +16,10 @@ const LINE_PATH=/^(\/emby)?\/system\/ext\/serverdomains\/?$/i;
 const UPSTREAM_LINE_PREFIX='上游·';
 const UPSTREAM_URL_MAX=2048;
 // The upstream's own list is fetched after the token check and must not hold the reply up for long.
-export const UPSTREAM_LINES_TIMEOUT_MS=3000;
-export const UPSTREAM_LINES_MAX_BYTES=64*1024;
+const UPSTREAM_LINES_TIMEOUT_MS=3000;
+const UPSTREAM_LINES_MAX_BYTES=64*1024;
+// The query parameters that carry the client's Emby token; the token check passes on only these.
+const TOKEN_PARAMS=['api_key','x-emby-token','x-mediabrowser-token'];
 
 export function lineSyncEnabled(route) {
   return route?.lineSync!==false;
@@ -119,4 +122,39 @@ export function lineSyncReply(upstreamStatus, lines, prefix, upstream=[], primar
   else{status=502;payload={error:'Upstream unavailable',ok:false};}
   const body=Buffer.from(JSON.stringify(payload));
   return {status,headers:{...JSON_HEADERS,'content-length':String(body.length)},body};
+}
+
+// The upstream's own line list, for a node that appends it. Best effort and bounded in size and time:
+// anything off reads as no lines, since the client's token has already been accepted.
+async function fetchUpstreamLines(exchange, {rest, search, line}) {
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),UPSTREAM_LINES_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const response=await exchange.open({rest,search,line,headers:{'accept-encoding':'identity'},signal:controller.signal});
+    const encoding=String(response.headers['content-encoding']||'identity').toLowerCase();
+    if(response.status!==200||encoding!=='identity'){response.body.resume();return [];}
+    const chunks=[];let size=0;
+    for await(const chunk of response.body){
+      size+=chunk.length;
+      if(size>UPSTREAM_LINES_MAX_BYTES){response.destroy();return [];}
+      chunks.push(chunk);
+    }
+    return upstreamLines(Buffer.concat(chunks));
+  } catch { return []; }
+  finally { clearTimeout(timer); }
+}
+
+// The whole line request, over the node's upstream exchange. The client's token is checked by asking
+// for a single library item with only the token parameters; the upstream's own list, if the node shares
+// it, is asked for on the line that accepted the token, with the client's own query. Rejects like
+// exchange.open() when no line answers at all.
+export async function answerLineRequest({exchange, route, prefix, authRest, lineRest, search}) {
+  const query=new URLSearchParams();
+  for(const [name,value] of new URLSearchParams(search))if(TOKEN_PARAMS.includes(name.toLowerCase()))query.append(name,value);
+  query.set('Limit','1');
+  const auth=await exchange.open({rest:authRest,search:`?${query}`});
+  auth.body.resume();
+  const shareUpstream=route.lineSyncUpstream===true;
+  const extra=auth.status===200&&shareUpstream?await fetchUpstreamLines(exchange,{rest:lineRest,search,line:auth.line}):[];
+  return lineSyncReply(auth.status,route.lines,prefix,extra,shareUpstream?routeUpstreams(route)[0]:undefined);
 }

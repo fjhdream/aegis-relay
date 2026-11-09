@@ -497,7 +497,8 @@ mac   = HMAC-SHA256(steerKey, "token\n" ‖ 前面各字段)[0:16]
 | `src/steering-topology.js` | 设置的规范化、机器/节点能否参与及原因、快照拓扑（含统一出口）、入口域名地址与各机器的入口配置 |
 | `src/domain-control.js` | 面板本机的入口域名请求文件 |
 | `scripts/host-entry-apply.sh` | 受限主机单元：复核请求后配置入口域名 |
-| `src/proxy.js` | `makeProxyHandler(…, steering)`：所有请求删除 `aegis_steer`；取流请求调用 `plan`；向测速对象报告响应头、字节和清单内容；`activeUpstreamLine` |
+| `src/proxy.js` | `makeProxyHandler(…, steering)`：所有请求删除 `aegis_steer`；取流请求调用 `plan`；向测速对象报告响应头、字节和清单内容 |
+| `src/upstream-exchange.js` | 发往上游的每个请求：线路顺序与熔断（`activeUpstreamLine`）、统一出口一跳、请求头与凭据规则、连接与超时、故障转移、续拉重连 |
 | `src/desired-snapshots.js` | 每台机器的期望快照：重新编译、按内容比对、只通知变了的机器 |
 | `src/agent-api.js` | `POST /api/agent/v1/steering`；注册时、以及 check-in 上报的机器档案变化时刷新期望快照 |
 | `src/agent-main.js` | 声明 `steering-v1`、`entry-v1`、`egress-v1`，运行引擎和同步循环，跟随面板下发的入口配置 |
