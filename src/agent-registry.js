@@ -1,4 +1,12 @@
+import { STEERING_CAPABILITY } from './steering.js';
+
 export const LOCAL_AGENT_ID = 'local';
+
+// Whether a machine runs a feature it declared as a capability. The panel machine runs this very
+// build, so it knows every one.
+export function agentKnows(agent, capability) {
+  return agent?.id===LOCAL_AGENT_ID||(Array.isArray(agent?.capabilities)&&agent.capabilities.includes(capability));
+}
 
 const iso = value => {
   const date = new Date(value || 0);
@@ -111,7 +119,7 @@ export function publicAgent(agent, data, runtime=null, now=Date.now()) {
     applyState:runtime?.applyState||agent.applyState||'waiting',proxyHealthy:runtime?.proxyHealthy===true||agent.proxyHealthy===true,
     desiredRevision:Number(runtime?.desiredRevision??agent.desiredRevision??0),appliedRevision:Number(runtime?.appliedRevision??agent.appliedRevision??0),
     inSync:runtime?.inSync===true||(Number(agent.desiredRevision||0)===Number(agent.appliedRevision||0)&&agent.applyState==='active'),
-    steerTarget:agent.steerTarget!==false,steerCapable:local||(Array.isArray(agent.capabilities)&&agent.capabilities.includes('steering-v1')),
+    steerTarget:agent.steerTarget!==false,steerCapable:agentKnows(agent,STEERING_CAPABILITY),
     lastAck:runtime?.lastAck||agent.lastAck||null,error:runtime?.error||agent.error||'',telemetry:runtime?.telemetry||agent.telemetry||null,lastTelemetryAt:runtime?.lastTelemetryAt||agent.lastTelemetryAt||null,canDelete:!local,agentVersion:local?'':String(agent.agentVersion||'')
   };
 }

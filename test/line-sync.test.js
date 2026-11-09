@@ -84,28 +84,27 @@ test('only machines that know line-sync-v1 (and the panel machine) get the line 
   assert.equal(byId('jp').lineSyncUpstream,false,'not even the upstream lines');
 });
 
-test('an upgrade to line-sync-v1 recompiles every snapshot, and a renamed machine renames its line',async()=>{
+test('a machine gets the line lists once it reports line-sync-v1, and a renamed machine renames its line',async()=>{
   const data={routes:[keyRoute()],agents:[{id:'local',name:'主机',domain:'panel.example.com',state:'active'}],deployments:[{agentId:'local',routeId:'n1',enabled:true}],enrollmentTokens:[],controlPlane:{},settings:{}},store={data,save(){},audit(){}};
-  let topologyChanges=0;
-  const api=new AgentApi({store,version:'0.13.0',localBase:'https://panel.example.com',onTopologyChange:()=>topologyChanges++});
+  const api=new AgentApi({store,version:'0.13.0',localBase:'https://panel.example.com'});
   const issued=issueEnrollment(data,{name:'HK',domain:'hk.example.com',routeIds:['n1']}),sign=crypto.generateKeyPairSync('ed25519'),box=crypto.generateKeyPairSync('x25519');
   const der=key=>key.export({format:'der',type:'spki'}).toString('base64url'),reply=()=>({status:0,raw:Buffer.alloc(0),writeHead(status){this.status=status},end(raw){this.raw=Buffer.from(raw||'')}});
   const req=(url,body,headers={})=>{const r=Readable.from([Buffer.from(body)]);r.url=url;r.method='POST';r.headers=headers;r.socket={remoteAddress:'127.0.0.1'};return r};
   const enrolled=reply();
   await api.handle(req('/api/agent/v1/enroll',JSON.stringify({protocolVersion:1,requestNonce:'line-enroll-nonce-0001',token:issued.token,agent:{signPublicKey:der(sign.publicKey),boxPublicKey:der(box.publicKey),agentVersion:'0.12.5',capabilities:['config-v1']},machine:{}})),enrolled);
-  assert.equal(enrolled.status,201);assert.equal(topologyChanges,1,'a new machine joins the line lists of its nodes');topologyChanges=0;
+  assert.equal(enrolled.status,201);
   const agentId=JSON.parse(enrolled.raw).agentId,agent=data.agents.find(item=>item.id===agentId);
-  assert.equal(api.desired(agent).nodes[0].lines,undefined);
+  assert.equal(api.snapshots.desired(agent.id).nodes[0].lines,undefined);
   const body=Buffer.from(JSON.stringify({agentVersion:'0.13.0',currentRevision:0,applyState:'waiting',proxyHealthy:true,domain:'hk.example.com',proxyMode:'domain',capabilities:['config-v1',LINE_SYNC_CAPABILITY]}));
   const timestamp=Math.floor(Date.now()/1000),contentHash=crypto.createHash('sha256').update(body).digest('base64url'),nonce='line-checkin-nonce-00001';
   const { agentRequestInput }=await import('../src/agent-api.js');
   const signature=crypto.sign(null,Buffer.from(agentRequestInput({method:'POST',path:'/api/agent/v1/check-in',agentId,timestamp,nonce,contentHash})),sign.privateKey).toString('base64url');
   const checked=reply();
   await api.handle(req('/api/agent/v1/check-in',body,{'x-aegis-agent-id':agentId,'x-aegis-timestamp':String(timestamp),'x-aegis-nonce':nonce,'x-aegis-content-sha256':contentHash,'x-aegis-signature':signature}),checked);
-  assert.equal(checked.status,200);assert.equal(topologyChanges,1,'the panel machine lists the upgraded machine too');
-  assert.deepEqual(api.desired(agent).nodes[0].lines,[{name:'主机',base:'https://panel.example.com'},{name:'HK',base:'https://hk.example.com'}]);
-  agent.name='香港';agent.sortOrder=-1;api.invalidate();
-  assert.deepEqual(api.desired(agent).nodes[0].lines.map(line=>line.name),['香港','主机'],'renamed and moved up in the machine order');
+  assert.equal(checked.status,200);
+  assert.deepEqual(api.snapshots.desired(agent.id).nodes[0].lines,[{name:'主机',base:'https://panel.example.com'},{name:'HK',base:'https://hk.example.com'}]);
+  agent.name='香港';agent.sortOrder=-1;api.snapshots.refresh();
+  assert.deepEqual(api.snapshots.desired(agent.id).nodes[0].lines.map(line=>line.name),['香港','主机'],'renamed and moved up in the machine order');
 });
 
 test('the line reply follows the reference service: data on success, ok:false otherwise',()=>{

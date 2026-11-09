@@ -94,14 +94,14 @@ function fakePanel(){
 test('changing an agent deployment immediately raises its desired revision', () => {
   const {store,api,data}=fakePanel();
   const remote=data.agents.find(a=>a.id==='remote-1');
-  api.invalidate();
+  api.snapshots.refresh();
   const base=Number(remote.desiredRevision);
   assert.ok(base>=1,'a registered machine must have a desired revision');
   // the machine reports it has applied what the panel currently wants
   remote.appliedRevision=base;
 
   replaceAgentDeployments(store.data,'remote-1',['route-a','route-b']);
-  api.invalidate();
+  api.snapshots.refresh();
   assert.ok(Number(remote.desiredRevision)>base,'adding nodes must bump the desired revision at once');
   assert.notEqual(Number(remote.desiredRevision),Number(remote.appliedRevision),'the card must read 等待同步, not 配置已同步');
 
@@ -109,7 +109,7 @@ test('changing an agent deployment immediately raises its desired revision', () 
   remote.appliedRevision=added;
   // the reported bug: de-selecting ONE node of several
   replaceAgentDeployments(store.data,'remote-1',['route-a']);
-  api.invalidate();
+  api.snapshots.refresh();
   assert.deepEqual(routesForAgent(store.data,'remote-1').map(r=>r.id),['route-a']);
   assert.ok(Number(remote.desiredRevision)>added,'removing a node must bump the desired revision too');
   assert.notEqual(Number(remote.desiredRevision),Number(remote.appliedRevision));
@@ -117,7 +117,7 @@ test('changing an agent deployment immediately raises its desired revision', () 
 
 test('a revoked machine is skipped and never blocks the others', () => {
   const {api,data}=fakePanel();
-  api.invalidate();
+  api.snapshots.refresh();
   assert.equal(data.agents.find(a=>a.id==='gone').desiredRevision,undefined);
   assert.ok(Number(data.agents.find(a=>a.id==='remote-1').desiredRevision)>=1);
 });

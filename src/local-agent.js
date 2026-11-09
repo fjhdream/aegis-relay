@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { compileDesiredSnapshot, ensurePanelSigningIdentity, verifySnapshot } from './snapshot.js';
+import { ensurePanelSigningIdentity, verifySnapshot } from './snapshot.js';
 import { b64u, randomToken, timingEqual } from './security.js';
 import { writeAtomic } from './store.js';
 import { ensureAgentRegistry, LOCAL_AGENT_ID, routeIdsForAgent, routesForAgent } from './agent-registry.js';
-import { agentSnapshotNodes } from './steering-topology.js';
+import { DesiredSnapshots } from './desired-snapshots.js';
 
 function freeze(value) {
   if(value&&typeof value==='object'&&!Object.isFrozen(value)){
@@ -53,10 +53,13 @@ export function runtimeRoutes(nodes) {
   }));
 }
 
+// The panel machine's own agent. It follows its desired snapshot like a remote machine does, only over
+// a direct call: whenever the panel machine is among the machines a refresh changed, it pulls the
+// snapshot, verifies it against the pinned panel key and applies it.
 export class LocalAgent {
-  constructor({store,cacheFile=`${store.file}.local-agent.snapshot`,localBase=''}) {
+  constructor({store,cacheFile=`${store.file}.local-agent.snapshot`,snapshots=null,localBase=''}) {
     const registered=Array.isArray(store.data.agents)&&store.data.agents.some(agent=>agent.id===LOCAL_AGENT_ID);
-    this.store=store;this.cacheFile=cacheFile;this.localBase=localBase;this.previousFile=`${cacheFile}.previous`;this.routeSource=new AtomicRouteSource(registered?routesForAgent(store.data,LOCAL_AGENT_ID):store.data.routes);
+    this.store=store;this.cacheFile=cacheFile;this.snapshots=snapshots||new DesiredSnapshots({store,localBase});this.previousFile=`${cacheFile}.previous`;this.routeSource=new AtomicRouteSource(registered?routesForAgent(store.data,LOCAL_AGENT_ID):store.data.routes);
     this.panelIdentity=null;this.record=null;this.lastError='';this.applyState='starting';this.lastSeen=null;
   }
 
@@ -90,12 +93,6 @@ export class LocalAgent {
     return true;
   }
 
-  pull(nodes) {
-    const compiled=compileDesiredSnapshot({nodes,previousState:this.record.desiredState,signingIdentity:this.panelIdentity});
-    this.record.desiredState=compiled.state;
-    return compiled.snapshot;
-  }
-
   apply(snapshot) {
     const decision=verifySnapshot(snapshot,this.pinnedIdentity(),{currentRevision:this.record.appliedRevision||0,currentHash:this.record.appliedHash||null});
     if(decision.status==='noop')return decision;
@@ -115,10 +112,11 @@ export class LocalAgent {
     if(agent){agent.lastSeen=this.lastSeen;agent.applyState=status==='applied'?'active':'error';agent.desiredRevision=snapshot?.revision||0;agent.appliedRevision=status==='applied'?(snapshot?.revision||0):(this.record.appliedRevision||0);agent.proxyHealthy=status==='applied';agent.updatedAt=this.lastSeen;}
   }
 
-  reconcile(nodes=agentSnapshotNodes(this.store.data,LOCAL_AGENT_ID,{localBase:this.localBase})) {
+  // Apply the desired snapshot as it stands; a no-op when it is already applied.
+  reconcile() {
     let snapshot;
     try {
-      snapshot=this.pull(nodes);
+      snapshot=this.snapshots.desired(LOCAL_AGENT_ID);
       const decision=this.apply(snapshot);
       this.ack(snapshot,'applied');
       this.applyState='active';this.lastError='';
@@ -137,6 +135,8 @@ export class LocalAgent {
     let loaded=false;
     try { loaded=this.loadCachedSnapshot(); } catch(error) { this.lastError=`cached snapshot rejected: ${error.message}`; }
     if(!loaded){this.record.appliedRevision=0;this.record.appliedHash=null;}
+    this.unsubscribe?.();
+    this.unsubscribe=this.snapshots.subscribe(changed=>{if(changed.includes(LOCAL_AGENT_ID))this.reconcile();});
     return this.reconcile();
   }
 

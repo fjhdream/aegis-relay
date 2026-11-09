@@ -409,7 +409,7 @@ mac   = HMAC-SHA256(steerKey, "token\n" ‖ 前面各字段)[0:16]
 - 这一项放在节点对象内部，因此受快照哈希和签名保护（`verifySnapshot` 校验 `schemaVersion`、`revision`、`nodes`），不需要提升快照格式版本。
 - 不参与切流的机器（包括旧探针）拿到的快照不变，不会因此产生新的 revision。
 - 快照里只放不常变的拓扑。在线状态、配额、上游线路走 §10.1 的同步。
-- 以下变化会立即重新编译所有机器的快照：切流设置、节点的切流开关或统一出口、机器的部署或参与开关、新机器注册、机器的能力（`steering-v1`、`egress-v1`）或直连域名变化（check-in 时检测）。
+- 面板数据的任何改动（节点、部署、机器、切流设置、新机器注册），以及 check-in 上报的机器档案（能力、直连域名、反代模式）变化，都会让面板立即重新编译所有机器的期望快照，并按内容比对：只有快照内容真的变了的机器才会升 revision、被唤醒长轮询。见 `src/desired-snapshots.js`。
 
 ## 11. 配置与面板
 
@@ -498,7 +498,8 @@ mac   = HMAC-SHA256(steerKey, "token\n" ‖ 前面各字段)[0:16]
 | `src/domain-control.js` | 面板本机的入口域名请求文件 |
 | `scripts/host-entry-apply.sh` | 受限主机单元：复核请求后配置入口域名 |
 | `src/proxy.js` | `makeProxyHandler(…, steering)`：所有请求删除 `aegis_steer`；取流请求调用 `plan`；向测速对象报告响应头、字节和清单内容；`activeUpstreamLine` |
-| `src/agent-api.js` | `POST /api/agent/v1/steering`；注册和 check-in 时检测拓扑变化并重新编译快照 |
+| `src/desired-snapshots.js` | 每台机器的期望快照：重新编译、按内容比对、只通知变了的机器 |
+| `src/agent-api.js` | `POST /api/agent/v1/steering`；注册时、以及 check-in 上报的机器档案变化时刷新期望快照 |
 | `src/agent-main.js` | 声明 `steering-v1`、`entry-v1`、`egress-v1`，运行引擎和同步循环，跟随面板下发的入口配置 |
 | `src/server.js` | 面板机器的引擎与 hub；`/steering` 管理接口；入口域名按数据面 Host 处理 |
 | `src/snapshot.js`、`src/local-agent.js` | 快照里的 `steering` 拓扑块，以及运行时路由映射 |
