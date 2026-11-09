@@ -14,14 +14,15 @@ import { handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS } from './proxy.j
 import { activeUpstreamLine } from './upstream-exchange.js';
 import { EGRESS_CAPABILITY, SteeringEngine, STEERING_CAPABILITY } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
-import { cleanEntryRequest, cleanEntryStatus, entryAttempt, ENTRY_CAPABILITY } from './steering-topology.js';
+import { cleanEntryRequest, ENTRY_CAPABILITY } from './steering-topology.js';
+// The same host request files as the panel machine: domain status and the steering entry domain.
+import { followEntry, readDomainStatus, readEntryStatus } from './domain-control.js';
 import { LINE_SYNC_CAPABILITY } from './line-sync.js';
 import { Metrics } from './metrics.js';
 import { telemetryFromMetrics } from './telemetry.js';
 
 const DATA_DIR=process.env.AGENT_DATA_DIR||'/app/agent-data',IDENTITY_FILE=path.join(DATA_DIR,'identity.json'),CURRENT_FILE=path.join(DATA_DIR,'current.snapshot'),PREVIOUS_FILE=path.join(DATA_DIR,'previous.snapshot'),METRICS_FILE=path.join(DATA_DIR,'metrics.enc');
 const DOMAIN_REQUEST_FILE=path.join(DATA_DIR,'host-domain-request.json'),DOMAIN_STATUS_FILE=path.join(DATA_DIR,'host-domain-status.json');
-const ENTRY_REQUEST_FILE=path.join(DATA_DIR,'host-entry-request.json'),ENTRY_STATUS_FILE=path.join(DATA_DIR,'host-entry-status.json');
 // Read the version from the package.json baked into this image, so the version the agent reports
 // always matches the code it is actually running — an upgrade rebuilds the image, so a bumped version
 // on the panel is proof the new build is live. Fall back to the env/hardcoded value if unreadable.
@@ -99,16 +100,6 @@ class RemoteConfig {
   apply(snapshot){const decision=verifySnapshot(snapshot,panelIdentity(this.identity),{currentRevision:this.revision,currentHash:this.hash});if(decision.status==='noop')return decision;const routes=decodeNodes(snapshot.nodes);if(fs.existsSync(CURRENT_FILE))writeAtomic(PREVIOUS_FILE,fs.readFileSync(CURRENT_FILE));writeAtomic(CURRENT_FILE,sealLocal(snapshot,this.identity));this.routeSource.apply(routes);this.revision=snapshot.revision;this.hash=snapshot.hash;this.applyState='active';this.error='';return decision;}
 }
 
-function readDomainStatus(){
-  try{
-    const value=JSON.parse(fs.readFileSync(DOMAIN_STATUS_FILE,'utf8'));
-    if(!value||typeof value!=='object')return null;
-    return {requestId:String(value.requestId||'').slice(0,80),state:['pending','applying','active','failed'].includes(value.state)?value.state:'failed',
-      mode:value.mode==='ip'?'ip':'domain',
-      desiredDomain:String(value.desiredDomain||'').slice(0,253),currentDomain:String(value.currentDomain||'').slice(0,253),
-      message:String(value.message||'').slice(0,500),updatedAt:String(value.updatedAt||'').slice(0,40)};
-  }catch{return null}
-}
 // The agent runs unprivileged in a container, so it cannot touch host Nginx or certbot. It drops a
 // validated request file into the mounted data dir; a narrowly scoped host unit performs the switch.
 function requestDomainSwitch(domain,email){
@@ -131,7 +122,7 @@ function requestIpSwitch(){
 function domainSwitchNeeded(desired){
   if(!desired||(effectiveMode()==='domain'&&desired===effectiveDomain()))return false;
   if(fs.existsSync(DOMAIN_REQUEST_FILE))return false;
-  const status=readDomainStatus();
+  const status=readDomainStatus(DATA_DIR);
   if(!status||status.mode!=='domain'||status.desiredDomain!==desired)return true;
   if(['pending','applying'].includes(status.state))return false;
   if(status.state==='active')return false;
@@ -141,27 +132,14 @@ function domainSwitchNeeded(desired){
 function ipSwitchNeeded(){
   if(effectiveMode()==='ip')return false;
   if(fs.existsSync(DOMAIN_REQUEST_FILE))return false;
-  const status=readDomainStatus();
+  const status=readDomainStatus(DATA_DIR);
   if(!status||status.mode!=='ip')return true;
   if(['pending','applying','active'].includes(status.state))return false;
   const age=Date.now()-Date.parse(status.updatedAt||'');
   return Number.isFinite(age)&&age>10*60_000;
 }
-function readEntryStatus(){try{return cleanEntryStatus(JSON.parse(fs.readFileSync(ENTRY_STATUS_FILE,'utf8')))}catch{return null}}
-// The steering entry domain also needs host Nginx and certbot: the same request/status file plumbing
-// as a domain switch, picked up by its own narrowly scoped host unit (host-entry-apply.sh).
-function followEntry(value){
-  const entry=cleanEntryRequest(value);
-  // One host change at a time: a domain switch and an entry setup both reload Nginx and run certbot.
-  if(!entry||fs.existsSync(ENTRY_REQUEST_FILE)||fs.existsSync(DOMAIN_REQUEST_FILE))return;
-  const attempt=entryAttempt(entry,readEntryStatus());
-  if(!attempt)return;
-  const requestId=randomToken(18),requestedAt=new Date().toISOString();
-  writeAtomic(ENTRY_STATUS_FILE,`${JSON.stringify({requestId,state:'pending',entryDomain:entry.domain,peers:entry.peers,attempt,message:'等待主机配置入口域名',updatedAt:requestedAt})}\n`);
-  writeAtomic(ENTRY_REQUEST_FILE,`${JSON.stringify({version:1,requestId,entryDomain:entry.domain,certificateEmail:entry.email,peers:entry.peers,attempt,requestedAt})}\n`);
-}
-function effectiveMode(){const status=readDomainStatus();if(status&&status.state==='active')return status.mode||'domain';if(AGENT_PROXY_MODE==='ip')return'ip';return AGENT_DOMAIN?'domain':(AGENT_PROXY_IP?'ip':'domain')}
-function effectiveDomain(){const status=readDomainStatus();if(status&&status.state==='active'&&status.currentDomain)return status.currentDomain;return effectiveMode()==='ip'?AGENT_PROXY_IP:AGENT_DOMAIN}
+function effectiveMode(){const status=readDomainStatus(DATA_DIR);if(status&&status.state==='active')return status.mode||'domain';if(AGENT_PROXY_MODE==='ip')return'ip';return AGENT_DOMAIN?'domain':(AGENT_PROXY_IP?'ip':'domain')}
+function effectiveDomain(){const status=readDomainStatus(DATA_DIR);if(status&&status.state==='active'&&status.currentDomain)return status.currentDomain;return effectiveMode()==='ip'?AGENT_PROXY_IP:AGENT_DOMAIN}
 
 async function acknowledge(identity,config,status,error='',proxyHealthy=true){const payload={protocolVersion:1,revision:config.revision,hash:config.hash,status,error:String(error||'').slice(0,240),proxyHealthy};const result=await signedRequest(identity,'POST','/api/agent/v1/ack',payload);if(!result.response.ok)throw new Error(result.data?.error||`ack failed (${result.response.status})`);}
 
@@ -178,8 +156,8 @@ async function steeringExchange(identity,payload){const result=await signedReque
 
 function startProxy(config,identity,metricStore,health,steering){const metrics=new Metrics(metricStore),key=storageKey(identity);steering.canServe=route=>metrics.canServe(route);const relay=makeProxyHandler(config.routeSource,key,metrics,steering),server=http.createServer(RELAY_SERVER_OPTIONS,(req,res)=>{res.on('error',()=>{});try{const out=relay(req,res);if(out&&typeof out.catch==='function')out.catch(error=>{console.error('[aegis-agent] relay error',error?.message||error);if(!res.headersSent&&!res.writableEnded){res.writeHead(502,{'cache-control':'no-store'});res.end('bad gateway')}})}catch(error){if(!res.headersSent&&!res.writableEnded){res.writeHead(502,{'cache-control':'no-store'});res.end('bad gateway')}}});server.requestTimeout=0;server.keepAliveTimeout=75_000;server.keepAliveTimeoutBuffer=5_000;server.headersTimeout=80_000;server.on('connection',socket=>{socket.setNoDelay(true);socket.setKeepAlive(true,15_000)});server.on('clientError',(_error,socket)=>{if(!socket.destroyed)socket.destroy()});server.on('upgrade',(req,socket,head)=>{socket.on('error',()=>socket.destroy());try{handleUpgrade(req,socket,head,config.routeSource,key)}catch{socket.destroy()}});return new Promise((resolve,reject)=>{let started=false;server.on('error',error=>{if(!started)return reject(error);health.proxyHealthy=false;console.error(`[aegis-agent] proxy server error: ${error?.message||error}`)});server.on('close',()=>{health.proxyHealthy=false});server.listen(PROXY_PORT,'0.0.0.0',()=>{started=true;resolve({server,metrics})})})}
 
-async function checkIn(identity,config,startedAt,bootId,proxyHealthy,telemetry){const payload={protocolVersion:1,agentVersion:VERSION,bootId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),currentRevision:config.revision,currentConfigId:config.hash,applyState:config.applyState,proxyHealthy,domain:effectiveDomain(),proxyMode:effectiveMode(),domainStatus:readDomainStatus(),entryStatus:readEntryStatus(),certificateNotAfter:null,capabilities:CAPABILITIES,telemetry},result=await signedRequest(identity,'POST','/api/agent/v1/check-in',payload);if(!result.response.ok)throw new Error(result.data?.error||`check-in failed (${result.response.status})`);return result.data;}
+async function checkIn(identity,config,startedAt,bootId,proxyHealthy,telemetry){const payload={protocolVersion:1,agentVersion:VERSION,bootId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),currentRevision:config.revision,currentConfigId:config.hash,applyState:config.applyState,proxyHealthy,domain:effectiveDomain(),proxyMode:effectiveMode(),domainStatus:readDomainStatus(DATA_DIR),entryStatus:readEntryStatus(DATA_DIR),certificateNotAfter:null,capabilities:CAPABILITIES,telemetry},result=await signedRequest(identity,'POST','/api/agent/v1/check-in',payload);if(!result.response.ok)throw new Error(result.data?.error||`check-in failed (${result.response.status})`);return result.data;}
 
-async function run(){const identity=loadIdentity();if(identity.panelUrl!==PANEL_URL)throw new Error('pinned panel URL mismatch');const config=new RemoteConfig(identity);try{config.load()}catch(error){config.error=`cached config rejected: ${error.message}`;config.applyState='error';}const health={proxyHealthy:true},steering=new SteeringEngine({selfId:identity.agentId,lineOf:activeUpstreamLine});const metricStore=loadMetricStore(identity),runtime=await startProxy(config,identity,metricStore,health,steering),server=runtime.server,metrics=runtime.metrics,startedAt=Date.now(),bootId=randomToken(16),healthy=()=>health.proxyHealthy&&server.listening;let delay=2_000,lastMetricSave=0;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{steering.stop();const saved=metricStore.save();server.close(()=>saved.then(()=>process.exit(0)));server.closeIdleConnections?.();setTimeout(()=>process.exit(0),5_000).unref()});steering.start(payload=>steeringExchange(identity,payload),()=>config.routeSource.getRoutes());followConfig(identity,config,healthy);for(;;){try{const telemetry=telemetryFromMetrics(metrics.snapshot(config.routeSource.getRoutes()));if(Date.now()-lastMetricSave>=60_000){metricStore.save();lastMetricSave=Date.now()}const status=await checkIn(identity,config,startedAt,bootId,healthy(),telemetry);const desiredMode=String(status.desiredMode||'');if(desiredMode==='ip'){if(ipSwitchNeeded())requestIpSwitch()}else if(status.desiredDomain){if(domainSwitchNeeded(status.desiredDomain))requestDomainSwitch(status.desiredDomain,status.certificateEmail)}if(status.entry)followEntry(status.entry);delay=Math.max(5_000,Number(status.heartbeatSeconds||15)*1000)}catch(error){config.error=String(error.message||error).slice(0,160);console.error(`[aegis-agent] ${config.error}`);delay=Math.min(300_000,Math.max(2_000,delay*2))}await sleep(delay)}}
+async function run(){const identity=loadIdentity();if(identity.panelUrl!==PANEL_URL)throw new Error('pinned panel URL mismatch');const config=new RemoteConfig(identity);try{config.load()}catch(error){config.error=`cached config rejected: ${error.message}`;config.applyState='error';}const health={proxyHealthy:true},steering=new SteeringEngine({selfId:identity.agentId,lineOf:activeUpstreamLine});const metricStore=loadMetricStore(identity),runtime=await startProxy(config,identity,metricStore,health,steering),server=runtime.server,metrics=runtime.metrics,startedAt=Date.now(),bootId=randomToken(16),healthy=()=>health.proxyHealthy&&server.listening;let delay=2_000,lastMetricSave=0;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{steering.stop();const saved=metricStore.save();server.close(()=>saved.then(()=>process.exit(0)));server.closeIdleConnections?.();setTimeout(()=>process.exit(0),5_000).unref()});steering.start(payload=>steeringExchange(identity,payload),()=>config.routeSource.getRoutes());followConfig(identity,config,healthy);for(;;){try{const telemetry=telemetryFromMetrics(metrics.snapshot(config.routeSource.getRoutes()));if(Date.now()-lastMetricSave>=60_000){metricStore.save();lastMetricSave=Date.now()}const status=await checkIn(identity,config,startedAt,bootId,healthy(),telemetry);const desiredMode=String(status.desiredMode||'');if(desiredMode==='ip'){if(ipSwitchNeeded())requestIpSwitch()}else if(status.desiredDomain){if(domainSwitchNeeded(status.desiredDomain))requestDomainSwitch(status.desiredDomain,status.certificateEmail)}if(status.entry)followEntry({dir:DATA_DIR,entry:cleanEntryRequest(status.entry)});delay=Math.max(5_000,Number(status.heartbeatSeconds||15)*1000)}catch(error){config.error=String(error.message||error).slice(0,160);console.error(`[aegis-agent] ${config.error}`);delay=Math.min(300_000,Math.max(2_000,delay*2))}await sleep(delay)}}
 
 if(process.argv.includes('--enroll'))await enroll();else await run();

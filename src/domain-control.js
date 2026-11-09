@@ -1,20 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomToken } from './security.js';
+import { writeAtomic } from './store.js';
 import { normalizeAgentDomain } from './agent-registry.js';
 import { cleanEntryStatus, entryAttempt } from './steering-topology.js';
 
+// Host changes a containerised process cannot make itself (Nginx, certificates): it drops a request
+// file into its data directory, and a narrowly scoped host unit, triggered by that exact file, applies
+// it and writes back a status file. The panel machine and every agent use the same files; `dir` is the
+// data directory they live in.
 const REQUEST_FILE='host-domain-request.json';
 const STATUS_FILE='host-domain-status.json';
 
 function readJson(file){try{return JSON.parse(fs.readFileSync(file,'utf8'))}catch{return null}}
-function atomicJson(file,value){
-  const dir=path.dirname(file),tmp=path.join(dir,`.${path.basename(file)}.${process.pid}.${randomToken(6)}.tmp`);
-  fs.mkdirSync(dir,{recursive:true});
-  const fd=fs.openSync(tmp,'wx',0o600);
-  try{fs.writeFileSync(fd,`${JSON.stringify(value)}\n`);fs.fsyncSync(fd)}finally{fs.closeSync(fd)}
-  fs.renameSync(tmp,file);
-}
+function writeJson(file,value){writeAtomic(file,`${JSON.stringify(value)}\n`)}
 
 export function baseHostname(value){
   if(!value)return'';
@@ -33,8 +32,8 @@ export function domainRequestRole({panelHostname='',proxyHostname='',requestHost
   return'reject';
 }
 
-export function readDomainStatus(dataFile){
-  const value=readJson(path.join(path.dirname(dataFile),STATUS_FILE));
+export function readDomainStatus(dir){
+  const value=readJson(path.join(dir,STATUS_FILE));
   if(!value||typeof value!=='object')return null;
   return {
     requestId:String(value.requestId||'').slice(0,80),
@@ -47,33 +46,32 @@ export function readDomainStatus(dataFile){
   };
 }
 
-export function requestDomainSwitch({dataFile,domain,email,currentDomain=''}){
+export function requestDomainSwitch({dir,domain,email,currentDomain=''}){
   const desiredDomain=normalizeAgentDomain(domain),certificateEmail=String(email||'').trim().toLowerCase();
   if(!/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(desiredDomain))throw new Error('代理域名必须是未携带端口或路径的完整 DNS 域名');
   if(!certificateEmail)throw new Error('请先在部署向导保存统一证书邮箱');
   if(!/^[^\s@]+@[^\s@]+$/.test(certificateEmail)||certificateEmail.length>254)throw new Error('证书邮箱格式无效');
-  const requestId=randomToken(18),requestedAt=new Date().toISOString(),dir=path.dirname(dataFile);
+  const requestId=randomToken(18),requestedAt=new Date().toISOString();
   const request={version:1,requestId,mode:'domain',desiredDomain,certificateEmail,requestedAt};
   const status={requestId,state:'pending',mode:'domain',desiredDomain,currentDomain,message:'等待主机申请证书并切换 Nginx',updatedAt:requestedAt};
-  atomicJson(path.join(dir,STATUS_FILE),status);
-  atomicJson(path.join(dir,REQUEST_FILE),request);
+  writeJson(path.join(dir,STATUS_FILE),status);
+  writeJson(path.join(dir,REQUEST_FILE),request);
   return status;
 }
 
-// The panel machine serves the steering entry domain too: same plumbing, its own host unit.
+// The steering entry domain: same plumbing, its own host unit (host-entry-apply.sh).
 const ENTRY_REQUEST_FILE='host-entry-request.json',ENTRY_STATUS_FILE='host-entry-status.json';
-export function readEntryStatus(dataFile){return cleanEntryStatus(readJson(path.join(path.dirname(dataFile),ENTRY_STATUS_FILE)))}
+export function readEntryStatus(dir){return cleanEntryStatus(readJson(path.join(dir,ENTRY_STATUS_FILE)))}
 
 // Files a request when the entry setup on this host differs from `entry` (or failed and is due for a
 // retry). One host change at a time: never next to a pending domain switch.
-export function followEntry({dataFile,entry,nowMs=Date.now()}){
-  const dir=path.dirname(dataFile);
+export function followEntry({dir,entry,nowMs=Date.now()}){
   if(!entry||fs.existsSync(path.join(dir,ENTRY_REQUEST_FILE))||fs.existsSync(path.join(dir,REQUEST_FILE)))return false;
-  const attempt=entryAttempt(entry,readEntryStatus(dataFile),nowMs);
+  const attempt=entryAttempt(entry,readEntryStatus(dir),nowMs);
   if(!attempt)return false;
   const requestId=randomToken(18),requestedAt=new Date(nowMs).toISOString();
-  atomicJson(path.join(dir,ENTRY_STATUS_FILE),{requestId,state:'pending',entryDomain:entry.domain,peers:entry.peers,attempt,message:'等待主机配置入口域名',updatedAt:requestedAt});
-  atomicJson(path.join(dir,ENTRY_REQUEST_FILE),{version:1,requestId,entryDomain:entry.domain,certificateEmail:entry.email,peers:entry.peers,attempt,requestedAt});
+  writeJson(path.join(dir,ENTRY_STATUS_FILE),{requestId,state:'pending',entryDomain:entry.domain,peers:entry.peers,attempt,message:'等待主机配置入口域名',updatedAt:requestedAt});
+  writeJson(path.join(dir,ENTRY_REQUEST_FILE),{version:1,requestId,entryDomain:entry.domain,certificateEmail:entry.email,peers:entry.peers,attempt,requestedAt});
   return true;
 }
 
