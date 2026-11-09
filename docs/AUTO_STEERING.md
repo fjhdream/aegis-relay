@@ -503,7 +503,7 @@ mac   = HMAC-SHA256(steerKey, "token\n" ‖ 前面各字段)[0:16]
 | `src/agent-api.js` | `POST /api/agent/v1/steering`；注册时、以及 check-in 上报的机器档案变化时刷新期望快照 |
 | `src/agent-main.js` | 声明 `steering-v1`、`entry-v1`、`egress-v1`，运行引擎和同步循环，跟随面板下发的入口配置 |
 | `src/server.js` | 面板机器的引擎与 hub；`/steering` 管理接口；入口域名按数据面 Host 处理 |
-| `src/snapshot.js`、`src/local-agent.js` | 快照里的 `steering` 拓扑块，以及运行时路由映射 |
+| `src/node-wire.js` | 节点在快照里的格式：面板编码（含 `steering` 拓扑块）与机器解码，两侧用同一套校验 |
 | `scripts/configure-entry-domain.sh` | 入口域名的 Nginx 站点、webroot 证书与 ACME 验证转发；由 `aegis-relay entry` / `aegis-relay-agent entry` 调用 |
 | `web/` | 「自动切流」页、节点编辑里的自动切流开关 |
 

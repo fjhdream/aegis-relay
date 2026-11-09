@@ -5,7 +5,7 @@ import { SteeringEngine } from '../src/steering.js';
 import { agentSnapshotNodes, agentSteeringIssues, cleanEntryRequest, desiredEntry, egressIssues, egressTopology, entryAttempt, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
 import { compileAgentDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
-import { runtimeRoutes } from '../src/local-agent.js';
+import { decodeNodes } from '../src/node-wire.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from '../src/playback-observation.js';
 
 const KEY=/^[A-Za-z0-9_-]{22}$/;
@@ -78,7 +78,7 @@ test('an observation-capable machine can report progress without becoming a stee
   const node=agentSnapshotNodes(data,'b')[0];
   assert.equal(node.playbackObservation,true);assert.equal(node.steering,undefined);
   const snapshot=compileAgentDesiredSnapshot({data,agentId:'b',signingIdentity:generatePanelSigningIdentity()}).snapshot;
-  assert.equal(runtimeRoutes(snapshot.nodes)[0].playbackObservation,true);assert.equal(runtimeRoutes(snapshot.nodes)[0].steering,undefined);
+  assert.equal(decodeNodes(snapshot.nodes)[0].playbackObservation,true);assert.equal(decodeNodes(snapshot.nodes)[0].steering,undefined);
   data.settings.steering.mode='off';assert.equal(agentSnapshotNodes(data,'b')[0].playbackObservation,undefined);
 });
 

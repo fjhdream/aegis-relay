@@ -1,14 +1,12 @@
 import crypto from 'node:crypto';
 import { canonicalJson } from './canonical-json.js';
-import { isRouteAuthKey, ROUTE_AUTH_VERSION } from './route-auth.js';
 import { b64u, timingEqual } from './security.js';
 import { agentSnapshotNodes } from './steering-topology.js';
-import { cleanLines } from './line-sync.js';
+import { encodeNodes } from './node-wire.js';
 
 export const SNAPSHOT_SCHEMA_VERSION=1;
 
 const sha256=value=>b64u(crypto.createHash('sha256').update(value).digest());
-const compareUtf8=(left,right)=>Buffer.compare(Buffer.from(left,'utf8'),Buffer.from(right,'utf8'));
 const deepFreeze=value=>{
   if(value&&typeof value==='object'&&!Object.isFrozen(value)){
     for(const child of Object.values(value))deepFreeze(child);
@@ -21,91 +19,6 @@ function safeRevision(value, allowZero=false) {
   const revision=Number(value);
   if(!Number.isSafeInteger(revision)||revision<(allowZero?0:1))throw new Error('revision must be a monotonic positive safe integer');
   return revision;
-}
-
-function stringArray(value, field) {
-  if(!Array.isArray(value))throw new Error(`${field} must be an array`);
-  return value.map(item=>{
-    if(typeof item!=='string'||!item.trim())throw new Error(`${field} contains an invalid value`);
-    return item;
-  });
-}
-
-function clientProfile(value={}) {
-  const result={enabled:value.enabled===true};
-  for(const field of ['userAgent','client','deviceName','deviceId'])if(value[field])result[field]=String(value[field]);
-  return result;
-}
-
-function streamRewrite(value={}) {
-  const domains=Array.isArray(value?.domains)?value.domains.map(d=>String(d||'').trim().toLowerCase()).filter(Boolean):[];
-  return {enabled:value?.enabled===true&&domains.length>0,domains};
-}
-
-// Present only on nodes this machine steers (see steering-topology.js), so every other snapshot keeps
-// its exact previous shape and hash.
-function steering(value) {
-  const peers=(Array.isArray(value.peers)?value.peers:[]).map(peer=>{
-    const id=String(peer?.id||''),base=String(peer?.base||'');
-    let url;try{url=new URL(base)}catch{throw new Error('invalid steering peer')}
-    if(!id||url.protocol!=='https:'||url.username||url.password||url.pathname!=='/'||url.search||url.hash||url.origin!==base)throw new Error('invalid steering peer');
-    return {id,base};
-  });
-  return {mode:value.mode==='on'?'on':'shadow',peers,params:{minRateMbps:Math.max(0,Number(value.params?.minRateMbps||0)),...(value.params?.anyLine===true?{anyLine:true}:{})}};
-}
-
-function egress(value) {
-  const id=String(value?.id||''),base=String(value?.base||'');
-  let url;try{url=new URL(base)}catch{throw new Error('invalid egress machine')}
-  if(!id||url.protocol!=='https:'||url.username||url.password||url.pathname!=='/'||url.search||url.hash||url.origin!==base)throw new Error('invalid egress machine');
-  return {id,base};
-}
-
-function normalizeNode(route) {
-  if(!route||typeof route!=='object')throw new Error('snapshot node must be an object');
-  const id=String(route.id||'').trim(),alias=String(route.alias||'').trim();
-  if(!id||!alias)throw new Error('snapshot nodes require id and alias');
-  const mode=route.accessMode==='alias_only'?'alias_only':'key';
-  let access={mode};
-  if(mode==='key'){
-    if(route.authMigrationRequired===true)throw new Error(`node ${alias} requires an access-key rotation before agent deployment`);
-    if(route.authVersion!==ROUTE_AUTH_VERSION||!isRouteAuthKey(route.routeAuthKey)||typeof route.keyDigest!=='string'||!route.keyDigest)throw new Error(`node ${alias} has incomplete route authentication`);
-    access={mode,algorithm:ROUTE_AUTH_VERSION,routeAuthKey:route.routeAuthKey,digest:route.keyDigest};
-    // Extra distribution channels (per-user keys) travel with their own digest so agents can verify
-    // and attribute each user's key.
-    const channels=[];
-    for(const ch of Array.isArray(route.channels)?route.channels:[]){
-      if(ch?.authVersion!==ROUTE_AUTH_VERSION||!isRouteAuthKey(ch.routeAuthKey)||typeof ch.keyDigest!=='string'||!ch.keyDigest)continue;
-      channels.push({id:String(ch.id||'').slice(0,32),routeAuthKey:ch.routeAuthKey,digest:ch.keyDigest});
-    }
-    if(channels.length)access.channels=channels;
-  }
-  const upstreams=stringArray(route.upstreams?.length?route.upstreams:(route.upstream?[route.upstream]:[]),'upstreams');
-  if(!upstreams.length)throw new Error(`node ${alias} requires at least one upstream`);
-  return {
-    id,alias,name:String(route.name||alias),enabled:route.enabled!==false,
-    upstreams,
-    allowPrivate:route.allowPrivate===true,tlsVerify:route.tlsVerify!==false,
-    showOnHome:route.showOnHome===true,clientProfile:clientProfile(route.clientProfile),streamRewrite:streamRewrite(route.streamRewrite),
-    speedLimitMbps:Number(route.speedLimitMbps||0),monthlyQuotaGB:Number(route.monthlyQuotaGB||0),access,
-    ...(route.steering?{steering:steering(route.steering)}:{}),
-    ...(route.playbackObservation===true?{playbackObservation:true}:{}),
-    ...(route.egress?{egress:egress(route.egress)}:{}),
-    ...(Array.isArray(route.lines)?{lines:cleanLines(route.lines),...(route.lineSyncUpstream===true?{lineSyncUpstream:true}:{})}:{})
-  };
-}
-
-export function normalizeSnapshotNodes(routes) {
-  if(!Array.isArray(routes))throw new Error('snapshot nodes must be an array');
-  const nodes=routes.map(normalizeNode).sort((left,right)=>compareUtf8(left.id,right.id)||compareUtf8(left.alias,right.alias));
-  const ids=new Set(),aliases=new Set();
-  for(const node of nodes){
-    if(ids.has(node.id))throw new Error(`duplicate node id: ${node.id}`);
-    if(aliases.has(node.alias))throw new Error(`duplicate node alias: ${node.alias}`);
-    ids.add(node.id);aliases.add(node.alias);
-  }
-  canonicalJson(nodes);
-  return nodes;
 }
 
 function importPrivate(identity) {
@@ -152,13 +65,13 @@ function compileNormalizedSnapshot({revision,nodes,signingIdentity}) {
 }
 
 export function compileSnapshot({revision,nodes,signingIdentity}) {
-  return compileNormalizedSnapshot({revision,nodes:normalizeSnapshotNodes(nodes),signingIdentity});
+  return compileNormalizedSnapshot({revision,nodes:encodeNodes(nodes),signingIdentity});
 }
 
 // previousSnapshot is the signed snapshot previousState describes, when the caller still holds it: an
 // unchanged machine then gets it back as it is, without another signature.
 export function compileDesiredSnapshot({nodes,previousState=null,previousSnapshot=null,signingIdentity}) {
-  const normalized=normalizeSnapshotNodes(nodes);
+  const normalized=encodeNodes(nodes);
   const contentHash=sha256(canonicalJson({schemaVersion:SNAPSHOT_SCHEMA_VERSION,nodes:normalized}));
   const previousRevision=previousState?safeRevision(previousState.revision,true):0;
   const unchanged=previousState?.contentHash===contentHash&&previousState?.keyId===signingIdentity.keyId;
