@@ -11,6 +11,7 @@ import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-aut
 import { ThrottleTransform } from './metrics.js';
 import { guardedLookup } from './lookup.js';
 import { EGRESS_HEADER, EGRESS_HOST_HEADER, egressToken, itemOf, relayedEgress, stripSteerParam } from './steering.js';
+import { lineSyncInfoPath, lineSyncReply, UPSTREAM_LINES_MAX_BYTES, UPSTREAM_LINES_TIMEOUT_MS, upstreamLines } from './line-sync.js';
 
 // SNI carries host names only. Node 22 merely warns about an IP address there (DEP0123); newer Node
 // rejects the request outright, which broke every HTTPS upstream configured by IP.
@@ -489,6 +490,27 @@ function rawHeaderBlock(headers) {
   return Object.entries(headers).flatMap(([k,v])=>v===undefined?[]:(Array.isArray(v)?v:[v]).map(item=>`${k}: ${item}\r\n`)).join('');
 }
 
+// The upstream's own line list, for a node that appends it (see line-sync.js). Best effort and bounded
+// in size and time: anything off resolves to no lines, since the client's token is already accepted.
+function fetchUpstreamLines(transport, options) {
+  return new Promise(resolve=>{
+    let settled=false;
+    const done=lines=>{if(settled)return;settled=true;clearTimeout(timer);resolve(lines)};
+    const up=transport.request(options,upRes=>{
+      const encoding=String(upRes.headers['content-encoding']||'identity').toLowerCase();
+      if(upRes.statusCode!==200||encoding!=='identity'){upRes.resume();return done([])}
+      const chunks=[];let size=0;
+      upRes.on('data',chunk=>{size+=chunk.length;if(size>UPSTREAM_LINES_MAX_BYTES){up.destroy();return done([])}chunks.push(chunk)});
+      upRes.on('end',()=>done(upstreamLines(Buffer.concat(chunks))));
+      upRes.on('error',()=>done([]));
+    });
+    const timer=setTimeout(()=>{up.destroy();done([])},UPSTREAM_LINES_TIMEOUT_MS);
+    timer.unref?.();
+    up.on('error',()=>done([]));
+    up.end();
+  });
+}
+
 export function makeProxyHandler(routeSource, key, metrics = null, steering = null) {
   return async (req, res) => {
     const incoming=new URL(req.url,'http://relay.invalid');
@@ -505,6 +527,14 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     const egress=route.egress?.base?route.egress:null;
     // Or the other way round: this is the egress machine, and another machine relayed the request.
     const relayed=egress?null:relayedEgress(route,req.headers,Date.now());
+    // Line sync (see line-sync.js): answered here with the node's own lines once the upstream accepts
+    // the client's token, which is checked by sending the request on as /System/Info. A node that does
+    // not share its lines answers 404 like a stock Emby server, instead of passing on the upstream's.
+    // A line request relayed by another machine is that machine's to answer: it is fetching the
+    // upstream's own list, so it goes on untouched.
+    const lineRest=found.rest,lineInfo=!relayed&&req.method==='GET'&&Array.isArray(route.lines)?lineSyncInfoPath(lineRest):null;
+    if (lineInfo&&!route.lines.length&&route.lineSyncUpstream!==true) { res.writeHead(404,{'cache-control':'no-store'}); return res.end('not found'); }
+    if (lineInfo) found.rest=lineInfo;
     // The steering token is addressed to this relay; it never reaches an upstream.
     const search=stripSteerParam(incoming.search);
     let continuation, vod;
@@ -582,7 +612,23 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
         clearTimeout(connectTimer);
         const status=upRes.statusCode||502;
         if (canRetry && RETRY_STATUS.has(status) && index+1<configured.length) { markFailure(route,targetValue,`HTTP ${status}`); upRes.resume(); return attempt(configured[index+1],index+1); }
-        if(RETRY_STATUS.has(status))markFailure(route,targetValue,`HTTP ${status}`);else markSuccess(route,targetValue); const out=cleanResponseHeaders(upRes.headers);
+        if(RETRY_STATUS.has(status))markFailure(route,targetValue,`HTTP ${status}`);else markSuccess(route,targetValue);
+        if(lineInfo){
+          finished=true;upRes.resume();
+          const answer=(extra=[])=>{
+            if(res.destroyed||res.headersSent){metricDone?.(status,0,false);return;}
+            const reply=lineSyncReply(status,route.lines,found.prefix,extra);
+            metricDone?.(reply.status,reply.body.length,reply.status>=500);res.writeHead(reply.status,reply.headers);res.end(reply.body);
+          };
+          // The upstream's own lines are asked for only once it has accepted the token, on the same
+          // upstream (or through the same egress machine) and with the client's own request.
+          if(status!==200||route.lineSyncUpstream!==true||res.destroyed)return answer();
+          const linesTarget=joinTarget(targetValue,egress?`${found.prefix}${lineRest}`:lineRest,relaySearch);
+          const linesHeaders={...requestHeaders,'accept-encoding':'identity'};
+          if(egress)linesHeaders[EGRESS_HEADER]=egressToken(route,Date.now());
+          return void fetchUpstreamLines(target.protocol==='https:'?https:http,{...options,path:linesTarget.pathname+linesTarget.search,headers:linesHeaders}).then(answer);
+        }
+        const out=cleanResponseHeaders(upRes.headers);
         // The egress machine already built its links for this machine's public host.
         if (out.location && !egress) {
           try {

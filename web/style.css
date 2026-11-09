@@ -263,6 +263,7 @@ svg{stroke-linecap:round;stroke-linejoin:round}
 .channel-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;background:var(--inset);border:1px solid var(--line);border-radius:var(--r-xs)}
 .channel-info{min-width:0;overflow:hidden}
 .chan-url{font-size:11px;word-break:break-all}
+.line-hint{display:block;color:var(--text-3);font-size:12px;line-height:1.5}
 .channel-actions{display:flex;gap:6px;flex-shrink:0}
 .channel-add{display:flex;gap:8px;margin-top:8px}
 .channel-add input{flex:1}

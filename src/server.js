@@ -23,6 +23,7 @@ import { fetchPanelIcon, MAX_ICON_BYTES, normalizePanelIcon } from './panel-icon
 import { SteeringEngine, STEERING_MODES } from './steering.js';
 import { SteeringHub } from './steering-hub.js';
 import { agentSteeringIssues, desiredEntry, egressIssues, egressTopology, ENTRY_CAPABILITY, entryCommand, entryCoverageGaps, normalizeClientList, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
+import { nodeLines } from './line-sync.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const APP_VERSION=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8')).version;
@@ -36,7 +37,7 @@ const cfg = {
 const key = deriveKey(process.env.APP_MASTER_KEY); const store = new Store(cfg.dataFile, key);
 if(!store.data.settings.certificateEmail&&cfg.certificateEmail){store.data.settings.certificateEmail=normalizeCertificateEmail(cfg.certificateEmail);store.save();}
 const configuredLocalDomain=activeLocalDomain(cfg);
-const localAgent = new LocalAgent({store}); localAgent.start();
+const localAgent = new LocalAgent({store,localBase:clientBaseUrl()}); localAgent.start();
 // After the local agent: on a fresh install it is what creates this record, and the steering topology
 // reads the domain from the record (an empty one left the panel machine out until the next restart).
 const localRecord=store.data.agents.find(agent=>agent.id===LOCAL_AGENT_ID);
@@ -55,7 +56,7 @@ function rangeVerdict(client,works){
 const steeringHub = new SteeringHub({store,onBoundVerdict:rangeVerdict,onAutoExclude:client=>{const settings=steeringSettings(store.data);if(Object.keys(settings.autoExcluded).some(item=>item.toLowerCase()===client.toLowerCase()))return;settings.autoExcluded[client]=new Date().toISOString();store.audit('steering.client_auto_excluded','system',client);store.save();}});
 // A machine's capabilities or domain feed every node's steering topology, so a change there recompiles
 // the local snapshot too (remote ones are recompiled by the API itself).
-const agentApi = new AgentApi({store,version:APP_VERSION,steering:steeringHub,onTopologyChange:()=>localAgent.reconcile()});
+const agentApi = new AgentApi({store,version:APP_VERSION,steering:steeringHub,localBase:clientBaseUrl(),onTopologyChange:()=>localAgent.reconcile()});
 const metrics = new Metrics(store);
 // Stats for nodes deleted by earlier versions were never removed; sweep them once at boot.
 metrics.retainOnly(store.data.routes.map(route=>route.id||route.alias));
@@ -124,7 +125,7 @@ function cleanAutoSteer(value={}){if(!value||typeof value!=='object')return{enab
 // machines; an explicit edit naming an unknown one is rejected.
 const knownEgressAgent=value=>{const id=String(value||'').trim().slice(0,64);return id&&store.data.agents.some(agent=>agent.id===id&&agent.state!=='revoked')?id:''};
 function cleanEgressAgent(value){const id=knownEgressAgent(value);if(String(value||'').trim()&&!id)throw Object.assign(new Error('unknown egress machine'),{status:400});return id}
-function publicRoute(r) { return { id:r.id, alias:r.alias, name:r.name, enabled:r.enabled, upstreams:routeUpstreams(r), allowPrivate:r.allowPrivate, tlsVerify:r.tlsVerify, accessMode:r.accessMode||'key', authMigrationRequired:r.authMigrationRequired===true, showOnHome:r.showOnHome===true, clientProfile:r.clientProfile||{enabled:false},streamRewrite:r.streamRewrite||{enabled:false,domains:[]},autoSteer:r.autoSteer||{enabled:false,minRateMbps:0},egressAgentId:r.egressAgentId||'',tags:r.tags||[],notes:r.notes||'',favorite:r.favorite===true,sortOrder:Number(r.sortOrder||0),speedLimitMbps:Number(r.speedLimitMbps||0),monthlyQuotaGB:Number(r.monthlyQuotaGB||0),reminderDays:Number(r.reminderDays||0),accessAlertThreshold:Number(r.accessAlertThreshold||0),channels:channelList(r),reminderLastAt:r.reminderLastAt||null,createdAt:r.createdAt,updatedAt:r.updatedAt }; }
+function publicRoute(r) { return { id:r.id, alias:r.alias, name:r.name, enabled:r.enabled, upstreams:routeUpstreams(r), allowPrivate:r.allowPrivate, tlsVerify:r.tlsVerify, accessMode:r.accessMode||'key', authMigrationRequired:r.authMigrationRequired===true, showOnHome:r.showOnHome===true, clientProfile:r.clientProfile||{enabled:false},streamRewrite:r.streamRewrite||{enabled:false,domains:[]},autoSteer:r.autoSteer||{enabled:false,minRateMbps:0},egressAgentId:r.egressAgentId||'',lineSync:r.lineSync!==false,lineSyncUpstream:r.lineSyncUpstream===true,tags:r.tags||[],notes:r.notes||'',favorite:r.favorite===true,sortOrder:Number(r.sortOrder||0),speedLimitMbps:Number(r.speedLimitMbps||0),monthlyQuotaGB:Number(r.monthlyQuotaGB||0),reminderDays:Number(r.reminderDays||0),accessAlertThreshold:Number(r.accessAlertThreshold||0),channels:channelList(r),reminderLastAt:r.reminderLastAt||null,createdAt:r.createdAt,updatedAt:r.updatedAt }; }
 function localDomainStatus(){const status=readDomainStatus(cfg.dataFile);if(!status)return null;if(status.state==='active'&&status.currentDomain&&status.currentDomain!==configuredLocalDomain)return{...status,state:'applying',message:'Nginx 已切换，面板服务正在重新载入配置'};return status}
 // A switch that finished and already matches the live endpoint is not news: the "当前生效域名"
 // field and the sync pill already show it, so surfacing a permanent green "已生效" banner is just
@@ -136,6 +137,9 @@ function ongoingDomainChange(change,liveEndpoint){
 }
 function agentView(agent){const view=publicAgent(agent,store.data,agent.id===LOCAL_AGENT_ID?localAgent.status():null);return agent.id===LOCAL_AGENT_ID?{...view,domain:configuredLocalDomain||view.domain||'',domainChange:ongoingDomainChange(localDomainStatus(),configuredLocalDomain||view.domain||''),automaticDomainSwitch:true}:{...view,domainChange:ongoingDomainChange(agent.domainStatus||null,agent.domain||''),automaticDomainSwitch:true}}
 function clientBaseUrl(){return cfg.localProxyBaseUrl||cfg.publicBaseUrl}
+// The lines a client syncs for this node (see line-sync.js), shown in the node editor whether or not the
+// node shares them yet.
+function previewLines(route){return nodeLines(store.data,{...route,lineSync:true},{entryBase:steeringEntryBaseUrl(store.data,route),localBase:clientBaseUrl()})}
 // A node deployed to a remote agent is distributed on that agent's own domain/IP, not the panel's, so
 // its shown client address must reflect that entry (falling back to the panel when served locally).
 // A steered node is handed out on the shared entry domain, which every participating machine serves.
@@ -197,13 +201,13 @@ function publishRoutes(){localAgent.reconcile();agentApi.invalidate();}
 function buildRoute(input,{alias,upstreams,accessMode,accessKey,enabled}){
   const now=new Date().toISOString();
   return {id:randomToken(12),alias,name:String(input.name||alias).slice(0,80),upstreams,allowPrivate:input.allowPrivate===true,tlsVerify:input.tlsVerify!==false,enabled,accessMode,
-    showOnHome:input.showOnHome===true,clientProfile:cleanProfile(input.clientProfile),streamRewrite:cleanStreamRewrite(input.streamRewrite),autoSteer:cleanAutoSteer(input.autoSteer),egressAgentId:knownEgressAgent(input.egressAgentId),tags:cleanTags(input.tags),notes:String(input.notes||'').slice(0,500),favorite:input.favorite===true,
+    showOnHome:input.showOnHome===true,clientProfile:cleanProfile(input.clientProfile),streamRewrite:cleanStreamRewrite(input.streamRewrite),autoSteer:cleanAutoSteer(input.autoSteer),egressAgentId:knownEgressAgent(input.egressAgentId),lineSync:input.lineSync!==false,lineSyncUpstream:input.lineSyncUpstream===true,tags:cleanTags(input.tags),notes:String(input.notes||'').slice(0,500),favorite:input.favorite===true,
     sortOrder:numeric(input.sortOrder,-10000,10000),speedLimitMbps:numeric(input.speedLimitMbps,0,100000),monthlyQuotaGB:numeric(input.monthlyQuotaGB,0,1000000),reminderDays:numeric(input.reminderDays,0,365),accessAlertThreshold:numeric(input.accessAlertThreshold,0,100000),
     ...routeAuthFields(accessKey),createdAt:now,updatedAt:now};
 }
 // Node fields a PATCH sets directly, applied in this order.
 const ROUTE_PATCH_FIELDS={
-  name:v=>String(v).slice(0,80),enabled:v=>v===true,tlsVerify:v=>v===true,showOnHome:v=>v===true,clientProfile:cleanProfile,streamRewrite:cleanStreamRewrite,autoSteer:cleanAutoSteer,egressAgentId:cleanEgressAgent,tags:cleanTags,notes:v=>String(v).slice(0,500),favorite:v=>v===true,
+  name:v=>String(v).slice(0,80),enabled:v=>v===true,tlsVerify:v=>v===true,showOnHome:v=>v===true,clientProfile:cleanProfile,streamRewrite:cleanStreamRewrite,autoSteer:cleanAutoSteer,egressAgentId:cleanEgressAgent,lineSync:v=>v!==false,lineSyncUpstream:v=>v===true,tags:cleanTags,notes:v=>String(v).slice(0,500),favorite:v=>v===true,
   sortOrder:v=>numeric(v,-10000,10000),speedLimitMbps:v=>numeric(v,0,100000),monthlyQuotaGB:v=>numeric(v,0,1000000),reminderDays:v=>numeric(v,0,365),accessAlertThreshold:v=>numeric(v,0,100000)
 };
 
@@ -335,8 +339,9 @@ async function updateAgent(req,res,agent){
   if(b.sortOrder!==undefined)agent.sortOrder=numeric(b.sortOrder,-10000,10000);
   if(b.steerTarget!==undefined)agent.steerTarget=b.steerTarget===true;
   agent.updatedAt=now;
-  // Another machine's deployments or participation reshape the steering peers in this machine's snapshot too.
-  if(local||routeIds||b.steerTarget!==undefined)localAgent.reconcile();
+  // Any machine's name, order, domain, deployments or participation reshape the line lists and steering
+  // peers in this machine's snapshot too.
+  localAgent.reconcile();
   if(b.steerTarget!==undefined||b.domain!==undefined)syncLocalEntry();
   agentApi.invalidate();
   store.audit(localDomainRequested?'agent.local_domain_requested':'agent.updated',ip(req),agent.id);
@@ -501,7 +506,7 @@ const adminApi={
   'POST /account/totp/begin':beginTotp,
   'POST /account/totp/enable':enableTotp,
   'POST /account/totp/disable':disableTotp,
-  'GET /routes':(req,res)=>json(res,200,{routes:store.data.routes.map(publicRoute).sort((a,b)=>a.sortOrder-b.sortOrder||Number(b.favorite)-Number(a.favorite)||a.name.localeCompare(b.name))}),
+  'GET /routes':(req,res)=>json(res,200,{routes:store.data.routes.map(r=>({...publicRoute(r),syncLines:previewLines(r)})).sort((a,b)=>a.sortOrder-b.sortOrder||Number(b.favorite)-Number(a.favorite)||a.name.localeCompare(b.name))}),
   'POST /routes':createRoute,
   'POST /import':importRoutes,
   'GET /export':(req,res)=>json(res,200,{version:1,exportedAt:new Date().toISOString(),routes:store.data.routes.map(r=>{const x=publicRoute(r);delete x.id;delete x.createdAt;delete x.updatedAt;return x})}),
