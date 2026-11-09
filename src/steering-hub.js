@@ -1,5 +1,6 @@
 import { agentKnows, LOCAL_AGENT_ID, remoteAgentStatus } from './agent-registry.js';
-import { STEERING_CAPABILITY, STEER_DEFAULTS, VERDICTS } from './steering.js';
+import { STEERING_CAPABILITY, STEER_DEFAULTS } from './steering.js';
+import { readReport, SESSION_KEY_RE, sessionUpdate, syncResponse } from './steering-sync.js';
 import { boundedClientList, excludedClients, readSteeringSettings } from './steering-topology.js';
 import { PlaybackObservation } from './playback-observation.js';
 
@@ -8,7 +9,6 @@ import { PlaybackObservation } from './playback-observation.js';
 // plus the health of its peers. Held in memory only — losing it on a restart just resets sessions to
 // "served wherever they land", which never interrupts a playback.
 
-const SESSION_KEY_RE=/^[A-Za-z0-9_-]{22}$/,PREFIX_KEY_RE=/^[A-Za-z0-9_-]{16}$/;
 const BATCH=200;
 const LANDING_SAMPLE=20,LANDING_MIN_SAMPLE=10,LANDING_MIN_RATIO=0.8;
 // Per client network and machine: how often playback went well. One sample per session and machine a
@@ -160,85 +160,74 @@ export class SteeringHub {
     return [...this.clients.values()].filter(stat=>stat.results.length>=TRIAL_MIN_LANDINGS&&stat.results.filter(Boolean).length/stat.results.length>=TRIAL_MIN_LANDED&&!decided.has(stat.client.toLowerCase())).slice(0,8).map(stat=>stat.client);
   }
 
+  // One machine's report in, the sessions that changed for it since its cursor out (see steering-sync.js).
   exchange(agentId, payload={}) {
-    const now=this.clock(),deployed=this.deployedRoutes(agentId);
+    const now=this.clock(),deployed=this.deployedRoutes(agentId),report=readReport(payload);
     this.prune(now);
     const routes={};
-    for(const [routeId,health] of Object.entries(payload?.health?.routes&&typeof payload.health.routes==='object'?payload.health.routes:{})){
-      if(deployed.has(routeId))routes[routeId]={line:Math.floor(number(health?.line,0,7)),quotaExhausted:health?.quotaExhausted===true};
-    }
+    for(const [routeId,health] of Object.entries(report.health))if(deployed.has(routeId))routes[routeId]=health;
     this.health.set(agentId,{at:now,routes});
-    const sessionFor=item=>{
-      const key=String(item?.s||''),routeId=String(item?.r||'');
-      return SESSION_KEY_RE.test(key)&&deployed.has(routeId)?this.touch(key,routeId,now):null;
-    };
-    for(const report of list(payload?.reports)){
-      const session=sessionFor(report);
-      if(!session||!VERDICTS.includes(report.verdict))continue;
+    const sessionFor=item=>SESSION_KEY_RE.test(item.s)&&deployed.has(item.r)?this.touch(item.s,item.r,now):null;
+    for(const item of report.reports){
+      const session=sessionFor(item);
+      if(!session||!item.verdict)continue;
       // A machine only ever speaks for its own line to the client.
-      const at=Math.min(now,number(report.at)),rateBps=Math.round(number(report.rateBps,0,1e11));
-      session.scores[agentId]={verdict:report.verdict,rateBps,at};
-      const seconds=number(report.segmentSeconds,0,60);if(seconds>0)session.segmentSeconds=seconds;
-      if(report.client)session.client=text(report.client);
-      if(PREFIX_KEY_RE.test(String(report.p||'')))session.prefix=report.p;
-      this.learn(session,agentId,report.verdict,at);
-      this.settle(session,agentId,report.verdict,rateBps,at);
+      const at=Math.min(now,item.at);
+      session.scores[agentId]={verdict:item.verdict,rateBps:item.rateBps,at};
+      if(item.segmentSeconds>0)session.segmentSeconds=item.segmentSeconds;
+      if(item.client!==null)session.client=item.client;
+      if(item.p)session.prefix=item.p;
+      this.learn(session,agentId,item.verdict,at);
+      this.settle(session,agentId,item.verdict,item.rateBps,at);
       this.bump(session);
     }
-    for(const decision of list(payload?.decisions)){
-      const session=sessionFor(decision);
+    for(const item of report.decisions){
+      const session=sessionFor(item);
       if(!session)continue;
-      const assigned=text(decision.assigned,64),epoch=Math.floor(number(decision.epoch));
+      const {assigned,epoch,reason}=item;
       if(assigned&&!this.routeAgents(session.routeId).has(assigned))continue;
       // Concurrent reassignments: the first one to reach a new epoch wins; the loser learns the
       // winner from this very response.
       if(epoch<=session.epoch)continue;
-      const at=Math.min(now,number(decision.at)),reason=text(decision.reason,32);
+      const at=Math.min(now,item.at);
       session.epoch=epoch;session.assigned=assigned;
       // A newer reassignment ends the wait on the previous switch's outcome.
       if(session.effect){this.effectDone('on',session.effect,reason==='landing_timeout'?'not_landed':'unmeasured');session.effect=null;}
-      if(decision.switched===true){
+      if(item.switched){
         session.lastSwitchAt=at;session.switches=[...session.switches,at].slice(-10);
         if(assigned)session.tried[assigned]=at;
-        if(assigned)session.effect={epoch,at,routeId:session.routeId,from:text(decision.from,64)||agentId,to:assigned,reason,fromRateBps:number(decision.fromRateBps)};
+        if(assigned)session.effect={epoch,at,routeId:session.routeId,from:item.from||agentId,to:assigned,reason,fromRateBps:item.fromRateBps};
       }
       this.bump(session);
-      this.event({at,routeId:session.routeId,session:session.key.slice(0,6),from:text(decision.from,64),to:assigned,reason,fromRateBps:number(decision.fromRateBps),toRateBps:number(decision.toRateBps),client:text(decision.client),mode:'on',reporter:agentId});
+      this.event({at,routeId:session.routeId,session:session.key.slice(0,6),from:item.from,to:assigned,reason,fromRateBps:item.fromRateBps,toRateBps:item.toRateBps,client:item.client,mode:'on',reporter:agentId});
     }
-    for(const landing of list(payload?.landings)){
-      const session=sessionFor(landing);
+    for(const item of report.landings){
+      const session=sessionFor(item);
       if(!session)continue;
-      const epoch=Math.floor(number(landing.epoch)),at=Math.min(now,number(landing.at));
-      session.lastLanding={epoch,at};
-      if(session.landedEpoch!==epoch){session.landedEpoch=epoch;this.outcome(landing.client||session.client,true);}
+      session.lastLanding={epoch:item.epoch,at:Math.min(now,item.at)};
+      if(session.landedEpoch!==item.epoch){session.landedEpoch=item.epoch;this.outcome(item.client||session.client,true);}
       this.bump(session);
     }
-    for(const failure of list(payload?.failures)){
-      const session=sessionFor(failure);
-      if(!session)continue;
-      const epoch=Math.floor(number(failure.epoch));
-      if(session.failedEpoch===epoch)continue;
-      session.failedEpoch=epoch;
-      this.outcome(failure.client||session.client,false);
-      if(session.effect?.epoch===epoch){this.effectDone('on',session.effect,'not_landed');session.effect=null;}
-      this.event({at:Math.min(now,number(failure.at)),routeId:session.routeId,session:session.key.slice(0,6),from:agentId,to:text(failure.target,64),reason:'landing_timeout',fromRateBps:0,toRateBps:0,client:text(failure.client||session.client),mode:'on',reporter:agentId});
+    for(const item of report.failures){
+      const session=sessionFor(item);
+      if(!session||session.failedEpoch===item.epoch)continue;
+      session.failedEpoch=item.epoch;
+      this.outcome(item.client||session.client,false);
+      if(session.effect?.epoch===item.epoch){this.effectDone('on',session.effect,'not_landed');session.effect=null;}
+      this.event({at:Math.min(now,item.at),routeId:session.routeId,session:session.key.slice(0,6),from:agentId,to:item.target,reason:'landing_timeout',fromRateBps:0,toRateBps:0,client:text(item.client||session.client),mode:'on',reporter:agentId});
     }
-    for(const item of list(payload?.shadow)){
-      const routeId=String(item?.r||'');
-      if(!deployed.has(routeId))continue;
-      const session=sessionFor(item),at=Math.min(now,number(item.at));
-      if(session&&!session.shadowEffect)session.shadowEffect={at,routeId,from:agentId,to:text(item.to,64),reason:text(item.reason,32)};
-      this.event({at:Math.min(now,number(item.at)),routeId,session:String(item.s||'').slice(0,6),from:agentId,to:text(item.to,64),reason:text(item.reason,32),fromRateBps:number(item.fromRateBps),toRateBps:number(item.toRateBps),client:text(item.client),mode:'shadow',reporter:agentId});
+    for(const item of report.shadow){
+      if(!deployed.has(item.r))continue;
+      const session=sessionFor(item),at=Math.min(now,item.at);
+      if(session&&!session.shadowEffect)session.shadowEffect={at,routeId:item.r,from:agentId,to:item.to,reason:item.reason};
+      this.event({at,routeId:item.r,session:item.s.slice(0,6),from:agentId,to:item.to,reason:item.reason,fromRateBps:item.fromRateBps,toRateBps:item.toRateBps,client:item.client,mode:'shadow',reporter:agentId});
     }
-    for(const item of list(payload?.bounds)){
-      if(deployed.has(String(item?.r||'')))this.bound(item.client,item.continued===true,item.trial===true);
+    for(const item of report.bounds)if(deployed.has(item.r))this.bound(item.client,item.continued,item.trial);
+    for(const item of report.rangeEvents){
+      const session=sessionFor({s:String(item.s||''),r:String(item.r||'')});if(session)this.rangeEvent(session,item,now);
     }
-    for(const item of list(payload?.rangeEvents)){
-      if(item?.phase!=='request'&&item?.phase!=='complete')continue;
-      const session=sessionFor(item);if(session)this.rangeEvent(session,item,now);
-    }
-    for(const item of list(payload?.playbackEvents))if(deployed.has(String(item?.r||'')))this.playback.ingest(agentId,item,now);
-    return this.response(agentId,deployed,payload?.cursor,now);
+    for(const item of report.playbackEvents)if(deployed.has(String(item?.r||'')))this.playback.ingest(agentId,item,now);
+    return this.response(agentId,deployed,report.cursor,now);
   }
 
   response(agentId, deployed, cursorValue, now) {
@@ -246,14 +235,17 @@ export class SteeringHub {
     const cursor=Number.isSafeInteger(cursorValue)&&cursorValue>=0&&cursorValue<=this.seq?cursorValue:0;
     const changed=[...this.sessions.values()].filter(session=>session.seq>cursor&&deployed.has(session.routeId)).sort((left,right)=>left.seq-right.seq).slice(0,BATCH);
     const settings=readSteeringSettings(this.store.data);
-    return {
-      protocolVersion:1,serverTime:now,cursor:changed.length===BATCH?changed.at(-1).seq:this.seq,
-      sessions:changed.map(session=>({s:session.key,r:session.routeId,assigned:session.assigned,epoch:session.epoch,lastSwitchAt:session.lastSwitchAt,switches:session.switches,scores:session.scores,tried:session.tried,segmentSeconds:session.segmentSeconds,lastLanding:session.lastLanding,lastSeen:session.lastSeen,prior:this.prior(session,now)})),
+    return syncResponse({
+      serverTime:now,cursor:changed.length===BATCH?changed.at(-1).seq:this.seq,
+      sessions:changed.map(session=>sessionUpdate(session,this.prior(session,now))),
       peers:this.peers(),
       excludedClients:excludedClients(settings),
       boundedClients:boundedClientList(settings),trialClients:this.trialClients(settings),boundBytes:settings.boundMB*1024*1024
-    };
+    });
   }
+
+  // The operator cleared the automatic capped-range results: forget the evidence behind them as well.
+  clearRangeVerdicts() { this.bounds.clear(); }
 
   peers() {
     const out=[];

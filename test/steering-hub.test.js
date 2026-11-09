@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SteeringHub } from '../src/steering-hub.js';
+import { localTransport } from '../src/steering-sync.js';
 import { SteeringEngine } from '../src/steering.js';
 import { agentSnapshotNodes, agentSteeringIssues, cleanEntryRequest, desiredEntry, egressIssues, egressTopology, entryAttempt, entryCoverageGaps, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringTopology } from '../src/steering-topology.js';
 import { compileAgentDesiredSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
@@ -150,7 +151,7 @@ test('two engines converge through the hub: a landing at the target confirms the
   const {store,route:base}=fixture(),hub=new SteeringHub({store,clock:()=>now});
   const route={...base,steering:{mode:'on',peers:[{id:'b',base:'https://s2.example.com'},{id:'local',base:'https://s1.example.com'}],params:{minRateMbps:0}}};
   const a=new SteeringEngine({selfId:'local',clock:()=>now}),b=new SteeringEngine({selfId:'b',clock:()=>now});
-  const sync=async(engine,id)=>engine.applySync(hub.exchange(id,engine.syncPayload([route])));
+  const sync=async(engine,id)=>engine.applySync(await localTransport(hub,id)(engine.syncPayload([route])));
   await sync(a,'local');await sync(b,'b');await sync(a,'local');
   const url='/movie/key123/Videos/abc/stream.mkv?DeviceId=d1&api_key=x',plan=(engine,path=url)=>{const incoming=new URL(path,'http://relay.invalid');return engine.plan({route,found:{route,rest:incoming.pathname.replace('/movie/key123',''),prefix:'/movie/key123'},req:{method:'GET',headers:{'user-agent':'Infuse-Direct/8'}},incoming,publicContext:{proto:'https'}})};
   plan(a);
@@ -242,7 +243,7 @@ test('stopping or pausing a capped playback does not disable its client type',()
   let now=1_000_000_000;
   const {store,data,route}=fixture();data.settings.steering.boundedClients=['VidHub'];
   const hub=new SteeringHub({store,clock:()=>now,onBoundVerdict:(client,works)=>{if(!works)(data.settings.steering.autoUnbounded||={})[client]='now';}});
-  const engine=new SteeringEngine({selfId:'local',clock:()=>now});engine.bounded.add('vidhub');engine.boundBytes=1000;
+  const engine=new SteeringEngine({selfId:'local',clock:()=>now,params:{boundBytes:1000}});engine.applySync({boundedClients:['vidhub']});
   const play=(item,start)=>{
     const incoming=new URL(`https://entry.example.com/Videos/${item}/stream?DeviceId=device`);
     const plan=engine.plan({route:{...route,steering:{mode:'on',peers:[]}},found:{rest:incoming.pathname,prefix:'/movie/key'},incoming,publicContext:{proto:'https'},req:{method:'GET',headers:{range:`bytes=${start}-`,'x-emby-client':'VidHub'}}});
@@ -265,8 +266,10 @@ test('stopping or pausing a capped playback does not disable its client type',()
 test('capped playback continues across machines even when sync batches arrive out of order',()=>{
   let now=1_000_000_000;
   const {store,data,route}=fixture();data.settings.steering.boundedClients=['VidHub'];
-  const hub=new SteeringHub({store,clock:()=>now}),a=new SteeringEngine({selfId:'local',clock:()=>now}),b=new SteeringEngine({selfId:'b',clock:()=>now});
-  for(const engine of [a,b]){engine.bounded.add('vidhub');engine.boundBytes=1000;}
+  const hub=new SteeringHub({store,clock:()=>now}),a=new SteeringEngine({selfId:'local',clock:()=>now,params:{boundBytes:1000}}),b=new SteeringEngine({selfId:'b',clock:()=>now,params:{boundBytes:1000}});
+  for(const engine of [a,b])engine.applySync({boundedClients:['vidhub']});
+  // Each machine's batches reach the hub over the wire format, in the order the test chooses.
+  const send={local:localTransport(hub,'local'),b:localTransport(hub,'b')};
   const play=(engine,start)=>{
     const incoming=new URL('https://entry.example.com/Videos/movie/stream?DeviceId=device');
     const plan=engine.plan({route:{...route,steering:{mode:'on',peers:[]}},found:{rest:incoming.pathname,prefix:'/movie/key'},incoming,publicContext:{proto:'https'},req:{method:'GET',headers:{range:`bytes=${start}-`,'x-emby-client':'VidHub'}}});
@@ -275,16 +278,16 @@ test('capped playback continues across machines even when sync batches arrive ou
   try{
     play(a,0);play(b,1000);
     const first=a.syncPayload([route]),second=b.syncPayload([route]);
-    hub.exchange('b',second);hub.exchange('local',first);
+    send.b(second);send.local(first);
     assert.equal(hub.view().ranges[0]?.continued,1,'the next Range on another machine confirms the first cap');
-    hub.exchange('local',first);hub.exchange('b',second);
+    send.local(first);send.b(second);
     assert.equal(hub.view().ranges[0].total,1,'retrying a sync must not count the same cap twice');
     now+=121_000;a.tick();b.tick();
-    hub.exchange('local',a.syncPayload([route]));hub.exchange('b',b.syncPayload([route]));
+    send.local(a.syncPayload([route]));send.b(b.syncPayload([route]));
     assert.equal(hub.view().ranges[0].total,1,'no follow-up leaves the last cap unconfirmed');
-    play(a,0);hub.exchange('local',a.syncPayload([route]));
+    play(a,0);send.local(a.syncPayload([route]));
     assert.equal(hub.view().ranges[0].total,1,'an earlier request cannot confirm a later re-read of the same bytes');
-    play(b,1000);hub.exchange('b',b.syncPayload([route]));
+    play(b,1000);send.b(b.syncPayload([route]));
     assert.equal(hub.view().ranges[0].continued,2);
   }finally{a.stop();b.stop();}
 });

@@ -4,6 +4,7 @@ import zlib from 'node:zlib';
 import { isRouteAuthKey } from './route-auth.js';
 import { b64u } from './security.js';
 import { observeJson } from './playback-observation.js';
+import { readSyncResponse, requeueReport, takeReport } from './steering-sync.js';
 
 // Automatic playback steering (docs/AUTO_STEERING.md). Every machine runs this engine on its own data
 // plane: it measures how well each playback session is being served here, and at request boundaries
@@ -16,7 +17,6 @@ export const STEERING_MODES=Object.freeze(['off','shadow','on']);
 // recognises such relayed requests when it is the egress machine itself.
 export const EGRESS_CAPABILITY='egress-v1';
 export const EGRESS_HEADER='x-aegis-egress',EGRESS_HOST_HEADER='x-aegis-egress-host';
-export const VERDICTS=Object.freeze(['ok','starved_down','starved_up','unknown']);
 export const STEER_DEFAULTS=Object.freeze({
   hlsWindowMs:20_000,minHlsSegments:4,progressiveWindowTicks:120,verdictTtlMs:60_000,dwellMs:120_000,
   switchWindowMs:600_000,maxSwitches:3,improve:1.3,penaltyMs:600_000,tokenTtlMs:30_000,sessionTtlMs:30*60_000,
@@ -26,7 +26,6 @@ export const STEER_DEFAULTS=Object.freeze({
   historyMinSamples:3,historyBadShare:0.34,historyGoodShare:0.75,boundContinueMs:120_000
 });
 
-const SESSION_KEY_RE=/^[A-Za-z0-9_-]{22}$/,PREFIX_KEY_RE=/^[A-Za-z0-9_-]{16}$/;
 const ITEM_RE=/\/(?:emby\/)?(?:videos|audio)\/([^/]+)\//i;
 const PLAY_RE=/\/(?:emby\/)?play\/(?:video|audio)\/([^/]+)(?:\/|$)/i;
 const DOWNLOAD_RE=/\/items\/([^/]+)\/download/i;
@@ -602,56 +601,43 @@ export class SteeringEngine {
   syncPayload(routes) {
     const health={routes:{}};
     for(const route of routes)health.routes[route.id]={line:this.lineOf(route),quotaExhausted:!this.canServe(route)};
-    const reports=[...this.reports.values()].slice(0,200);
-    for(const report of reports)this.reports.delete(report.s);
-    return {protocolVersion:1,cursor:this.cursor,reports,decisions:this.decisions.splice(0,200),landings:this.landings.splice(0,200),failures:this.failures.splice(0,200),shadow:this.shadow.splice(0,200),rangeEvents:this.rangeEvents.splice(0,200),playbackEvents:this.playbackEvents.splice(0,200),health};
+    return takeReport(this,health);
   }
 
   // A failed sync must not lose decisions/landings: put them back in front (reports are superseded by
   // fresher ones anyway).
-  requeue(payload) {
-    for(const list of ['decisions','landings','failures','shadow','rangeEvents','playbackEvents']){
-      this[list].unshift(...(payload[list]||[]));
-      if(this[list].length>1000)this[list].splice(0,this[list].length-1000);
-    }
-  }
+  requeue(payload) { requeueReport(this,payload); }
 
+  // The panel's answer (see steering-sync.js). Whatever it leaves out, this machine keeps.
   applySync(response) {
-    if(!response||typeof response!=='object')return;
-    const serverTime=Number(response.serverTime);
-    if(Number.isFinite(serverTime)&&serverTime>0)this.offsetMs=serverTime-this.clock();
-    if(Number.isSafeInteger(response.cursor)&&response.cursor>=0)this.cursor=response.cursor;
-    for(const remote of Array.isArray(response.sessions)?response.sessions:[])this.mergeSession(remote);
-    if(Array.isArray(response.peers))this.health=new Map(response.peers.map(peer=>[String(peer?.id||''),{healthy:peer?.healthy===true,at:Number(peer?.at)||0,routes:peer?.routes&&typeof peer.routes==='object'?peer.routes:{}}]));
-    if(Array.isArray(response.excludedClients))this.excluded=new Set(response.excludedClients.map(client=>String(client).toLowerCase()));
-    if(Array.isArray(response.boundedClients))this.bounded=new Set(response.boundedClients.map(client=>String(client).toLowerCase()));
-    if(Array.isArray(response.trialClients))this.trials=new Set(response.trialClients.map(client=>String(client).toLowerCase()));
-    if(Number.isSafeInteger(response.boundBytes)&&response.boundBytes>=1024*1024)this.boundBytes=response.boundBytes;
+    const sync=readSyncResponse(response);
+    if(!sync)return;
+    if(sync.serverTime!==undefined)this.offsetMs=sync.serverTime-this.clock();
+    if(sync.cursor!==undefined)this.cursor=sync.cursor;
+    for(const update of sync.sessions)this.mergeSession(update);
+    if(sync.peers)this.health=new Map(sync.peers.map(peer=>[peer.id,{healthy:peer.healthy,at:peer.at,routes:peer.routes}]));
+    if(sync.excludedClients)this.excluded=new Set(sync.excludedClients);
+    if(sync.boundedClients)this.bounded=new Set(sync.boundedClients);
+    if(sync.trialClients)this.trials=new Set(sync.trialClients);
+    if(sync.boundBytes!==undefined)this.boundBytes=sync.boundBytes;
   }
 
-  mergeSession(remote) {
-    const key=String(remote?.s||'');
-    if(!SESSION_KEY_RE.test(key))return;
-    const session=this.session(key,String(remote.r||''),Number(remote.lastSeen)||this.now());
-    const epoch=Number(remote.epoch)||0,assigned=String(remote.assigned||'');
+  // Folds one session update from the panel into this machine's copy.
+  mergeSession(update) {
+    const session=this.session(update.key,update.routeId,update.lastSeen||this.now());
     // The panel is the arbiter: a newer epoch always wins, and at the same epoch its choice wins.
-    if(epoch>session.epoch||(epoch===session.epoch&&assigned!==session.assigned)){
-      session.epoch=epoch;session.assigned=assigned;session.lastSwitchAt=Number(remote.lastSwitchAt)||0;
-      session.switches=Array.isArray(remote.switches)?remote.switches.map(Number).filter(Number.isFinite).slice(-10):[];
+    if(update.epoch>session.epoch||(update.epoch===session.epoch&&update.assigned!==session.assigned)){
+      session.epoch=update.epoch;session.assigned=update.assigned;session.lastSwitchAt=update.lastSwitchAt;session.switches=update.switches;
     }
-    for(const [id,score] of Object.entries(remote.scores&&typeof remote.scores==='object'?remote.scores:{})){
+    for(const [id,score] of Object.entries(update.scores)){
       if(id===this.selfId)continue;
-      const at=Number(score?.at)||0;
-      if(!session.scores[id]||at>session.scores[id].at)session.scores[id]={verdict:VERDICTS.includes(score?.verdict)?score.verdict:'unknown',rateBps:Number(score?.rateBps)||0,at};
+      if(!session.scores[id]||score.at>session.scores[id].at)session.scores[id]=score;
     }
-    for(const [id,at] of Object.entries(remote.tried&&typeof remote.tried==='object'?remote.tried:{}))session.tried[id]=Math.max(session.tried[id]||0,Number(at)||0);
-    if(!session.segmentSeconds&&Number(remote.segmentSeconds)>0)session.segmentSeconds=Number(remote.segmentSeconds);
-    if(remote.prior&&typeof remote.prior==='object'){
-      session.prior={};
-      for(const [id,seen] of Object.entries(remote.prior).slice(0,32)){const n=Math.floor(Number(seen?.n)||0),ok=Number(seen?.ok);if(n>0&&ok>=0&&ok<=1)session.prior[id]={ok,n};}
-    }
-    if(remote.lastLanding&&(!session.lastLanding||Number(remote.lastLanding.at)>session.lastLanding.at))session.lastLanding={epoch:Number(remote.lastLanding.epoch)||0,at:Number(remote.lastLanding.at)||0};
-    session.lastSeen=Math.max(session.lastSeen,Number(remote.lastSeen)||0);
+    for(const [id,at] of Object.entries(update.tried))session.tried[id]=Math.max(session.tried[id]||0,at);
+    if(!session.segmentSeconds&&update.segmentSeconds>0)session.segmentSeconds=update.segmentSeconds;
+    if(update.prior)session.prior=update.prior;
+    if(update.lastLanding&&(!session.lastLanding||update.lastLanding.at>session.lastLanding.at))session.lastLanding=update.lastLanding;
+    session.lastSeen=Math.max(session.lastSeen,update.lastSeen);
   }
 
   // `send(payload) -> response` is the transport: a signed HTTPS call on agents, a direct hub call on

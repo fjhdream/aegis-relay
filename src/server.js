@@ -21,6 +21,7 @@ import { qrRows } from './qr.js';
 import { fetchPanelIcon, MAX_ICON_BYTES, normalizePanelIcon } from './panel-icon.js';
 import { SteeringEngine } from './steering.js';
 import { SteeringHub } from './steering-hub.js';
+import { localTransport } from './steering-sync.js';
 import { steeringSettings } from './steering-topology.js';
 import { channelList, Panel } from './panel.js';
 
@@ -317,7 +318,8 @@ async function serveAdmin(req,res,prefix){
 const admin=http.createServer((req,res)=>serveAdmin(req,res,cfg.adminPath));
 admin.requestTimeout=35_000;admin.headersTimeout=10_000;admin.listen(cfg.adminPort,cfg.adminHost,()=>console.log(`AegisRelay admin listening on http://${cfg.adminHost}:${cfg.adminPort}${cfg.adminPath}`));
 const steering=new SteeringEngine({selfId:LOCAL_AGENT_ID,lineOf:activeUpstreamLine,canServe:route=>metrics.canServe(route)});
-steering.start(async payload=>steeringHub.exchange(LOCAL_AGENT_ID,payload),()=>localAgent.routeSource.getRoutes());
+// The panel machine syncs with its own hub exactly as a remote machine would, minus the network.
+steering.start(localTransport(steeringHub,LOCAL_AGENT_ID),()=>localAgent.routeSource.getRoutes());
 const relay=makeProxyHandler(localAgent.routeSource,key,metrics,steering);
 const panelHostname=baseHostname(cfg.publicBaseUrl),proxyHostname=baseHostname(cfg.localProxyBaseUrl)||panelHostname,splitDomains=!!panelHostname&&!!proxyHostname&&panelHostname!==proxyHostname;
 function requestHostname(req){try{return new URL(`http://${String(req.headers.host||'')}`).hostname.toLowerCase()}catch{return''}}

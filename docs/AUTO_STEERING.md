@@ -492,7 +492,8 @@ mac   = HMAC-SHA256(steerKey, "token\n" ‖ 前面各字段)[0:16]
 
 | 文件 | 职责 |
 |---|---|
-| `src/steering.js` | 数据面引擎：会话键与令牌、网段摘要、统一出口凭证、§7 的判定、§8 的 `decide`（纯函数）、`SteeringEngine.plan`（决定就地服务还是跳转）、测速采样、分段接续判定、同步载荷的导出与合并 |
+| `src/steering.js` | 数据面引擎：会话键与令牌、网段摘要、统一出口凭证、§7 的判定、§8 的 `decide`（纯函数）、`SteeringEngine.plan`（决定就地服务还是跳转）、测速采样、分段接续判定、把 hub 的答复合并进本机会话 |
+| `src/steering-sync.js` | 机器与面板之间的切流同步格式（两个方向的编码与清洗），以及面板本机和测试用的 `localTransport` |
 | `src/steering-hub.js` | 面板侧会话仲裁、对端健康、决策事件、客户端落地率、切换效果、网段历史、分段接续统计 |
 | `src/steering-topology.js` | 设置的规范化、机器/节点能否参与及原因、快照拓扑（含统一出口）、入口域名地址与各机器的入口配置 |
 | `src/domain-control.js` | 面板本机的入口域名请求文件 |
