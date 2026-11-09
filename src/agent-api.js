@@ -1,14 +1,11 @@
 import crypto from 'node:crypto';
 import { b64u, randomToken, RateLimiter, requestIp, timingEqual } from './security.js';
 import { ensurePanelSigningIdentity } from './snapshot.js';
-import { compileAgentDesiredSnapshot } from './snapshot.js';
-import { LOCAL_AGENT_ID, normalizeAgentDomain, replaceAgentDeployments } from './agent-registry.js';
+import { DesiredSnapshots } from './desired-snapshots.js';
+import { normalizeAgentDomain, replaceAgentDeployments } from './agent-registry.js';
 import { sealAgentSnapshot } from './agent-config.js';
 import { sanitizeTelemetry } from './telemetry.js';
-import { EGRESS_CAPABILITY, STEERING_CAPABILITY } from './steering.js';
-import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
-import { cleanEntryStatus, desiredEntry, ENTRY_CAPABILITY, readSteeringSettings } from './steering-topology.js';
-import { LINE_SYNC_CAPABILITY, lineSyncEnabled } from './line-sync.js';
+import { cleanEntryStatus, desiredEntry, ENTRY_CAPABILITY } from './steering-topology.js';
 
 export const AGENT_PROTOCOL_VERSION=1;
 export const ENROLLMENT_TTL_MS=10*60_000;
@@ -63,9 +60,9 @@ export function consumeEnrollment(data,token,agentInput,now=Date.now()) {
   return agent;
 }
 
-// The parts of a machine record that feed the steering topology and the line lists compiled into
-// every snapshot.
-const steeringTopologyKey=agent=>{const has=name=>Array.isArray(agent.capabilities)&&agent.capabilities.includes(name)?1:0;return `${has(STEERING_CAPABILITY)}|${has(EGRESS_CAPABILITY)}|${has(PLAYBACK_OBSERVATION_CAPABILITY)}|${has(LINE_SYNC_CAPABILITY)}|${agent.domain||''}|${agent.proxyMode||''}`};
+// The machine profile (机器档案, see GLOSSARY.md): what a check-in reports that snapshots are built
+// from. Heartbeat fields (health, revisions, telemetry) are not part of it and never recompile anything.
+const machineProfile=agent=>JSON.stringify([Array.isArray(agent.capabilities)?agent.capabilities:[],agent.domain||'',agent.proxyMode||'']);
 
 function cleanCapabilities(value) {
   return [...new Set((Array.isArray(value)?value:[]).map(item=>String(item)).filter(item=>/^[a-z0-9-]{1,32}$/.test(item)))].slice(0,16);
@@ -129,44 +126,34 @@ function importPanelPrivate(identity) { return crypto.createPrivateKey({key:Buff
 function baseHeaders(extra={}) { return {'cache-control':'no-store','content-type':'application/json; charset=utf-8','x-content-type-options':'nosniff','referrer-policy':'no-referrer',...extra}; }
 
 export class AgentApi {
-  constructor({store,version='0.0.0',steering=null,onTopologyChange=null,localBase=''}) {
-    this.store=store;this.version=version;this.steering=steering;this.onTopologyChange=onTopologyChange;this.localBase=localBase;this.panelIdentity=ensurePanelSigningIdentity(store);this.nonces=new Map();
+  constructor({store,version='0.0.0',steering=null,snapshots=null,localBase=''}) {
+    this.store=store;this.version=version;this.steering=steering;this.snapshots=snapshots||new DesiredSnapshots({store,localBase});this.panelIdentity=ensurePanelSigningIdentity(store);this.nonces=new Map();
     // Every response is signed and every request verified; parsing the DER keys each time was pure
     // overhead on the media event loop. The panel key is fixed for the process, agent keys per record.
     this.panelPrivateKey=importPanelPrivate(this.panelIdentity);this.agentKeys=new WeakMap();
     // Enrollment is the only unauthenticated agent endpoint. Tokens are 32-byte digests so guessing
     // is hopeless, but without a limiter the endpoint is still free CPU and audit-log spam.
     this.enrollLimiter=new RateLimiter(12,10*60_000);
-    // Control-plane work must never stall the media data plane, so desired snapshots are compiled
-    // once per configuration epoch instead of on every heartbeat, and pollers park on a long poll.
-    this.epoch=1;this.cache=new Map();this.waiters=new Set();
+    // Control-plane work must never stall the media data plane: snapshots are compiled only when the
+    // panel data changes (see desired-snapshots.js), and pollers park on a long poll until then. Only
+    // the machines whose snapshot changed are woken.
+    this.waiters=new Set();
+    this.snapshots.subscribe(changed=>this.wake(changed));
   }
 
-  // Called by the panel whenever routes, deployments or agents change.
-  // The desired revision used to be recompiled lazily, on the machine's next heartbeat. Until then
-  // agent.desiredRevision still equalled appliedRevision, so a card whose node selection had just
-  // been changed reported 「配置已同步」 for up to a full heartbeat while the machine was in fact
-  // still serving the old node set — the change looked like it had silently done nothing. Recompile
-  // right here instead: it is one signature per machine, the result is what the next poll would have
-  // cached anyway, and the panel now says 「等待同步」 until the machine has actually applied it.
-  invalidate() {
-    this.epoch++;this.cache.clear();
-    for(const agent of Array.isArray(this.store.data.agents)?this.store.data.agents:[]){
-      if(agent.id===LOCAL_AGENT_ID||agent.state==='revoked')continue;
-      // A single unusable machine record must never break the change for every other machine.
-      try{ this.desired(agent); }catch{}
-    }
-    this.wake();
+  // With no list, every parked poll is answered (shutdown).
+  wake(agentIds=null) {
+    const only=agentIds?new Set(agentIds):null;
+    for(const waiter of [...this.waiters])if(!only||only.has(waiter.agentId))waiter.release('changed');
   }
-  wake() { for(const waiter of [...this.waiters])waiter.release('changed'); }
   // Shutdown: every agent parks a long poll here, and an in-flight request keeps server.close() waiting
   // until the poll times out — past Docker's stop grace period. Answer them all now, park no more, and
   // close each connection with its answer: server.close() only drops connections idle at the moment it
   // is called, so a keep-alive socket freed afterwards would carry the agent's next poll right back in.
   close() { this.closing=true;this.wake(); }
 
-  waitForConfig(seconds) {
-    const waiter={done:false};
+  waitForConfig(agentId,seconds) {
+    const waiter={done:false,agentId};
     waiter.promise=new Promise(resolve=>{
       waiter.release=reason=>{if(waiter.done)return;waiter.done=true;this.waiters.delete(waiter);clearTimeout(waiter.timer);resolve(reason)};
       waiter.timer=setTimeout(()=>waiter.release('timeout'),Math.max(1,seconds)*1000);
@@ -203,17 +190,6 @@ export class AgentApi {
     this.nonces.set(nonceKey,at);return {agent,nonce};
   }
 
-  desired(agent) {
-    // Recompiling means canonical JSON + SHA-256 + an Ed25519 signature. Doing that on every poll
-    // burned CPU shared with proxied playback, so reuse it until the configuration actually changes.
-    const cached=this.cache.get(agent.id);
-    if(cached&&cached.epoch===this.epoch){agent.desiredRevision=cached.snapshot.revision;agent.desiredHash=cached.snapshot.hash;return cached.snapshot;}
-    const compiled=compileAgentDesiredSnapshot({data:this.store.data,agentId:agent.id,previousState:agent.desiredState||null,signingIdentity:this.panelIdentity,localBase:this.localBase});
-    agent.desiredState=compiled.state;agent.desiredRevision=compiled.snapshot.revision;agent.desiredHash=compiled.snapshot.hash;
-    this.cache.set(agent.id,{epoch:this.epoch,snapshot:compiled.snapshot});
-    return compiled.snapshot;
-  }
-
   async handle(req,res) {
     const url=new URL(req.url,'http://agent.invalid');let requestNonce='error';
     try{
@@ -224,21 +200,20 @@ export class AgentApi {
         const agent=consumeEnrollment(this.store.data,parsed.token, {...agentInput,machine:parsed.machine});
         this.store.audit('agent.enrolled',requestIp(req),agent.id);
         // A new machine joins the steering topology and the line lists of the nodes it serves.
-        this.invalidate();this.onTopologyChange?.();
+        this.snapshots.refresh();
         return this.send(res,201,{protocolVersion:AGENT_PROTOCOL_VERSION,agentId:agent.id,panelKeyId:this.panelIdentity.keyId,panelSigningPublicKey:this.panelIdentity.publicKey,serverTime:nowSeconds(),poll:{path:'/api/agent/v1/config',maxWaitSeconds:25,heartbeatSeconds:10}},requestNonce);
       }
       if(req.method==='POST'&&url.pathname==='/api/agent/v1/check-in'){
         const {raw,parsed}=await readBody(req),verified=this.verify(req,url,raw);requestNonce=verified.nonce;
-        const agent=verified.agent,at=new Date().toISOString(),topologyBefore=steeringTopologyKey(agent);agent.lastSeen=at;agent.updatedAt=at;agent.agentVersion=String(parsed.agentVersion||agent.agentVersion||'unknown').slice(0,32);agent.applyState=['active','waiting','error'].includes(parsed.applyState)?parsed.applyState:'waiting';agent.proxyHealthy=parsed.proxyHealthy===true;agent.appliedRevision=Number.isSafeInteger(parsed.currentRevision)?Math.max(0,parsed.currentRevision):Number(agent.appliedRevision||0);agent.capabilities=cleanCapabilities(parsed.capabilities);agent.reportedDomain=normalizeAgentDomain(parsed.domain||'');agent.proxyMode=cleanProxyMode(parsed.proxyMode)||agent.proxyMode||(agent.domain?'domain':'ip');if(parsed.domainStatus&&typeof parsed.domainStatus==='object'){const d=parsed.domainStatus,mode=cleanProxyMode(d.mode)||'domain';agent.domainStatus={requestId:String(d.requestId||'').slice(0,80),state:['pending','applying','active','failed'].includes(d.state)?d.state:'failed',mode,desiredDomain:normalizeAgentDomain(d.desiredDomain||''),currentDomain:normalizeAgentDomain(d.currentDomain||''),message:String(d.message||'').slice(0,500),updatedAt:String(d.updatedAt||'').slice(0,40)};if(agent.domainStatus.state==='active'){agent.proxyMode=mode;agent.domain=agent.domainStatus.currentDomain||(mode==='ip'?agent.reportedDomain:agent.domain)||'';if(mode==='ip'){if(agent.desiredMode==='ip')delete agent.desiredMode;}else if(agent.desiredDomain===agent.domain){delete agent.desiredDomain;delete agent.desiredMode;}}}else if(agent.reportedDomain&&!agent.desiredDomain&&!agent.desiredMode)agent.domain=agent.reportedDomain;
-        // An upgraded machine (new capability) or a changed domain reshapes which machines may steer a
-        // node between them, and the lines every machine hands out for it; recompile everyone's
-        // snapshot so the new peer and line lists go out right away.
-        if(steeringTopologyKey(agent)!==topologyBefore&&(readSteeringSettings(this.store.data).mode!=='off'||this.store.data.routes.some(route=>route.egressAgentId||lineSyncEnabled(route)))){this.invalidate();this.onTopologyChange?.();}
+        const agent=verified.agent,at=new Date().toISOString(),profileBefore=machineProfile(agent);agent.lastSeen=at;agent.updatedAt=at;agent.agentVersion=String(parsed.agentVersion||agent.agentVersion||'unknown').slice(0,32);agent.applyState=['active','waiting','error'].includes(parsed.applyState)?parsed.applyState:'waiting';agent.proxyHealthy=parsed.proxyHealthy===true;agent.appliedRevision=Number.isSafeInteger(parsed.currentRevision)?Math.max(0,parsed.currentRevision):Number(agent.appliedRevision||0);agent.capabilities=cleanCapabilities(parsed.capabilities);agent.reportedDomain=normalizeAgentDomain(parsed.domain||'');agent.proxyMode=cleanProxyMode(parsed.proxyMode)||agent.proxyMode||(agent.domain?'domain':'ip');if(parsed.domainStatus&&typeof parsed.domainStatus==='object'){const d=parsed.domainStatus,mode=cleanProxyMode(d.mode)||'domain';agent.domainStatus={requestId:String(d.requestId||'').slice(0,80),state:['pending','applying','active','failed'].includes(d.state)?d.state:'failed',mode,desiredDomain:normalizeAgentDomain(d.desiredDomain||''),currentDomain:normalizeAgentDomain(d.currentDomain||''),message:String(d.message||'').slice(0,500),updatedAt:String(d.updatedAt||'').slice(0,40)};if(agent.domainStatus.state==='active'){agent.proxyMode=mode;agent.domain=agent.domainStatus.currentDomain||(mode==='ip'?agent.reportedDomain:agent.domain)||'';if(mode==='ip'){if(agent.desiredMode==='ip')delete agent.desiredMode;}else if(agent.desiredDomain===agent.domain){delete agent.desiredDomain;delete agent.desiredMode;}}}else if(agent.reportedDomain&&!agent.desiredDomain&&!agent.desiredMode)agent.domain=agent.reportedDomain;
+        // An upgraded machine (new capability) or a changed domain can reshape any machine's snapshot
+        // (steering peers, egress, line lists); the refresh works out which ones actually changed.
+        if(machineProfile(agent)!==profileBefore)this.snapshots.refresh();
         if(parsed.entryStatus!==undefined)agent.entryStatus=cleanEntryStatus(parsed.entryStatus);
         if(parsed.telemetry!==undefined){const telemetry=sanitizeTelemetry(parsed.telemetry);if(!telemetry)throw Object.assign(new Error('invalid agent telemetry'),{status:400,nonce:requestNonce});agent.telemetry=telemetry;agent.lastTelemetryAt=at;}
         // Heartbeat state is disposable; the panel's periodic flush persists it. Writing the whole
         // encrypted store synchronously on every check-in stalled the event loop serving playback.
-        const snapshot=this.desired(agent);delete agent.error;
+        const snapshot=this.snapshots.desired(agent.id);delete agent.error;
         // Agents older than 0.10.21 poll config with wait=0, so such a machine only learns about a
         // change on its next heartbeat — and it is already asleep when the change happens. At a flat
         // 30s beat a node de-selected in the panel kept being served for up to half a minute, which reads as
@@ -256,18 +231,18 @@ export class AgentApi {
         const {raw}=await readBody(req),verified=this.verify(req,url,raw);requestNonce=verified.nonce;
         const after=Math.max(0,Number(url.searchParams.get('after')||0));if(!Number.isSafeInteger(after))throw Object.assign(new Error('invalid config revision'),{status:400,nonce:requestNonce});
         const at=new Date().toISOString();verified.agent.lastSeen=at;verified.agent.updatedAt=at;
-        let snapshot=this.desired(verified.agent);
+        let snapshot=this.snapshots.desired(verified.agent.id);
         if(after>=snapshot.revision){
           // Long poll: park until the configuration changes instead of making the agent hammer us.
           const wait=Math.min(25,Math.max(0,Number(url.searchParams.get('wait')||0)));
           if(wait>0){
-            let gone=false;const waiter=this.waitForConfig(wait);
+            let gone=false;const waiter=this.waitForConfig(verified.agent.id,wait);
             const abandon=()=>{gone=true;waiter.release('closed')};
             res.once('close',abandon);
             await waiter.promise;
             res.off('close',abandon);
             if(gone||res.writableEnded||res.destroyed)return;
-            snapshot=this.desired(verified.agent);
+            snapshot=this.snapshots.desired(verified.agent.id);
           }
           if(after>=snapshot.revision)return this.send(res,204,null,requestNonce);
         }

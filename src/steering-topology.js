@@ -1,5 +1,5 @@
 import { isRouteAuthKey } from './route-auth.js';
-import { LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
+import { agentKnows, LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
 import { EGRESS_CAPABILITY, STEERING_CAPABILITY, STEERING_MODES } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 import { LINE_SYNC_CAPABILITY, lineSyncUpstream, nodeLines } from './line-sync.js';
@@ -71,7 +71,7 @@ export function agentSteeringIssues(agent, settings) {
   const domain=String(agent.domain||'').toLowerCase(),local=agent.id===LOCAL_AGENT_ID;
   if(!domain||(!local&&agent.proxyMode==='ip'))issues.push('没有 HTTPS 直连域名（IP 反代不能作为切流目标）');
   else if(settings.entryDomain&&domain===settings.entryDomain)issues.push('直连域名与入口域名相同，需要给这台机器单独的域名');
-  if(!local&&!(Array.isArray(agent.capabilities)&&agent.capabilities.includes(STEERING_CAPABILITY)))issues.push('探针版本不支持切流，需要升级');
+  if(!agentKnows(agent,STEERING_CAPABILITY))issues.push('探针版本不支持切流，需要升级');
   return issues;
 }
 
@@ -104,7 +104,7 @@ const deployingAgents=(data,route)=>{
   const deployed=new Set((Array.isArray(data.deployments)?data.deployments:[]).filter(item=>item.routeId===route.id&&item.enabled!==false).map(item=>item.agentId));
   return (Array.isArray(data.agents)?data.agents:[]).filter(agent=>deployed.has(agent.id)&&agent.state!=='revoked');
 };
-const knowsEgress=agent=>agent.id===LOCAL_AGENT_ID||(Array.isArray(agent.capabilities)&&agent.capabilities.includes(EGRESS_CAPABILITY));
+const knowsEgress=agent=>agentKnows(agent,EGRESS_CAPABILITY);
 
 // A unified upstream egress: every machine serving the node relays its upstream traffic through one of
 // them, so the upstream sees a single address however clients are spread or steered. It is only in
@@ -137,8 +137,7 @@ export function egressTopology(data, route) {
 // where the panel machine serves nodes.
 export function agentSnapshotNodes(data, agentId, {localBase=''}={}) {
   const routes=routesForAgent(data,agentId),settings=readSteeringSettings(data);
-  const capabilities=agentId===LOCAL_AGENT_ID?null:data.agents?.find(a=>a.id===agentId)?.capabilities;
-  const knows=name=>agentId===LOCAL_AGENT_ID||(Array.isArray(capabilities)&&capabilities.includes(name));
+  const agent=data.agents?.find(a=>a.id===agentId)||{id:agentId},knows=name=>agentKnows(agent,name);
   const observes=knows(PLAYBACK_OBSERVATION_CAPABILITY),syncsLines=knows(LINE_SYNC_CAPABILITY);
   return routes.map(route=>{
     const topology=settings.mode==='off'?null:steeringTopology(data,route,settings),egress=egressTopology(data,route);

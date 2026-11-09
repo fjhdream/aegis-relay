@@ -13,7 +13,8 @@ import { adminRelative, isRootAdminRequest, normalizeAdminPath } from './admin-p
 import { customConnectionKey } from './connection-key.js';
 import { isRouteAuthKey, newRouteAuthKey, ROUTE_AUTH_VERSION, routeChannels, routeTokenDigest } from './route-auth.js';
 import { LocalAgent } from './local-agent.js';
-import { agentEntryUrl, deploymentId, ensureLocalDeployment, LOCAL_AGENT_ID, normalizeAgentDomain, publicAgent, removeRouteDeployments, replaceAgentDeployments, routeEntryBaseUrl } from './agent-registry.js';
+import { DesiredSnapshots } from './desired-snapshots.js';
+import { agentEntryUrl, agentKnows, deploymentId, ensureLocalDeployment, LOCAL_AGENT_ID, normalizeAgentDomain, publicAgent, removeRouteDeployments, replaceAgentDeployments, routeEntryBaseUrl } from './agent-registry.js';
 import { AgentApi, enrollmentInstallCommand, issueEnrollment, normalizeCertificateEmail } from './agent-api.js';
 import { aggregateTelemetry, indexViewersByNode, nodeChannels, sanitizeTelemetry, telemetryFromMetrics } from './telemetry.js';
 import { createDashboardFeed } from './dashboard-feed.js';
@@ -37,11 +38,14 @@ const cfg = {
 const key = deriveKey(process.env.APP_MASTER_KEY); const store = new Store(cfg.dataFile, key);
 if(!store.data.settings.certificateEmail&&cfg.certificateEmail){store.data.settings.certificateEmail=normalizeCertificateEmail(cfg.certificateEmail);store.save();}
 const configuredLocalDomain=activeLocalDomain(cfg);
-const localAgent = new LocalAgent({store,localBase:clientBaseUrl()}); localAgent.start();
+// Every machine's desired snapshot, the panel's own included. Anything below that changes nodes,
+// deployments, machines or steering settings calls snapshots.refresh(); it works out who changed.
+const snapshots = new DesiredSnapshots({store,localBase:clientBaseUrl()});
+const localAgent = new LocalAgent({store,snapshots}); localAgent.start();
 // After the local agent: on a fresh install it is what creates this record, and the steering topology
 // reads the domain from the record (an empty one left the panel machine out until the next restart).
 const localRecord=store.data.agents.find(agent=>agent.id===LOCAL_AGENT_ID);
-if(localRecord&&configuredLocalDomain&&localRecord.domain!==configuredLocalDomain){localRecord.domain=configuredLocalDomain;localRecord.updatedAt=new Date().toISOString();store.save();localAgent.reconcile();}
+if(localRecord&&configuredLocalDomain&&localRecord.domain!==configuredLocalDomain){localRecord.domain=configuredLocalDomain;localRecord.updatedAt=new Date().toISOString();store.save();snapshots.refresh();}
 // Automatic steering: the hub arbitrates sessions across machines; a client type that keeps failing to
 // follow steering redirects is excluded for good (until the operator clears it).
 // Capped ranges (direct play cut into requests): a client type that continued on trial is switched on,
@@ -54,9 +58,10 @@ function rangeVerdict(client,works){
   store.audit(works?'steering.client_range_enabled':'steering.client_range_disabled','system',client);store.save();
 }
 const steeringHub = new SteeringHub({store,onBoundVerdict:rangeVerdict,onAutoExclude:client=>{const settings=steeringSettings(store.data);if(Object.keys(settings.autoExcluded).some(item=>item.toLowerCase()===client.toLowerCase()))return;settings.autoExcluded[client]=new Date().toISOString();store.audit('steering.client_auto_excluded','system',client);store.save();}});
-// A machine's capabilities or domain feed every node's steering topology, so a change there recompiles
-// the local snapshot too (remote ones are recompiled by the API itself).
-const agentApi = new AgentApi({store,version:APP_VERSION,steering:steeringHub,localBase:clientBaseUrl(),onTopologyChange:()=>localAgent.reconcile()});
+const agentApi = new AgentApi({store,version:APP_VERSION,steering:steeringHub,snapshots});
+// Compile every machine once at boot, so each card shows 「等待同步」 or 「已同步」 right away instead of
+// after that machine's first poll. An unchanged machine keeps its revision.
+snapshots.refresh();
 const metrics = new Metrics(store);
 // Stats for nodes deleted by earlier versions were never removed; sweep them once at boot.
 metrics.retainOnly(store.data.routes.map(route=>route.id||route.alias));
@@ -156,7 +161,7 @@ function steeringView(){
     const agent=store.data.agents.find(item=>item.id===machine.id),entry=desiredEntry(store.data,machine.id);
     if(!entry)continue;
     const status=machine.local?readEntryStatus(cfg.dataFile):agent.entryStatus||null,current=!!status&&status.entryDomain===entry.domain&&status.peers.join(' ')===entry.peers.join(' ');
-    entryCommands.push({id:machine.id,name:machine.name,command:entryCommand(entry,machine.local),auto:machine.local||(agent.capabilities||[]).includes(ENTRY_CAPABILITY),state:current?status.state:'waiting',message:current?status.message:'',attempt:current?status.attempt:0,updatedAt:current?status.updatedAt:''});
+    entryCommands.push({id:machine.id,name:machine.name,command:entryCommand(entry,machine.local),auto:agentKnows(agent,ENTRY_CAPABILITY),state:current?status.state:'waiting',message:current?status.message:'',attempt:current?status.attempt:0,updatedAt:current?status.updatedAt:''});
   }
   const routes=store.data.routes.map(route=>{const issues=routeSteeringIssues(store.data,route,settings),gaps=settings.entryDomain&&!issues.length?entryCoverageGaps(store.data,route,settings):[];return{id:route.id,alias:route.alias,name:route.name,enabled:route.autoSteer?.enabled===true,issues,entryGaps:gaps.map(agent=>agent.name||agent.id),entryAddress:!!steeringEntryBaseUrl(store.data,route),egressAgentId:route.egressAgentId||'',egressIssues:egressIssues(store.data,route),egressActive:!!egressTopology(store.data,route)}});
   return {settings:{mode:settings.mode,entryDomain:settings.entryDomain,excludedClients:settings.excludedClients,autoExcluded:settings.autoExcluded,boundedClients:settings.boundedClients,boundAuto:settings.boundAuto,autoBounded:settings.autoBounded,autoUnbounded:settings.autoUnbounded,boundMB:settings.boundMB},certificateEmail:email,machines,routes,entryCommands,live:steeringHub.view()};
@@ -196,7 +201,6 @@ const adminAccount=()=>store.data.admin;
 const otpUri=secret=>`otpauth://totp/${encodeURIComponent(`AegisRelay:${adminAccount().username}`)}?secret=${secret}&issuer=AegisRelay&digits=6&period=30`;
 const findRoute=id=>store.data.routes.find(x=>x.id===id);
 // A node change goes live on the panel's own proxy and is pushed to every remote machine.
-function publishRoutes(){localAgent.reconcile();agentApi.invalidate();}
 // The node record shared by create and import. Callers validate the alias and upstreams and pick the key.
 function buildRoute(input,{alias,upstreams,accessMode,accessKey,enabled}){
   const now=new Date().toISOString();
@@ -339,11 +343,10 @@ async function updateAgent(req,res,agent){
   if(b.sortOrder!==undefined)agent.sortOrder=numeric(b.sortOrder,-10000,10000);
   if(b.steerTarget!==undefined)agent.steerTarget=b.steerTarget===true;
   agent.updatedAt=now;
-  // Any machine's name, order, domain, deployments or participation reshape the line lists and steering
-  // peers in this machine's snapshot too.
-  localAgent.reconcile();
+  // Any machine's name, order, domain, deployments or participation can reshape the line lists and
+  // steering peers in every machine's snapshot.
+  snapshots.refresh();
   if(b.steerTarget!==undefined||b.domain!==undefined)syncLocalEntry();
-  agentApi.invalidate();
   store.audit(localDomainRequested?'agent.local_domain_requested':'agent.updated',ip(req),agent.id);
   return json(res,200,{agent:agentView(agent)});
 }
@@ -353,7 +356,7 @@ async function agentResource(req,res,[,id]){
   if(req.method==='DELETE'){
     if(agent.id===LOCAL_AGENT_ID)return json(res,409,{error:'the local agent cannot be deleted'});
     store.data.agents=store.data.agents.filter(item=>item!==agent);store.data.deployments=store.data.deployments.filter(item=>item.agentId!==agent.id);
-    store.audit('agent.deleted',ip(req),agent.id);publishRoutes();
+    store.audit('agent.deleted',ip(req),agent.id);snapshots.refresh();
     return json(res,200,{ok:true});
   }
   return notFound(res);
@@ -375,7 +378,7 @@ async function createRoute(req,res){
   const deployAgentId=String(b.agentId||''),deployAgent=deployAgentId&&deployAgentId!==LOCAL_AGENT_ID?store.data.agents?.find(a=>a.id===deployAgentId):null;
   if(deployAgent)store.data.deployments.push({id:deploymentId(deployAgentId,r.id),agentId:deployAgentId,routeId:r.id,enabled:true,createdAt:now,updatedAt:now});
   if(!deployAgent||!agentEntryUrl(deployAgent))ensureLocalDeployment(store.data,r.id,now);
-  store.audit('route.created',ip(req),alias);publishRoutes();
+  store.audit('route.created',ip(req),alias);snapshots.refresh();
   return json(res,201,{route:publicRoute(r),...credentialsFor(r,accessKey)});
 }
 async function importRoutes(req,res){
@@ -388,7 +391,7 @@ async function importRoutes(req,res){
       store.data.routes.push(r);ensureLocalDeployment(store.data,r.id,r.createdAt);credentials.push({alias,...credentialsFor(r,accessKey)});
     }catch(e){errors.push({alias:String(item?.alias||''),error:e.message})}
   }
-  store.audit('routes.imported',ip(req),`${credentials.length} imported`);publishRoutes();
+  store.audit('routes.imported',ip(req),`${credentials.length} imported`);snapshots.refresh();
   return json(res,200,{imported:credentials.length,credentials,errors});
 }
 async function updateRoute(req,res,r){
@@ -414,7 +417,7 @@ async function updateRoute(req,res,r){
   if(alias!==undefined)r.alias=alias;
   if(upstreams){r.allowPrivate=allowPrivate;r.upstreams=upstreams;delete r.upstream;}
   r.updatedAt=new Date().toISOString();
-  store.audit(switchedKey===null?'route.updated':'route.access_mode_changed',ip(req),r.alias);publishRoutes();
+  store.audit(switchedKey===null?'route.updated':'route.access_mode_changed',ip(req),r.alias);snapshots.refresh();
   return json(res,200,{route:publicRoute(r),...(switchedKey===null?{}:clientCredentials(r,switchedKey))});
 }
 async function routeResource(req,res,[,id]){
@@ -422,7 +425,7 @@ async function routeResource(req,res,[,id]){
   if(req.method==='PATCH')return updateRoute(req,res,r);
   if(req.method==='DELETE'){
     store.data.routes=store.data.routes.filter(x=>x!==r);removeRouteDeployments(store.data,r.id);metrics.drop(r.id);dropRouteRuntime(r.id);
-    store.audit('route.deleted',ip(req),r.alias);publishRoutes();
+    store.audit('route.deleted',ip(req),r.alias);snapshots.refresh();
     return json(res,200,{ok:true});
   }
   return notFound(res);
@@ -439,7 +442,7 @@ async function rotateRouteKey(req,res,[,id]){
   if(r.accessMode==='alias_only')return json(res,409,{error:'this node does not use an access key'});
   const b=await body(req),accessKey=connectionKey(b.accessKey),routeAuthKey=r.authVersion===ROUTE_AUTH_VERSION&&isRouteAuthKey(r.routeAuthKey)?r.routeAuthKey:newRouteAuthKey();
   r.authVersion=ROUTE_AUTH_VERSION;r.routeAuthKey=routeAuthKey;r.keyDigest=routeTokenDigest(accessKey,routeAuthKey);r.accessKey=accessKey;delete r.authMigrationRequired;r.updatedAt=new Date().toISOString();
-  store.audit('route.key_rotated',ip(req),r.alias);publishRoutes();
+  store.audit('route.key_rotated',ip(req),r.alias);snapshots.refresh();
   return json(res,200,credentialsFor(r,accessKey));
 }
 async function routeChannelList(req,res,[,id]){
@@ -450,7 +453,7 @@ async function routeChannelList(req,res,[,id]){
     const b=await body(req);r.channels=Array.isArray(r.channels)?r.channels:[];
     if(r.channels.length>=32)return json(res,409,{error:'一个节点最多 32 个分发通道'});
     const channel=newChannel(b.label,b.accessKey);r.channels.push(channel);r.updatedAt=new Date().toISOString();
-    store.audit('route.channel_added',ip(req),`${r.alias}:${channel.label}`);publishRoutes();
+    store.audit('route.channel_added',ip(req),`${r.alias}:${channel.label}`);snapshots.refresh();
     return json(res,201,{channel:{id:channel.id,label:channel.label,clientPath:`/${r.alias}/${channel.accessKey}/`},publicBaseUrl:routeBaseUrl(r)});
   }
   return notFound(res);
@@ -459,8 +462,8 @@ async function routeChannel(req,res,[,id,cid]){
   const r=findRoute(id);if(!r)return notFound(res);
   if(cid==='default')return json(res,409,{error:'默认通道不能在此删除/改名，请用列表中的“密码”按钮'});
   r.channels=Array.isArray(r.channels)?r.channels:[];const channel=r.channels.find(c=>c.id===cid);if(!channel)return json(res,404,{error:'通道不存在'});
-  if(req.method==='DELETE'){r.channels=r.channels.filter(c=>c.id!==cid);r.updatedAt=new Date().toISOString();store.audit('route.channel_removed',ip(req),`${r.alias}:${channel.label}`);publishRoutes();return json(res,200,{ok:true});}
-  if(req.method==='PATCH'){const b=await body(req);channel.label=String(b.label||'').slice(0,40);r.updatedAt=new Date().toISOString();publishRoutes();return json(res,200,{ok:true,label:channel.label});}
+  if(req.method==='DELETE'){r.channels=r.channels.filter(c=>c.id!==cid);r.updatedAt=new Date().toISOString();store.audit('route.channel_removed',ip(req),`${r.alias}:${channel.label}`);snapshots.refresh();return json(res,200,{ok:true});}
+  if(req.method==='PATCH'){const b=await body(req);channel.label=String(b.label||'').slice(0,40);r.updatedAt=new Date().toISOString();store.save();snapshots.refresh();return json(res,200,{ok:true,label:channel.label});}
   return notFound(res);
 }
 function completeReminder(req,res,[,id]){
@@ -495,7 +498,7 @@ async function updateSteering(req,res){
   if(b.clearAutoExcluded===true)settings.autoExcluded={};
   if(b.boundAuto!==undefined)settings.boundAuto=b.boundAuto===true;
   if(b.clearRangeAuto===true){settings.autoBounded={};settings.autoUnbounded={};steeringHub.bounds.clear();}
-  store.audit('steering.updated',ip(req),settings.mode);store.save();publishRoutes();syncLocalEntry();
+  store.audit('steering.updated',ip(req),settings.mode);store.save();snapshots.refresh();syncLocalEntry();
   return json(res,200,steeringView());
 }
 

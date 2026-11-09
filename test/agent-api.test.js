@@ -143,13 +143,25 @@ test('a parked config long poll is released as soon as the machine node set chan
   const polling=agent.call('GET',`/api/agent/v1/config?after=${current}&wait=25`,null,parked);
   await new Promise(resolve=>setTimeout(resolve,50));
   assert.equal(parked.status,0,'nothing changed yet, so the poll stays parked');
-  replaceAgentDeployments(agent.data,agent.agentId,[]);agent.api.invalidate();
+  replaceAgentDeployments(agent.data,agent.agentId,[]);agent.api.snapshots.refresh();
   await polling;
   assert.equal(parked.status,200);
   assert.ok(Date.now()-started<2_000,'the change is delivered at once, not at the end of the wait');
   const snapshot=openAgentSnapshot({envelope:JSON.parse(parked.raw),identity:{agentId:agent.agentId,boxPrivateKey:agent.box.privateKey.export({format:'der',type:'pkcs8'}).toString('base64url'),panelKeyId:agent.enrolled.panelKeyId,panelSigningPublicKey:agent.enrolled.panelSigningPublicKey}});
   assert.equal(snapshot.revision,current+1);
   assert.deepEqual(snapshot.nodes,[]);
+});
+
+test('a refresh wakes only the parked polls of machines whose snapshot changed',async()=>{
+  const route=id=>({id,alias:id,enabled:true,accessMode:'alias_only',upstreams:['https://emby.example.net']});
+  const data={routes:[route('r1'),route('r2')],agents:[{id:'a',state:'active'},{id:'b',state:'active'}],deployments:[{agentId:'a',routeId:'r1',enabled:true},{agentId:'b',routeId:'r2',enabled:true}],controlPlane:{},settings:{}};
+  const api=new AgentApi({store:{data,save(){},audit(){}}});
+  api.snapshots.refresh();
+  const a=api.waitForConfig('a',5),b=api.waitForConfig('b',5);
+  data.routes[0].name='renamed';api.snapshots.refresh();
+  assert.equal(await a.promise,'changed');
+  assert.equal(b.done,false,'b serves nothing that changed, so it stays parked');
+  b.release('test');
 });
 
 test('shutdown answers every parked long poll at once so the panel can exit inside the stop grace period',async()=>{
@@ -181,25 +193,30 @@ test('agent signatures are checked against a cached key that follows the agent r
   assert.equal(missing.status,401);assert.match(missing.raw.toString(),/agent key invalid/);
 });
 
-test('the signed steering endpoint exchanges sessions, and an upgrade to steering recompiles every snapshot',async()=>{
+test('the signed steering endpoint exchanges sessions, and the check-in reporting an upgrade wakes the machine with its new snapshot',async()=>{
   const { SteeringHub }=await import('../src/steering-hub.js'),{ newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest }=await import('../src/route-auth.js');
   const routeAuthKey=newRouteAuthKey();
   const data={routes:[{id:'route-a',alias:'movie',enabled:true,accessMode:'key',authVersion:ROUTE_AUTH_VERSION,routeAuthKey,keyDigest:routeTokenDigest('key123',routeAuthKey),upstreams:['https://emby.example.net'],autoSteer:{enabled:true}}],
     agents:[{id:'local',domain:'s1.example.com',state:'active'}],deployments:[{agentId:'local',routeId:'route-a',enabled:true}],enrollmentTokens:[],controlPlane:{},settings:{steering:{mode:'on',entryDomain:'entry.example.com'}}},store={data,save(){},audit(){}};
-  let topologyChanges=0;
-  const hub=new SteeringHub({store}),api=new AgentApi({store,version:'0.11.0',steering:hub,onTopologyChange:()=>topologyChanges++});
+  const hub=new SteeringHub({store}),api=new AgentApi({store,version:'0.11.0',steering:hub});
   const issued=issueEnrollment(data,{name:'HK',domain:'s2.example.com',routeIds:['route-a']}),sign=crypto.generateKeyPairSync('ed25519'),box=crypto.generateKeyPairSync('x25519');
   const enrollResponse=response();
   await api.handle(request('/api/agent/v1/enroll',JSON.stringify({protocolVersion:1,requestNonce:'steer-enroll-nonce-0001',token:issued.token,agent:{signPublicKey:publicDer(sign.publicKey),boxPublicKey:publicDer(box.publicKey),agentVersion:'0.10.22',capabilities:['config-v1']},machine:{}})),enrollResponse);
-  assert.equal(topologyChanges,1,'enrolling a machine while steering is on recompiles the local snapshot');topologyChanges=0;
   const agentId=JSON.parse(enrollResponse.raw).agentId,signed=(path,body,nonce,method='POST')=>request(path,body,signedHeaders({method,path,agentId,privateKey:sign.privateKey,body,nonce}),method);
   // Before the upgrade the machine is not part of the node's steering topology.
-  assert.equal(api.desired(data.agents[1]).nodes[0].steering,undefined);
+  const before=api.snapshots.desired(agentId);
+  assert.equal(before.nodes[0].steering,undefined);
+  // The machine parks a config long poll; the check-in that reports its upgrade must wake it.
+  const parked=Object.assign(new EventEmitter(),response()),configPath=`/api/agent/v1/config?after=${before.revision}&wait=25`,started=Date.now();
+  const polling=api.handle(signed(configPath,Buffer.alloc(0),'steer-config-nonce-00001','GET'),parked);
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(parked.status,0);
   const checkBody=Buffer.from(JSON.stringify({agentVersion:'0.11.0',currentRevision:0,applyState:'waiting',proxyHealthy:true,domain:'s2.example.com',proxyMode:'domain',capabilities:['config-v1','steering-v1']}));
   const checkResponse=response();await api.handle(signed('/api/agent/v1/check-in',checkBody,'steer-checkin-nonce-0001'),checkResponse);
   assert.equal(checkResponse.status,200);
-  assert.equal(topologyChanges,1,'the local snapshot is recompiled too');
-  assert.deepEqual(api.desired(data.agents[1]).nodes[0].steering.peers.map(peer=>peer.id).sort(),[agentId,'local'].sort());
+  await polling;
+  assert.equal(parked.status,200,'the upgraded machine gets its new snapshot at once');assert.ok(Date.now()-started<2_000);
+  assert.deepEqual(api.snapshots.desired(agentId).nodes[0].steering.peers.map(peer=>peer.id).sort(),[agentId,'local'].sort());
   const s='Q'.repeat(22),steerBody=Buffer.from(JSON.stringify({protocolVersion:1,cursor:0,reports:[{s,r:'route-a',verdict:'ok',rateBps:1000,at:Date.now()}],health:{routes:{'route-a':{line:0,quotaExhausted:false}}}}));
   const steerResponse=response();await api.handle(signed('/api/agent/v1/steering',steerBody,'steer-sync-nonce-00001'),steerResponse);
   assert.equal(steerResponse.status,200);

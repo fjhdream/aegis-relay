@@ -1,4 +1,4 @@
-import { LOCAL_AGENT_ID, remoteAgentStatus } from './agent-registry.js';
+import { agentKnows, LOCAL_AGENT_ID, remoteAgentStatus } from './agent-registry.js';
 import { STEERING_CAPABILITY, STEER_DEFAULTS, VERDICTS } from './steering.js';
 import { boundedClientList, excludedClients, readSteeringSettings } from './steering-topology.js';
 import { PlaybackObservation } from './playback-observation.js';
@@ -260,7 +260,7 @@ export class SteeringHub {
     for(const agent of this.store.data.agents||[]){
       if(agent.state==='revoked')continue;
       const local=agent.id===LOCAL_AGENT_ID,health=this.health.get(agent.id);
-      const healthy=local||(remoteAgentStatus(agent)==='online'&&agent.proxyHealthy===true&&Array.isArray(agent.capabilities)&&agent.capabilities.includes(STEERING_CAPABILITY)&&Number(agent.desiredRevision||0)===Number(agent.appliedRevision||0));
+      const healthy=local||(remoteAgentStatus(agent)==='online'&&agent.proxyHealthy===true&&agentKnows(agent,STEERING_CAPABILITY)&&Number(agent.desiredRevision||0)===Number(agent.appliedRevision||0));
       out.push({id:agent.id,healthy,at:health?.at||0,routes:health?.routes||{}});
     }
     return out;

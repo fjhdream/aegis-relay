@@ -36,8 +36,10 @@ test('local agent completes register, pull, verify, atomic apply and ACK', async
     assert.equal(fs.statSync(cache).mode&0o777,0o600);
 
     store.data.routes[0].name='Changed';store.save();
-    const changed=agent.reconcile(),secondRoutes=agent.routeSource.getRoutes();
-    assert.equal(changed.ok,true);assert.equal(changed.decision,'apply');assert.equal(changed.revision,2);
+    // The panel machine is told through its subscription, like a remote machine's long poll.
+    assert.deepEqual(agent.snapshots.refresh(),['local']);
+    const secondRoutes=agent.routeSource.getRoutes();
+    assert.equal(agent.status().appliedRevision,2);assert.equal(store.data.controlPlane.localAgent.lastAck.revision,2);
     assert.notEqual(secondRoutes,firstRoutes);
     assert.equal(firstRoutes[0].name,'Original');
     assert.equal(secondRoutes[0].name,'Changed');
@@ -46,14 +48,13 @@ test('local agent completes register, pull, verify, atomic apply and ACK', async
     assert.equal(agent.status().appliedRevision,2);
 
     store.data.deployments=[];store.save();
-    const deselected=agent.reconcile();
-    assert.equal(deselected.ok,true);
+    assert.deepEqual(agent.snapshots.refresh(),['local']);
+    assert.equal(agent.status().inSync,true);
     assert.equal(agent.routeSource.getRoutes().length,0);
     assert.deepEqual(agent.status().routeIds,[]);
-    // The restart below must see exactly what reconcile persisted, not the in-memory pull that follows.
     await store.flush();
 
-    const snapshot=agent.pull(store.data.routes),tampered=structuredClone(snapshot);tampered.nodes[0].name='Attacker';
+    const snapshot=agent.snapshots.desired('local'),tampered=structuredClone(snapshot);tampered.revision=snapshot.revision+1;
     const activeBefore=agent.routeSource.getRoutes();
     assert.throws(()=>agent.apply(tampered),/hash mismatch/);
     assert.equal(agent.routeSource.getRoutes(),activeBefore);

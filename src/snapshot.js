@@ -155,21 +155,24 @@ export function compileSnapshot({revision,nodes,signingIdentity}) {
   return compileNormalizedSnapshot({revision,nodes:normalizeSnapshotNodes(nodes),signingIdentity});
 }
 
-export function compileDesiredSnapshot({nodes,previousState=null,signingIdentity}) {
+// previousSnapshot is the signed snapshot previousState describes, when the caller still holds it: an
+// unchanged machine then gets it back as it is, without another signature.
+export function compileDesiredSnapshot({nodes,previousState=null,previousSnapshot=null,signingIdentity}) {
   const normalized=normalizeSnapshotNodes(nodes);
   const contentHash=sha256(canonicalJson({schemaVersion:SNAPSHOT_SCHEMA_VERSION,nodes:normalized}));
   const previousRevision=previousState?safeRevision(previousState.revision,true):0;
   const unchanged=previousState?.contentHash===contentHash&&previousState?.keyId===signingIdentity.keyId;
+  if(unchanged&&previousSnapshot&&previousSnapshot.revision===previousRevision&&previousSnapshot.hash===previousState.snapshotHash)return {snapshot:previousSnapshot,state:previousState};
   const revision=unchanged?previousRevision:previousRevision+1;
   if(revision<1)throw new Error('the first snapshot must use revision 1');
   const snapshot=compileNormalizedSnapshot({revision,nodes:normalized,signingIdentity});
   return {snapshot,state:Object.freeze({revision,contentHash,snapshotHash:snapshot.hash,keyId:signingIdentity.keyId})};
 }
 
-export function compileAgentDesiredSnapshot({data,agentId,previousState=null,signingIdentity,localBase=''}) {
+export function compileAgentDesiredSnapshot({data,agentId,previousState=null,previousSnapshot=null,signingIdentity,localBase=''}) {
   if(!data||typeof data!=='object')throw new Error('agent snapshot requires store data');
   if(!String(agentId||'').trim())throw new Error('agent snapshot requires agentId');
-  return compileDesiredSnapshot({nodes:agentSnapshotNodes(data,agentId,{localBase}),previousState,signingIdentity});
+  return compileDesiredSnapshot({nodes:agentSnapshotNodes(data,agentId,{localBase}),previousState,previousSnapshot,signingIdentity});
 }
 
 export function verifySnapshot(snapshot, signingIdentity, {currentRevision=0,currentHash=null}={}) {
