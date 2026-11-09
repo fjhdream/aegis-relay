@@ -85,7 +85,7 @@ AegisRelay 不再提供客户端直连与服务端跟随之间的策略开关。
 
 ```text
 客户端 → GET /movie/<连接密码>/emby/System/Ext/ServerDomains（带 Emby 登录令牌）
-  机器把请求改为 /emby/System/Info 发给上游，用来校验令牌
+  机器向上游请求 /emby/Items?Limit=1 来校验令牌
     上游返回 200 → {"data":[{"name":"香港","url":"https://hk.example.com/movie/<连接密码>"}, …],"ok":true}
     上游返回 401/403 → 401 {"error":"Invalid token","ok":false}
     上游不可用 → 502 {"error":"Upstream unavailable","ok":false}

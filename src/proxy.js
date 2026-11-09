@@ -11,7 +11,7 @@ import { isRouteAuthKey, matchRouteChannel, verifyRouteToken } from './route-aut
 import { ThrottleTransform } from './metrics.js';
 import { guardedLookup } from './lookup.js';
 import { EGRESS_HEADER, EGRESS_HOST_HEADER, egressToken, itemOf, relayedEgress, stripSteerParam } from './steering.js';
-import { lineSyncInfoPath, lineSyncReply, UPSTREAM_LINES_MAX_BYTES, UPSTREAM_LINES_TIMEOUT_MS, upstreamLines } from './line-sync.js';
+import { lineSyncAuthPath, lineSyncReply, UPSTREAM_LINES_MAX_BYTES, UPSTREAM_LINES_TIMEOUT_MS, upstreamLines } from './line-sync.js';
 
 // SNI carries host names only. Node 22 merely warns about an IP address there (DEP0123); newer Node
 // rejects the request outright, which broke every HTTPS upstream configured by IP.
@@ -528,13 +528,13 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     // Or the other way round: this is the egress machine, and another machine relayed the request.
     const relayed=egress?null:relayedEgress(route,req.headers,Date.now());
     // Line sync (see line-sync.js): answered here with the node's own lines once the upstream accepts
-    // the client's token, which is checked by sending the request on as /System/Info. A node that does
+    // the client's token, which is checked by asking for a single library item. A node that does
     // not share its lines answers 404 like a stock Emby server, instead of passing on the upstream's.
     // A line request relayed by another machine is that machine's to answer: it is fetching the
     // upstream's own list, so it goes on untouched.
-    const lineRest=found.rest,lineInfo=!relayed&&req.method==='GET'&&Array.isArray(route.lines)?lineSyncInfoPath(lineRest):null;
-    if (lineInfo&&!route.lines.length&&route.lineSyncUpstream!==true) { res.writeHead(404,{'cache-control':'no-store'}); return res.end('not found'); }
-    if (lineInfo) found.rest=lineInfo;
+    const lineRest=found.rest,lineAuth=!relayed&&req.method==='GET'&&Array.isArray(route.lines)?lineSyncAuthPath(lineRest):null;
+    if (lineAuth&&!route.lines.length&&route.lineSyncUpstream!==true) { res.writeHead(404,{'cache-control':'no-store'}); return res.end('not found'); }
+    if (lineAuth) found.rest=lineAuth;
     // The steering token is addressed to this relay; it never reaches an upstream.
     const search=stripSteerParam(incoming.search);
     let continuation, vod;
@@ -577,6 +577,15 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     // normal compression, so playback speed on a rewrite-enabled node matches one without it.
     const derived=routeDerived(route),rewriter=egress?null:buildStreamRewriter(derived.rewrite,publicContext,found.prefix);
     const relaySearch=search;
+    let upstreamSearch=relaySearch;
+    if(lineAuth){
+      const query=new URLSearchParams();
+      for(const [name,value] of new URLSearchParams(relaySearch)){
+        if(['api_key','x-emby-token','x-mediabrowser-token'].includes(name.toLowerCase()))query.append(name,value);
+      }
+      query.set('Limit','1');
+      upstreamSearch=`?${query}`;
+    }
     const canRetry=safeMethod(req.method); let finished=false, clientGone=false, activeUp=null;
     // Emby clients abort constantly (seeking, stopping, backgrounding). Nginx tears the upstream
     // down with the client; without this the upstream kept streaming into a dead socket and leaked
@@ -590,7 +599,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     const attempt=(targetValue,index,freshSocket=false)=>{
       if (finished || clientGone) return;
       const directTarget=(continuation&&index===0&&continuation.target)||(vod&&index===0&&vod.target)||null;
-      const target=directTarget||joinTarget(targetValue,upstreamRest,relaySearch), base=new URL(targetValue), requestHeaders={...originalHeaders};
+      const target=directTarget||joinTarget(targetValue,upstreamRest,upstreamSearch), base=new URL(targetValue), requestHeaders={...originalHeaders};
       if(egress){requestHeaders[EGRESS_HEADER]=egressToken(route,Date.now());if(publicContext.host)requestHeaders[EGRESS_HOST_HEADER]=publicContext.host;}
       requestHeaders.host=target.host;
       if (!routeOrigins.has(target.origin)) { delete requestHeaders.authorization; delete requestHeaders.cookie; delete requestHeaders['x-emby-token']; }
@@ -613,7 +622,7 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
         const status=upRes.statusCode||502;
         if (canRetry && RETRY_STATUS.has(status) && index+1<configured.length) { markFailure(route,targetValue,`HTTP ${status}`); upRes.resume(); return attempt(configured[index+1],index+1); }
         if(RETRY_STATUS.has(status))markFailure(route,targetValue,`HTTP ${status}`);else markSuccess(route,targetValue);
-        if(lineInfo){
+        if(lineAuth){
           finished=true;upRes.resume();
           const answer=(extra=[])=>{
             if(res.destroyed||res.headersSent){metricDone?.(status,0,false);return;}

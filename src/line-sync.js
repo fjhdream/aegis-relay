@@ -27,11 +27,10 @@ export function lineSyncUpstream(route) {
   return lineSyncEnabled(route)&&route?.lineSyncUpstream===true;
 }
 
-// The upstream call that proves the client's token, for a line request; null for any other path. The
-// reference service checks the token the same way, against /System/Info, which needs a signed-in user.
-export function lineSyncInfoPath(rest) {
+// Some upstreams serve /System/Info publicly; the items endpoint checks the user's library access.
+export function lineSyncAuthPath(rest) {
   const match=LINE_PATH.exec(String(rest||''));
-  return match?`${match[1]?'/emby':''}/System/Info`:null;
+  return match?`${match[1]?'/emby':''}/Items`:null;
 }
 
 function lineName(value) {

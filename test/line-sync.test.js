@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import { Readable } from 'node:stream';
 import zlib from 'node:zlib';
-import { cleanLines, LINE_SYNC_CAPABILITY, lineSyncInfoPath, lineSyncReply, nodeLines, upstreamLines } from '../src/line-sync.js';
+import { cleanLines, LINE_SYNC_CAPABILITY, lineSyncAuthPath, lineSyncReply, nodeLines, upstreamLines } from '../src/line-sync.js';
 import { agentSnapshotNodes } from '../src/steering-topology.js';
 import { compileSnapshot, generatePanelSigningIdentity } from '../src/snapshot.js';
 import { runtimeRoutes } from '../src/local-agent.js';
@@ -32,11 +32,11 @@ function fleet(extra={}) {
   };
 }
 
-test('only the line request is answered, on either Emby path spelling, and checked as /System/Info',()=>{
-  assert.equal(lineSyncInfoPath('/emby/System/Ext/ServerDomains'),'/emby/System/Info');
-  assert.equal(lineSyncInfoPath('/emby/system/ext/serverdomains/'),'/emby/System/Info');
-  assert.equal(lineSyncInfoPath('/System/Ext/ServerDomains'),'/System/Info');
-  for(const other of ['/emby/System/Info','/emby/System/Ext/ServerDomains/x','/x/emby/System/Ext/ServerDomains','/emby/System/Ext/ServerDomainsX',''])assert.equal(lineSyncInfoPath(other),null,other);
+test('only the line request is answered, on either Emby path spelling, and checked as /Items',()=>{
+  assert.equal(lineSyncAuthPath('/emby/System/Ext/ServerDomains'),'/emby/Items');
+  assert.equal(lineSyncAuthPath('/emby/system/ext/serverdomains/'),'/emby/Items');
+  assert.equal(lineSyncAuthPath('/System/Ext/ServerDomains'),'/Items');
+  for(const other of ['/emby/System/Info','/emby/System/Ext/ServerDomains/x','/x/emby/System/Ext/ServerDomains','/emby/System/Ext/ServerDomainsX',''])assert.equal(lineSyncAuthPath(other),null,other);
 });
 
 test('a node lists the entry domain first, then every machine serving it in the panel order',()=>{
@@ -138,14 +138,13 @@ const get=(port,path,headers={})=>new Promise((resolve,reject)=>{const req=http.
 const LINES=[{name:'智能入口',base:'https://entry.example.com'},{name:'香港',base:'https://hk.example.com'},{name:'IP 机',base:'http://203.0.113.9:8080'}];
 
 const ORIGIN_LINES='{"data":[{"name":"origin","url":"https://direct-origin.example.net"},{"name":"重复","url":"https://hk.example.com/movie/key123"}],"ok":true}';
-// A stand-in Emby: /System/Info accepts only the token "good"; the line list is ORIGIN_LINES unless the
-// test swaps in its own handler.
+// Model an upstream that serves public metadata at /System/Info but authenticates /Items.
 async function emby({domains=null}={}) {
   const seen=[];
   const server=http.createServer((req,res)=>{
     const token=req.headers['x-emby-token']||new URL(req.url,'http://x').searchParams.get('api_key');
     seen.push({url:req.url,token,encoding:req.headers['accept-encoding']});
-    if(/\/System\/Info/i.test(req.url)&&token!=='good'){res.writeHead(401);return res.end('unauthorized')}
+    if(/\/Items(?:\?|$)/i.test(req.url)&&token!=='good'){res.writeHead(401);return res.end('unauthorized')}
     if(/ServerDomains/.test(req.url)&&domains)return domains(req,res);
     res.writeHead(200,{'content-type':'application/json'});res.end(/ServerDomains/.test(req.url)?ORIGIN_LINES:'{"Id":"x"}');
   });
@@ -156,19 +155,19 @@ test('a relay answers the line request with the node lines, under the client key
   const upstream=await emby(),routes=[keyRoute({upstreams:[`http://127.0.0.1:${upstream.port}`],allowPrivate:true,lines:LINES}),{id:'n2',alias:'open',name:'Open',enabled:true,accessMode:'alias_only',upstreams:[`http://127.0.0.1:${upstream.port}`],allowPrivate:true,lines:LINES.slice(1)}];
   const relay=http.createServer(makeProxyHandler({getRoutes:()=>routes},deriveKey('k'.repeat(32)))),port=await listen(relay);
   try {
-    const ok=await get(port,'/movie/key123/emby/System/Ext/ServerDomains',{'x-emby-token':'good'});
-    assert.equal(ok.status,200);assert.match(ok.headers['content-type'],/application\/json/);
-    assert.deepEqual(JSON.parse(ok.body),{data:[
-      {name:'智能入口',url:'https://entry.example.com/movie/key123'},{name:'香港',url:'https://hk.example.com/movie/key123'},{name:'IP 机',url:'http://203.0.113.9:8080/movie/key123'}],ok:true});
-    assert.deepEqual([upstream.seen.at(-1).url,upstream.seen.at(-1).token],['/emby/System/Info','good'],'the token was checked upstream, and the upstream list was never asked for');
-    const query=await get(port,'/movie/key123/system/ext/serverdomains?api_key=good');
-    assert.equal(query.status,200);assert.equal(upstream.seen.at(-1).url,'/System/Info?api_key=good');
-    const open=await get(port,'/open/emby/System/Ext/ServerDomains',{'x-emby-token':'good'});
-    assert.deepEqual(JSON.parse(open.body).data.map(line=>line.url),['https://hk.example.com/open','http://203.0.113.9:8080/open'],'a node without a key has no key in its lines');
     const bad=await get(port,'/movie/key123/emby/System/Ext/ServerDomains',{'x-emby-token':'stolen'});
     assert.deepEqual([bad.status,JSON.parse(bad.body)],[401,{error:'Invalid token',ok:false}]);
     const none=await get(port,'/movie/key123/emby/System/Ext/ServerDomains');
     assert.equal(none.status,401,'no token, no lines');
+    const ok=await get(port,'/movie/key123/emby/System/Ext/ServerDomains',{'x-emby-token':'good'});
+    assert.equal(ok.status,200);assert.match(ok.headers['content-type'],/application\/json/);
+    assert.deepEqual(JSON.parse(ok.body),{data:[
+      {name:'智能入口',url:'https://entry.example.com/movie/key123'},{name:'香港',url:'https://hk.example.com/movie/key123'},{name:'IP 机',url:'http://203.0.113.9:8080/movie/key123'}],ok:true});
+    assert.deepEqual([upstream.seen.at(-1).url,upstream.seen.at(-1).token],['/emby/Items?Limit=1','good'],'the token was checked upstream, and the upstream list was never asked for');
+    const query=await get(port,'/movie/key123/system/ext/serverdomains?api_key=good&limit=999&Recursive=true');
+    assert.equal(query.status,200);assert.equal(upstream.seen.at(-1).url,'/Items?api_key=good&Limit=1');
+    const open=await get(port,'/open/emby/System/Ext/ServerDomains',{'x-emby-token':'good'});
+    assert.deepEqual(JSON.parse(open.body).data.map(line=>line.url),['https://hk.example.com/open','http://203.0.113.9:8080/open'],'a node without a key has no key in its lines');
     assert.equal((await get(port,'/movie/wrongkey/emby/System/Ext/ServerDomains',{'x-emby-token':'good'})).status,404,'the connection key still guards the node');
     assert.ok(upstream.seen.every(item=>!/ServerDomains/.test(item.url)));
   } finally { await Promise.all([close(relay),close(upstream.server)]); }
@@ -196,11 +195,11 @@ test('a node that appends the upstream lines asks for them only once the token i
     assert.deepEqual(JSON.parse(ok.body).data,[
       {name:'智能入口',url:'https://entry.example.com/movie/key123'},{name:'香港',url:'https://hk.example.com/movie/key123'},{name:'IP 机',url:'http://203.0.113.9:8080/movie/key123'},
       {name:'上游·origin',url:'https://direct-origin.example.net'}],'the node lines first; an upstream line repeating one of them is dropped');
-    assert.deepEqual(upstream.seen.map(item=>[item.url,item.token]),[['/emby/System/Info','good'],['/emby/System/Ext/ServerDomains','good']]);
+    assert.deepEqual(upstream.seen.map(item=>[item.url,item.token]),[['/emby/Items?Limit=1','good'],['/emby/System/Ext/ServerDomains','good']]);
     assert.equal(upstream.seen[1].encoding,'identity','the list is read here, so it is asked for uncompressed');
     upstream.seen.length=0;
     assert.equal((await get(port,'/movie/key123/emby/System/Ext/ServerDomains',{'x-emby-token':'stolen'})).status,401);
-    assert.deepEqual(upstream.seen.map(item=>item.url),['/emby/System/Info'],'a rejected token never reaches the upstream list');
+    assert.deepEqual(upstream.seen.map(item=>item.url),['/emby/Items?Limit=1'],'a rejected token never reaches the upstream list');
     upstream.seen.length=0;
     assert.equal((await get(port,'/movie/key123/emby/System/Ext/ServerDomains?api_key=good')).status,200);
     assert.equal(upstream.seen[1].url,'/emby/System/Ext/ServerDomains?api_key=good','the client query rides along');
@@ -249,7 +248,7 @@ test('through a unified egress, the token is checked via the egress machine and 
     assert.equal(res.status,200);
     assert.deepEqual(JSON.parse(res.body).data.map(line=>line.name),['香港','IP 机'],'B answers with its own list');
     assert.deepEqual([counts.b,counts.a],[1,1]);
-    assert.deepEqual([upstream.seen.at(-1).url,upstream.seen.at(-1).token],['/emby/System/Info','good']);
+    assert.deepEqual([upstream.seen.at(-1).url,upstream.seen.at(-1).token],['/emby/Items?Limit=1','good']);
   } finally { a.stop();b.stop();await Promise.all([relayA,relayB,upstream.server].map(close)); }
 });
 
@@ -266,6 +265,6 @@ test('through a unified egress, the upstream lines are fetched via the egress ma
     assert.equal(res.status,200);
     assert.deepEqual(JSON.parse(res.body).data.map(line=>line.name),['香港','IP 机','上游·origin']);
     assert.deepEqual([counts.b,counts.a],[1,2],'both upstream calls went through the egress machine');
-    assert.deepEqual(upstream.seen.map(item=>item.url),['/emby/System/Info','/emby/System/Ext/ServerDomains']);
+    assert.deepEqual(upstream.seen.map(item=>item.url),['/emby/Items?Limit=1','/emby/System/Ext/ServerDomains']);
   } finally { a.stop();b.stop();await Promise.all([relayA,relayB,upstream.server].map(close)); }
 });
