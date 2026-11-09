@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import http from 'node:http';import https from 'node:https';import net from 'node:net';
-import {clearTlsSessions,getRuntimeStatus,handleUpgrade,makeProxyHandler,RELAY_HIGH_WATER_MARK,RELAY_SERVER_OPTIONS,shouldRewriteStreamBody,stripAdminCredentials,stripAdminSetCookies,validateUpstream,validateUpstreamList} from '../src/proxy.js';import {deriveKey,tokenDigest} from '../src/security.js';
+import {handleUpgrade,makeProxyHandler,RELAY_SERVER_OPTIONS,shouldRewriteStreamBody,stripAdminSetCookies,validateUpstream,validateUpstreamList} from '../src/proxy.js';import {clearTlsSessions,getRuntimeStatus,RELAY_HIGH_WATER_MARK,stripAdminCredentials} from '../src/upstream-exchange.js';import {deriveKey,tokenDigest} from '../src/security.js';
 const TEST_TLS_CERT=`-----BEGIN CERTIFICATE-----
 MIIDGjCCAgKgAwIBAgIUIbeDFssFh3d60STn8JZVJvohWqwwDQYJKoZIhvcNAQEL
 BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcyNDA1NTI1MFoXDTM2MDcy
