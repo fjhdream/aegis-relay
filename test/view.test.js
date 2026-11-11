@@ -657,4 +657,10 @@ test('app.js names only what view.js has, and writes no markup of its own',()=>{
   assert.deepEqual(names.filter(name=>!new RegExp(`(?<![\\w$.])${name.replace(/\$/g,'\\$')}(?![\\w$])`).test(body)),[]);
   // What goes into the page is decided in view.js: no string in app.js starts a tag.
   assert.deepEqual(app.match(/['"`]\s*<\/?[a-zA-Z]/g),null);
+  // The server gives every import its version by rewriting one form of it (src/server.js): a whole
+  // line, single quotes, a file beside this one. No script of the page may import any other way.
+  for(const name of fs.readdirSync(new URL('../web/',import.meta.url)).filter(file=>file.endsWith('.js'))){
+    const source=fs.readFileSync(new URL(`../web/${name}`,import.meta.url),'utf8').replace(/^\s*\/\/.*$/gm,'');
+    assert.deepEqual([(source.match(/^[ \t]*import\b.*$/gm)||[]).filter(line=>!/^import \{[^}]*\} from '\.\/[\w.-]+\.js';$/.test(line)),source.match(/\bimport\s*\(/g)],[[],null],name);
+  }
 });
