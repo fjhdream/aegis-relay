@@ -1,5 +1,5 @@
 import { isRouteAuthKey } from './route-auth.js';
-import { agentKnows, isCertificateEmail, LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
+import { agentKnows, isCertificateEmail, LOCAL_AGENT_ID, routesForAgent, shellWord } from './agent-registry.js';
 import { EGRESS_CAPABILITY, STEERING_CAPABILITY, STEERING_MODES } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 import { LINE_SYNC_CAPABILITY, lineSyncUpstream, nodeLines } from './line-sync.js';
@@ -224,5 +224,5 @@ export function entryAttempt(desired, status, nowMs=Date.now()) {
 }
 
 export function entryCommand(entry, local) {
-  return `sudo ${local?'aegis-relay':'aegis-relay-agent'} entry ${entry.domain} ${entry.email}${entry.peers.length?` ${entry.peers.join(' ')}`:''}`;
+  return ['sudo',local?'aegis-relay':'aegis-relay-agent','entry',...[entry.domain,entry.email,...entry.peers].map(shellWord)].join(' ');
 }
