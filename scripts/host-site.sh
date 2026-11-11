@@ -243,3 +243,25 @@ agent_ip_steps(){
   set_env "$AEGIS_AGENT_DIR/.env" AGENT_PROXY_IP "$aegis_ip" || return 1
   echo "Agent IP 反代已就绪: http://$aegis_ip/"
 }
+
+# Render again the address the agent serves on now, so that an update's Nginx tuning reaches it. What
+# Nginx has loaded is the truth about that address: the enabled site's server_name is `_` on the IP
+# site and the domain otherwise. Only a machine with no site yet is read from .env. Returns 3 when
+# there is nothing to render (no address was ever set up), 1 when rendering failed.
+#   agent_serve_current
+agent_serve_current(){
+  aegis_serving=$(sed -n 's/^[[:space:]]*server_name[[:space:]]\{1,\}\([^;[:space:]]*\).*$/\1/p' "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-agent.conf" 2>/dev/null | head -n1)
+  aegis_env_email=$(sed -n 's/^AGENT_EMAIL=//p' "$AEGIS_AGENT_DIR/.env" 2>/dev/null | head -n1)
+  if [ -z "$aegis_serving" ]; then
+    if [ "$(sed -n 's/^AGENT_PROXY_MODE=//p' "$AEGIS_AGENT_DIR/.env" 2>/dev/null | head -n1)" = ip ]; then aegis_serving=_
+    else aegis_serving=$(sed -n 's/^AGENT_DOMAIN=//p' "$AEGIS_AGENT_DIR/.env" 2>/dev/null | head -n1); fi
+    [ -n "$aegis_serving" ] || return 3
+    [ "$aegis_serving" = _ ] || [ -n "$aegis_env_email" ] || return 3
+  fi
+  if [ "$aegis_serving" = _ ]; then agent_serve_ip; return $?; fi
+  if [ -z "$aegis_env_email" ]; then
+    echo "Nginx 正在为 $aegis_serving 服务，但 .env 里没有证书邮箱（AGENT_EMAIL），无法重新生成站点。" >&2
+    return 1
+  fi
+  agent_serve_domain "$aegis_serving" "$aegis_env_email"
+}

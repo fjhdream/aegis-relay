@@ -143,17 +143,13 @@ agent_up(){
 }
 agent_up --force-recreate --remove-orphans
 echo "Agent 已升级到 $SOURCE_VERSION，原注册身份、本地快照和流量统计已保留。"
-DOMAIN=$(sed -n 's/^AGENT_DOMAIN=//p' "$INSTALL_DIR/.env" | head -n1)
-EMAIL=$(sed -n 's/^AGENT_EMAIL=//p' "$INSTALL_DIR/.env" | head -n1)
-MODE=$(sed -n 's/^AGENT_PROXY_MODE=//p' "$INSTALL_DIR/.env" | head -n1)
-# Re-assert whichever入口 this machine already uses so Nginx stays consistent with the new build;
-# both configure scripts are idempotent. env-persisted mode/domain means the入口 survives upgrades.
-if [ "$MODE" = ip ]; then
-  # Never fail the upgrade over this (the new agent is already running), but do not hide it either:
-  # a silently skipped re-config means the machine keeps the OLD Nginx tuning after an update.
-  "$INSTALL_DIR/agent-configure-ip.sh" || echo "警告：IP 反代入口重新配置失败，Nginx 仍沿用旧配置（本次更新的 Nginx 调优未应用）。修复后执行: sudo aegis-relay-agent ip" >&2
-elif [ -n "$DOMAIN" ] && [ -n "$EMAIL" ]; then
-  "$INSTALL_DIR/agent-configure-domain.sh" "$DOMAIN" "$EMAIL" || echo "警告：域名入口重新配置失败，Nginx 仍沿用旧配置（本次更新的 Nginx 调优未应用）。修复后执行: sudo aegis-relay-agent domain $DOMAIN $EMAIL" >&2
-else
-  echo "若尚未配置入口，请执行 HTTPS: sudo aegis-relay-agent domain 域名 邮箱，或 IP 反代: sudo aegis-relay-agent ip"
-fi
+# Render again the direct address this machine already serves on, so Nginx stays consistent with the
+# new build. It is read from the site Nginx has loaded, so a machine whose .env had drifted from it
+# keeps its address instead of being switched. Never fail the upgrade over this (the new agent is
+# already running), but do not hide it either: a silently skipped re-config means the machine keeps
+# the OLD Nginx tuning after an update.
+. "$INSTALL_DIR/host-site.sh"
+agent_serve_current || case $? in
+  3) echo "若尚未配置直连地址，请执行 HTTPS: sudo aegis-relay-agent domain 域名 邮箱，或 IP 反代: sudo aegis-relay-agent ip" ;;
+  *) echo "警告：直连地址重新配置失败，Nginx 仍沿用旧配置（本次更新的 Nginx 调优未应用）。修复后执行: sudo aegis-relay-agent domain 域名 邮箱，或: sudo aegis-relay-agent ip" >&2 ;;
+esac
