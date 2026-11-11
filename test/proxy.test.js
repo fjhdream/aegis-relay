@@ -48,7 +48,7 @@ g5w9ie66oBzW1c1Ve0GaViRTvxESzmJLqd+bEFrYb3v7pSe9j6XQ3E+PcjDn4ExD
 ls0YYpE+ePrxn7w5QCBLTtjZ
 -----END PRIVATE KEY-----`;
 import { newRouteAuthKey, ROUTE_AUTH_VERSION, routeTokenDigest } from '../src/route-auth.js';
-import { AtomicRouteSource } from '../src/local-agent.js';
+import { AtomicRouteSource } from '../src/snapshot-follower.js';
 import { Metrics } from '../src/metrics.js';
 const listen=s=>new Promise(r=>s.listen(0,'127.0.0.1',()=>r(s.address().port))),close=s=>new Promise(r=>{s.closeAllConnections?.();s.close(r)});
 const listenAny=s=>new Promise(r=>s.listen(0,()=>r(s.address().port)));

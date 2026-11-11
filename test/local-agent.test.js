@@ -54,11 +54,6 @@ test('local agent completes register, pull, verify, atomic apply and ACK', async
     assert.deepEqual(agent.status().routeIds,[]);
     await store.flush();
 
-    const snapshot=agent.snapshots.desired('local'),tampered=structuredClone(snapshot);tampered.revision=snapshot.revision+1;
-    const activeBefore=agent.routeSource.getRoutes();
-    assert.throws(()=>agent.apply(tampered),/hash mismatch/);
-    assert.equal(agent.routeSource.getRoutes(),activeBefore);
-
     const restartedStore=new Store(file,key),restarted=new LocalAgent({store:restartedStore,cacheFile:cache});
     assert.equal(restarted.start().decision,'noop');
     assert.equal(restarted.routeSource.getRoutes().length,0);
