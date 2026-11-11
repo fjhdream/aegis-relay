@@ -3,7 +3,7 @@ import https from 'node:https';
 import net from 'node:net';
 import { pipeline } from 'node:stream';
 import { guardedLookup } from './lookup.js';
-import { EGRESS_HEADER, EGRESS_HOST_HEADER, egressToken } from './steering.js';
+import { EGRESS_HEADER, EGRESS_HOST_HEADER, EGRESS_PROTO_HEADER, egressToken } from './steering.js';
 
 // The upstream exchange: every request this relay sends upstream for a node goes through here, so
 // "how do we talk to this node's upstream" lives in one place. One exchange serves one client request.
@@ -207,7 +207,7 @@ export class UpstreamExchange {
     // the client-compat hint.
     const headers=stripAdminCredentials(hopFree(clientHeaders));
     delete headers['x-forwarded-for'];delete headers.forwarded;delete headers['x-real-ip'];
-    delete headers[EGRESS_HEADER];delete headers[EGRESS_HOST_HEADER];
+    delete headers[EGRESS_HEADER];delete headers[EGRESS_HOST_HEADER];delete headers[EGRESS_PROTO_HEADER];
     if(publicContext.host)headers['x-forwarded-host']=publicContext.host;
     headers['x-forwarded-proto']=publicContext.proto;
     if(!this.egress)applyClientProfile(headers,route.clientProfile);
@@ -224,7 +224,9 @@ export class UpstreamExchange {
 
   requestHeaders(url,extra=null) {
     const headers={...this.headers,...(extra||{})};
-    if(this.egress){headers[EGRESS_HEADER]=egressToken(this.route,Date.now());if(this.publicContext.host)headers[EGRESS_HOST_HEADER]=this.publicContext.host;}
+    // The egress machine's Nginx overwrites X-Forwarded-Proto for its own HTTPS hop, so the client's scheme
+    // goes in a header of its own (see EGRESS_PROTO_HEADER).
+    if(this.egress){headers[EGRESS_HEADER]=egressToken(this.route,Date.now());if(this.publicContext.host)headers[EGRESS_HOST_HEADER]=this.publicContext.host;headers[EGRESS_PROTO_HEADER]=`proto=${this.publicContext.proto==='http'?'http':'https'}`;}
     headers.host=url.host;
     // The client's Emby credentials only ever reach this node's own origins.
     if(!this.origins.has(url.origin)){delete headers.authorization;delete headers.cookie;delete headers['x-emby-token'];}

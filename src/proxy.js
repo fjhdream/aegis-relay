@@ -388,8 +388,8 @@ export function makeProxyHandler(routeSource, key, metrics = null, steering = nu
     if (!relayed && metrics && (playback || hasViewerIdentity(req,incoming))) { const info=accessInfoFrom(req,incoming); if(info){ info.channelId=found.channelId||'default'; metrics.recordAccess(route,info); } }
     if (!egress&&!continuation&&!vod&&!routeUpstreams(route).length) { metricDone?.(502,0,true);res.writeHead(502,{'cache-control':'no-store'}); return res.end('no upstream available'); }
     // The upstream builds its redirects for the host the client used. A relayed request is answered for
-    // the host the client actually used, so every link it carries leads back to that machine.
-    const publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req);
+    // the host and scheme the client actually used, so every link it carries leads back to that machine.
+    const publicContext=relayed?{host:relayed.host,proto:relayed.proto}:publicRequestContext(req);
     // Automatic steering: serve here, or send this playback request to a peer machine's direct domain.
     const steer=playback&&!relayed&&route.steering&&steering?steering.plan({route,found,req,incoming,publicContext,source:continuation?.source?new URL(continuation.source,'http://relay.invalid'):undefined}):null;
     if (steer?.redirect) { metricDone?.(302,0,false); res.writeHead(302,{location:steer.redirect,'cache-control':'no-store','referrer-policy':'no-referrer'}); return res.end(); }
@@ -545,7 +545,7 @@ export function handleUpgrade(req, socket, head, routeSource, key) {
   // host; otherwise use the node's primary upstream. An unknown/blocked stream host is dropped.
   let vod; if(!egress){ try { vod=vodTarget(found,relaySearch); } catch { return socket.destroy(); } }
   if(!egress&&!vod&&!routeUpstreams(found.route).length)return socket.destroy();
-  const publicContext=relayed?{host:relayed.host,proto:'https'}:publicRequestContext(req);
+  const publicContext=relayed?{host:relayed.host,proto:relayed.proto}:publicRequestContext(req);
   const exchange=new UpstreamExchange({route:found.route,prefix:found.prefix,egress,publicContext,clientHeaders:req.headers,method:req.method});
   const up=exchange.upgrade({rest:found.rest,search:relaySearch,target:vod?.target||null,protocol:req.headers.upgrade});
   // Unhandled socket errors on either leg would surface as an uncaught exception and restart the

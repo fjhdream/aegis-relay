@@ -84,7 +84,7 @@ test('through the unified egress, the client path goes to the egress machine wit
     await read((await exchange.open({rest:'/emby/Items',search:'?Limit=1'})).body);
     const sent=machine.seen[0];
     assert.equal(sent.url,'/movie/key123/emby/Items?Limit=1');
-    assert.deepEqual(relayedEgress(r,sent.headers,Date.now()),{host:'hk.example.com'});
+    assert.deepEqual(relayedEgress(r,sent.headers,Date.now()),{host:'hk.example.com',proto:'https'});
     assert.deepEqual([sent.headers['user-agent'],sent.headers.authorization],['Client/1','MediaBrowser Token="t"'],'the egress machine applies the hint, and it is a node origin');
   } finally { await close(machine.server); }
 });
