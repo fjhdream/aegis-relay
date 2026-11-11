@@ -114,14 +114,16 @@ site_restore(){
 # its data directory and a systemd path unit starts a script here, as root, to act on it. That
 # directory belongs to the container's user: whatever is at the request's name is that user's doing.
 
-# The request, printed, if it is what a request can be: a regular file of at most 64 KiB, opened
-# without following a link and without waiting. Anything else fails, unread: a link (to a file only
-# root may read, or to /dev/zero), a pipe that would keep the unit waiting for ever, a file large
-# enough to exhaust the host's memory.
-#   host_request_text FILE
-host_request_text(){
+# The request as one line of ASCII JSON, if it is what a request can be: a regular file of at most
+# 64 KiB, opened without following a link and without waiting, that holds a JSON object in UTF-8.
+# Anything else fails, unread: a link (to a file only root may read, or to /dev/zero), a pipe that
+# would keep the unit waiting for ever, a file large enough to exhaust the host's memory. What comes
+# out reads the same however it is passed on and whatever the locale: no raw control character, no
+# byte that is not ASCII, no line break.
+#   host_request_json FILE
+host_request_json(){
   python3 - "$1" <<'PY'
-import os, stat, sys
+import json, os, stat, sys
 LIMIT = 65536
 try:
     descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -141,25 +143,39 @@ try:
         sys.exit(1)
 finally:
     os.close(descriptor)
-sys.stdout.buffer.write(text)
+try:
+    request = json.loads(text.decode('utf-8'))
+except Exception:
+    sys.exit(1)
+if not isinstance(request, dict):
+    sys.exit(1)
+print(json.dumps(request))
 PY
 }
 
 # The named fields of a request, one per line, read once so that all of them come from the same
-# request. A field that is missing, not a string, or holds a line break comes out as an empty line;
-# a request that is not a JSON object fails.
+# request. A field that is missing, not a string, or holds a line break comes out as an empty line
+# (a line break would shift every field after it); a request that cannot be read fails.
 #   host_request_fields FILE NAME [NAME ...]
 host_request_fields(){
   aegis_request_file=$1; shift
-  host_request_text "$aegis_request_file" | python3 -c '
+  host_request_json "$aegis_request_file" | python3 -c '
 import json, sys
 request = json.load(sys.stdin)
-if not isinstance(request, dict):
-    sys.exit(1)
 for name in sys.argv[1:]:
     field = request.get(name, "")
-    print(field if isinstance(field, str) and "\n" not in field and "\r" not in field else "")
+    print(field if isinstance(field, str) and "\n" not in field else "")
 ' "$@"
+}
+
+# Whether VALUE, all of it, matches PATTERN (an extended regular expression from ^ to $). grep judges
+# a line at a time: a value with a line break in it would pass as soon as one of its lines matched,
+# and the other lines would go wherever the value goes (an Nginx site, an argument to certbot).
+#   value_matches VALUE PATTERN
+value_matches(){
+  case $1 in *'
+'*) return 1 ;; esac
+  printf '%s' "$1" | grep -Eq -e "$2"
 }
 
 # Take away whatever is at a request's name, so that the path unit watching it comes to rest. A
@@ -300,8 +316,8 @@ agent_switch(){
 #   agent_serve_domain DOMAIN EMAIL
 agent_serve_domain(){
   aegis_domain=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
-  printf '%s' "$aegis_domain" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "域名格式无效" >&2; return 1; }
-  printf '%s' "${2:-}" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "邮箱格式无效" >&2; return 1; }
+  value_matches "$aegis_domain" '^[A-Za-z0-9.-]+$' || { echo "域名格式无效" >&2; return 1; }
+  value_matches "${2:-}" '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "邮箱格式无效" >&2; return 1; }
   agent_switch domain "$aegis_domain" agent_domain_steps "$aegis_domain" "$2"
 }
 

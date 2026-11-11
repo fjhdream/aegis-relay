@@ -9,11 +9,12 @@ umask 077
 INSTALL_DIR=${1:-}
 AEGIS_HERE=$(dirname "$0")
 # The library is in src/ under an agent's install directory and beside the panel's scripts/. Without it
-# the request cannot be read safely; it must still not sit there re-triggering this unit.
+# the request cannot be read safely; it must still not sit there re-triggering this unit, and its
+# `pending` status goes too, so that the request is filed again instead of waited for.
 if [ -f "$AEGIS_HERE/src/host-site.sh" ]; then . "$AEGIS_HERE/src/host-site.sh"
 elif [ -f "$AEGIS_HERE/../src/host-site.sh" ]; then . "$AEGIS_HERE/../src/host-site.sh"
 else
-  case "$INSTALL_DIR" in /opt/aegis-relay|/opt/aegis-relay-agent) rm -rf -- "$INSTALL_DIR/data/host-entry-request.json" ;; esac
+  case "$INSTALL_DIR" in /opt/aegis-relay|/opt/aegis-relay-agent) rm -rf -- "$INSTALL_DIR/data/host-entry-request.json" "$INSTALL_DIR/data/host-entry-status.json" 2>/dev/null || true ;; esac
   echo "src/host-site.sh is missing; update this machine" >&2; exit 1
 fi
 case "$INSTALL_DIR" in "$AEGIS_PANEL_DIR"|"$AEGIS_AGENT_DIR") ;; *) echo "unknown install directory" >&2; exit 1 ;; esac
@@ -24,30 +25,38 @@ CONFIGURE="$INSTALL_DIR/configure-entry-domain.sh"
 
 [ "$(id -u)" -eq 0 ] || exit 1
 [ -e "$REQUEST" ] || [ -L "$REQUEST" ] || exit 0
+# From here on the request is gone however this script ends, by a check below, by a step that fails
+# under `set -e`, or at the end of the work: while it is there the path unit starts the script again.
+LOG=
+finish(){ host_request_drop "$REQUEST"; [ -z "$LOG" ] || rm -f "$LOG"; }
+trap finish EXIT
 
-# The request comes from an unprivileged container, so it is read with care (host_request_text) and
-# every field is re-validated here before it reaches Nginx or certbot. Anything unexpected drops the
-# request instead of running the workflow.
-REQUEST_TEXT=$(host_request_text "$REQUEST" 2>/dev/null) || { host_request_drop "$REQUEST"; exit 1; }
-FIELDS=$(python3 - "$REQUEST_TEXT" <<'PY'
-import json,re,sys
-DOMAIN=re.compile(r'^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+# The request comes from an unprivileged container, so it is read with care (host_request_json) and
+# every field is re-validated here before it reaches Nginx or certbot. Anything unexpected ends the
+# script instead of running the workflow. Each value is matched whole (fullmatch: `$` would let a
+# trailing line break through, and the fields below are told apart by their lines), and by a check
+# that python cannot be told to skip, as it can an assert.
+FIELDS=$(host_request_json "$REQUEST" 2>/dev/null | python3 -c '
+import json, re, sys
+DOMAIN = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+def need(fine):
+    if not fine:
+        raise ValueError
 try:
-  value=json.loads(sys.argv[1])
-  request_id=value.get('requestId'); entry=str(value.get('entryDomain','')).lower(); email=str(value.get('certificateEmail','')).lower()
-  peers=value.get('peers'); attempt=value.get('attempt',1)
-  assert isinstance(request_id,str) and re.fullmatch(r'[A-Za-z0-9_-]{8,80}',request_id)
-  assert DOMAIN.match(entry)
-  assert re.fullmatch(r'[^\s@]+@[^\s@]+',email) and len(email)<=254
-  assert isinstance(peers,list) and len(peers)<=16
-  peers=[str(peer).lower() for peer in peers]
-  assert all(DOMAIN.match(peer) and peer!=entry for peer in peers)
-  assert isinstance(attempt,int) and 1<=attempt<=1000
+    value = json.load(sys.stdin)
+    request_id = value.get("requestId"); entry = str(value.get("entryDomain", "")).lower(); email = str(value.get("certificateEmail", "")).lower()
+    peers = value.get("peers"); attempt = value.get("attempt", 1)
+    need(isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,80}", request_id))
+    need(DOMAIN.fullmatch(entry))
+    need(re.fullmatch(r"[^\s@]+@[^\s@]+", email) and len(email) <= 254)
+    need(isinstance(peers, list) and len(peers) <= 16)
+    peers = [str(peer).lower() for peer in peers]
+    need(all(DOMAIN.fullmatch(peer) and peer != entry for peer in peers))
+    need(type(attempt) is int and 1 <= attempt <= 1000)
 except Exception:
-  sys.exit(1)
-print(request_id); print(entry); print(email); print(attempt); print(' '.join(peers))
-PY
-) || { host_request_drop "$REQUEST"; exit 1; }
+    sys.exit(1)
+print(request_id); print(entry); print(email); print(attempt); print(" ".join(peers))
+') || exit 1
 REQUEST_ID=$(printf '%s\n' "$FIELDS" | sed -n 1p)
 ENTRY=$(printf '%s\n' "$FIELDS" | sed -n 2p)
 EMAIL=$(printf '%s\n' "$FIELDS" | sed -n 3p)
@@ -77,10 +86,8 @@ write_status applying "正在配置入口域名并申请证书"
 if sh "$CONFIGURE" "$ENTRY" "$EMAIL" $PEERS >"$LOG" 2>&1; then
   SUCCESS=$(tail -n 1 "$LOG")
   write_status active "${SUCCESS:-入口域名已生效}"
-  host_request_drop "$REQUEST"; rm -f "$LOG"
   exit 0
 fi
 ERROR=$(tail -n 6 "$LOG" | tr '\n' ' ' | cut -c1-480)
 write_status failed "${ERROR:-入口域名配置失败，请检查 DNS 与 80/443 端口}"
-host_request_drop "$REQUEST"; rm -f "$LOG"
 exit 1

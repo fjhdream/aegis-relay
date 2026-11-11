@@ -7,14 +7,14 @@ INSTALL_DIR=$AEGIS_PANEL_DIR
 PROXY_DOMAIN=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
-printf '%s' "$PROXY_DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' || { echo "代理域名格式无效" >&2; exit 1; }
-printf '%s' "$EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证书邮箱格式无效" >&2; exit 1; }
+value_matches "$PROXY_DOMAIN" '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' || { echo "代理域名格式无效" >&2; exit 1; }
+value_matches "$EMAIL" '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证书邮箱格式无效" >&2; exit 1; }
 [ -f "$INSTALL_DIR/.env" ] || { echo "未找到 AegisRelay 安装" >&2; exit 1; }
 PUBLIC_BASE_URL=$(sed -n 's/^PUBLIC_BASE_URL=//p' "$INSTALL_DIR/.env" | head -n1)
 PANEL_DOMAIN=$(printf '%s' "$PUBLIC_BASE_URL" | sed -n 's#^https://\([^/:]*\)/\{0,1\}$#\1#p' | tr '[:upper:]' '[:lower:]')
 ADMIN_PATH=$(sed -n 's/^ADMIN_PATH=//p' "$INSTALL_DIR/.env" | head -n1 | sed 's#^/##;s#/$##')
 [ -n "$PANEL_DOMAIN" ] || { echo "请先执行 aegis-relay domain 配置 HTTPS 面板域名" >&2; exit 1; }
-printf '%s' "$PANEL_DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' || { echo "PUBLIC_BASE_URL 中的面板域名无效" >&2; exit 1; }
+value_matches "$PANEL_DOMAIN" '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' || { echo "PUBLIC_BASE_URL 中的面板域名无效" >&2; exit 1; }
 [ -n "$ADMIN_PATH" ] || { echo "ADMIN_PATH 缺失" >&2; exit 1; }
 [ "$PANEL_DOMAIN" != "$PROXY_DOMAIN" ] || { echo "面板域名与代理域名必须不同" >&2; exit 1; }
 # 第三方软件源失效（如 402/GPG 过期）不应中断本脚本：所需软件包通常已安装，
