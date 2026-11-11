@@ -55,11 +55,12 @@ function loadIdentity(file){const identity=JSON.parse(fs.readFileSync(file,'utf8
 function verifyResponse(response,raw,identity,nonce,now){const timestamp=Number(response.headers.get('x-aegis-timestamp')),contentHash=response.headers.get('x-aegis-content-sha256')||'',signature=response.headers.get('x-aegis-signature')||'',keyId=response.headers.get('x-aegis-panel-key-id')||'';if(!Number.isSafeInteger(timestamp)||Math.abs(Math.floor(now()/1000)-timestamp)>300||!timingEqual(contentHash,sha256(raw))||!timingEqual(keyId,identity.panelKeyId))throw new Error('panel response identity rejected');const input=panelResponseInput({status:response.status,requestNonce:nonce,timestamp,contentHash});if(!crypto.verify(null,Buffer.from(input),panelPublicKey(identity),Buffer.from(signature,'base64url')))throw new Error('panel response signature rejected');}
 
 // Register this machine with the panel, or keep the identity it already has. Returns
-// {agentId, registered}: `registered` is false when the existing identity was kept.
+// {agentId, registered}: `registered` is false when the existing identity was kept (agentId is null if
+// that file cannot be read; keeping it is still not an error here).
 export async function enrollAgent({dataDir,panelUrl,token='',name='',version='0.0.0',fetch=globalThis.fetch,now=Date.now}){
   const panel=cleanPanel(panelUrl),files=agentFiles(dataDir);
   fs.mkdirSync(dataDir,{recursive:true,mode:0o700});
-  const alreadyEnrolled=fs.existsSync(files.identity),kept=()=>({agentId:JSON.parse(fs.readFileSync(files.identity,'utf8')).agentId,registered:false});
+  const alreadyEnrolled=fs.existsSync(files.identity),kept=()=>{let agentId=null;try{agentId=JSON.parse(fs.readFileSync(files.identity,'utf8')).agentId||null}catch{}return{agentId,registered:false}};
   token=String(token||'');
   // Enrollment is driven by the token, not merely by whether an identity file exists. A fresh valid
   // token is explicit intent to (re-)register THIS machine, so it must go through even when a stale
@@ -126,8 +127,16 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
     const body=payload===null?Buffer.alloc(0):Buffer.from(JSON.stringify(payload)),timestamp=Math.floor(now()/1000),nonce=randomToken(16),contentHash=sha256(body);
     const signature=b64u(crypto.sign(null,Buffer.from(agentRequestInput({method,path:pathAndQuery,agentId:identity.agentId,timestamp,nonce,contentHash})),signPrivateKey(identity))),headers={'x-aegis-agent-id':identity.agentId,'x-aegis-timestamp':String(timestamp),'x-aegis-nonce':nonce,'x-aegis-content-sha256':contentHash,'x-aegis-signature':signature};
     if(payload!==null)headers['content-type']='application/json';
-    const options={method,headers,signal:timeoutMs?AbortSignal.any([stopped,AbortSignal.timeout(timeoutMs)]):stopped};if(method!=='GET'&&payload!==null)options.body=body;
-    const response=await fetch(`${panel}${pathAndQuery}`,options),raw=Buffer.from(await response.arrayBuffer());verifyResponse(response,raw,identity,nonce,now);return{response,raw,data:raw.length?JSON.parse(raw.toString('utf8')):null};
+    const options={method,headers};if(method!=='GET'&&payload!==null)options.body=body;
+    // The request ends with stop(), or after timeoutMs. Its own controller, taken off the stop signal
+    // as soon as it is over: an agent makes requests for months and nothing may pile up on that signal.
+    const request=new AbortController(),cancel=()=>request.abort(stopped.reason);
+    if(stopped.aborted)cancel();else stopped.addEventListener('abort',cancel,{once:true});
+    const timer=timeoutMs?setTimeout(()=>request.abort(new DOMException('The operation was aborted due to timeout','TimeoutError')),timeoutMs):null;
+    try{
+      const response=await fetch(`${panel}${pathAndQuery}`,{...options,signal:request.signal}),raw=Buffer.from(await response.arrayBuffer());
+      verifyResponse(response,raw,identity,nonce,now);return{response,raw,data:raw.length?JSON.parse(raw.toString('utf8')):null};
+    }finally{clearTimeout(timer);stopped.removeEventListener('abort',cancel)}
   }
 
   const metricStore=loadMetricStore(files.metrics,key),metrics=new Metrics(metricStore);
@@ -156,7 +165,7 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
       const started=now();let pause;
       try{const applied=await pollConfig(CONFIG_WAIT_SECONDS);retry.reset();pause=applied?0:CONFIG_POLL_FLOOR_MS-(now()-started)}
       catch(error){if(stopped.aborted)return;report(error);pause=retry.next()}
-      if(pause>0)await sleep(pause,stopped);
+      if(pause>0&&!stopped.aborted)await sleep(pause,stopped);
     }
   }
 
@@ -180,12 +189,14 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
         if(status.entry)followEntry({dir:dataDir,entry:cleanEntryRequest(status.entry),nowMs:now()});
         retry.reset();delay=Math.max(5_000,Number(status.heartbeatSeconds||15)*1000);
       }catch(error){if(stopped.aborted)return;report(error);delay=retry.next()}
-      await sleep(delay,stopped);
+      if(!stopped.aborted)await sleep(delay,stopped);
     }
   }
 
   steering.start(async payload=>{const result=await signedRequest('POST','/api/agent/v1/steering',payload,20_000);if(!result.response.ok)throw new Error(result.data?.error||`steering sync failed (${result.response.status})`);return result.data;},routes);
-  const loops=[followConfig(),heartbeat()].map(loop=>loop.catch(report));
+  // Neither loop is meant to end before stop(). One that throws is left unhandled on purpose: the
+  // process dies and Docker restarts the agent, rather than it relaying on without following the panel.
+  const loops=[followConfig(),heartbeat()];
 
   return {
     agentId:identity.agentId,port:server.address().port,
