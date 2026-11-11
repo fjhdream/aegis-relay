@@ -74,10 +74,10 @@ store.data.sessions = sessions;
 function pruneSessions(){const now=Date.now();for(const [sid,session] of Object.entries(sessions))if(!session||Number(session.expires)<now)delete sessions[sid];for(const [sid] of Object.entries(sessions).sort((a,b)=>Number(b[1].expires)-Number(a[1].expires)).slice(16))delete sessions[sid]}
 pruneSessions();
 const loginLimiter = new RateLimiter(6, 5 * 60_000);
-const ui = fs.readFileSync(path.join(ROOT, 'web', 'index.html'),'utf8').replace('APP_JS',`app.js?v=${APP_VERSION}`).replace('STYLE_CSS',`style.css?v=${APP_VERSION}`).replace('HELP_CSS',`help.css?v=${APP_VERSION}`).replaceAll('APP_VERSION',APP_VERSION);
-// The page asks for app.js by version, so that no cache hands a new page an old script; app.js asks
-// for the modules it imports the same way.
-const uiFiles = new Map(Object.keys(UI_FILES).map(name=>[name,name==='/app.js'?Buffer.from(fs.readFileSync(path.join(ROOT,'web',name),'utf8').replace(/(from\s*'\.\/[\w.-]+\.js)'/g,`$1?v=${APP_VERSION}'`)):fs.readFileSync(path.join(ROOT,'web',name))]));
+const ui = fs.readFileSync(path.join(ROOT, 'web', 'index.html'),'utf8').replace('APP_JS',`app.js?v=${APP_VERSION}`).replace('THEME_JS',`theme.js?v=${APP_VERSION}`).replace('VIEW_JS',`view.js?v=${APP_VERSION}`).replace('STYLE_CSS',`style.css?v=${APP_VERSION}`).replace('HELP_CSS',`help.css?v=${APP_VERSION}`).replaceAll('APP_VERSION',APP_VERSION);
+// The page asks for each of its files by version, so that no cache hands a new page an old script; a
+// script asks for the modules it imports the same way.
+const uiFiles = new Map(Object.keys(UI_FILES).map(name=>[name,name.endsWith('.js')?Buffer.from(fs.readFileSync(path.join(ROOT,'web',name),'utf8').replace(/^(import\b[^'\n]*'\.\/[\w.-]+\.js)'/gm,`$1?v=${APP_VERSION}'`)):fs.readFileSync(path.join(ROOT,'web',name))]));
 const agentInstaller = fs.readFileSync(path.join(ROOT,'scripts','agent-install.sh'));
 const agentUpgrader = fs.readFileSync(path.join(ROOT,'scripts','agent-upgrade.sh'));
 

@@ -200,12 +200,18 @@ test('the page and everything it loads are served, each asked for by version',as
   const version=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8')).version,get=file=>call('GET',`/${file}`,undefined,{auth:false,prefix:''});
   const page=await get('');
   assert.match(page.headers.get('content-type'),/^text\/html/);
-  // The app is a module (it imports the rest), and nothing is left for the browser to guess a version of.
-  const scripts=[...page.text.matchAll(/<script\b([^>]*)>/g)].map(match=>match[1].trim()),styles=[...page.text.matchAll(/<link rel="stylesheet" href="([^"]+)"/g)].map(match=>match[1]);
-  assert.deepEqual([scripts,styles],[[`type="module" src="app.js?v=${version}"`],[`style.css?v=${version}`,`help.css?v=${version}`]]);
+  // The theme is applied by a plain script in <head>, before anything is painted; the app is a module
+  // (it imports the rest), and what it imports is fetched ahead under the very address it will ask for.
+  // Nothing is left for the browser to guess a version of.
+  const head=page.text.slice(0,page.text.indexOf('</head>')),scripts=[...page.text.matchAll(/<script\b([^>]*)>/g)].map(match=>match[1].trim()),styles=[...page.text.matchAll(/<link rel="stylesheet" href="([^"]+)"/g)].map(match=>match[1]);
+  assert.deepEqual([scripts,styles],[[`src="theme.js?v=${version}"`,`type="module" src="app.js?v=${version}"`],[`style.css?v=${version}`,`help.css?v=${version}`]]);
+  assert.ok(head.includes(`<script src="theme.js?v=${version}"></script>`)&&!head.includes('type="module"'),'the theme script is in the head, the app is not');
   const app=await get(`app.js?v=${version}`),imports=[...app.text.matchAll(/^import\b[^'\n]*'([^']+)'/gm)].map(match=>match[1]);
   assert.deepEqual(imports,[`./view.js?v=${version}`]);
-  for(const [file,type] of [[`app.js?v=${version}`,/^text\/javascript/],...imports.map(name=>[name.slice(2),/^text\/javascript/]),...styles.map(name=>[name,/^text\/css/])]){
+  assert.deepEqual([...head.matchAll(/<link rel="modulepreload" href="([^"]+)"/g)].map(match=>`./${match[1]}`),imports);
+  // No script the page is made of imports anything without a version.
+  for(const name of fs.readdirSync(path.join(ROOT,'web')).filter(name=>name.endsWith('.js')))assert.deepEqual([...(await get(`${name}?v=${version}`)).text.matchAll(/^import\b[^'\n]*'([^']+)'/gm)].map(match=>match[1]).filter(specifier=>!specifier.endsWith(`?v=${version}`)),[],name);
+  for(const [file,type] of [[`theme.js?v=${version}`,/^text\/javascript/],[`app.js?v=${version}`,/^text\/javascript/],...imports.map(name=>[name.slice(2),/^text\/javascript/]),...styles.map(name=>[name,/^text\/css/])]){
     const answer=await get(file);
     assert.deepEqual([answer.status,type.test(answer.headers.get('content-type')),answer.headers.get('cache-control'),answer.text.length>0],[200,true,'no-store',true],file);
   }

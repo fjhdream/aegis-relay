@@ -152,6 +152,12 @@ test('a node is shown in the form as it is, and saving the form unchanged sends 
   // A node from before some settings existed: nothing is shown as "undefined", and the newer switches take their defaults.
   const old=view.routeToForm({name:'Old',alias:'old',tags:[],upstreams:['https://x.example.com'],accessMode:'key',allowPrivate:false,tlsVerify:true,showOnHome:false,favorite:false,clientProfile:{}});
   assert.deepEqual([old['#access-threshold'],old['#steer-min-rate'],old['#steer-egress'],old['#stream-rewrite-domains'],old['#stream-rewrite-enabled'],old['#steer-enabled'],old['#line-sync-enabled'],old['#line-sync-upstream'],old['#profile-enabled']],[0,'','','',false,false,true,false,false]);
+  // A yes/no select that somehow holds neither answer is a no (one of them lets a node reach private
+  // addresses, another switches certificate checks off), and a switch is on only when the node says true.
+  const choices=view.ROUTE_FIELDS.filter(field=>field.kind==='choice'),sentAs=value=>{const sent=view.formToRoute({...typed,...Object.fromEntries(choices.map(field=>[field.id,value]))});return choices.map(field=>sent[field.key])};
+  assert.deepEqual([choices.map(field=>field.key),sentAs('true'),sentAs('false'),sentAs(''),sentAs('undefined'),sentAs('TRUE'),sentAs('1')],[['allowPrivate','tlsVerify','showOnHome','favorite'],[true,true,true,true],...Array(5).fill([false,false,false,false])]);
+  const loosely=view.routeToForm({...full,clientProfile:{...full.clientProfile,enabled:'yes'},streamRewrite:{enabled:1,domains:[]},autoSteer:{enabled:'true',minRateMbps:0},lineSyncUpstream:1,lineSync:0});
+  assert.deepEqual([loosely['#profile-enabled'],loosely['#stream-rewrite-enabled'],loosely['#steer-enabled'],loosely['#line-sync-upstream'],loosely['#line-sync-enabled']],[false,false,false,false,true]);
   assert.deepEqual([view.formToRoute({...typed,'#speed-limit':'','#steer-min-rate':''}).speedLimitMbps,view.formToRoute({...typed,'#steer-min-rate':''}).autoSteer.minRateMbps,view.formToRoute({...typed,'#private':'false'}).allowPrivate],[0,0,false]);
 });
 
@@ -343,7 +349,7 @@ const NOW=Date.parse('2026-11-11T08:00:00Z');
 // The steering page as the refresher sees it: what was asked for, drawn, said under the title and said aloud.
 function steeringPage(ask){
   const seen={shown:[],status:'',toasts:[]},where={page:'steering',csrf:'test',hidden:false};
-  const refresher=view.steeringRefresher({ask,onPage:()=>where.page==='steering',signedIn:()=>!!where.csrf,hidden:()=>where.hidden,show:(data,liveOnly)=>seen.shown.push({data,liveOnly}),status:text=>{seen.status=text},toast:(message,error)=>seen.toasts.push([message,error]),now:()=>NOW});
+  const refresher=view.steeringRefresher({ask,onPage:()=>where.page==='steering',signedIn:()=>!!where.csrf,hidden:()=>where.hidden,showAll:data=>seen.shown.push({data,liveOnly:false}),showLive:data=>seen.shown.push({data,liveOnly:true}),status:text=>{seen.status=text},toast:(message,error)=>seen.toasts.push([message,error]),now:()=>NOW});
   return {refresher,seen,where};
 }
 
