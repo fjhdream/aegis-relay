@@ -135,6 +135,18 @@ test('the hub hands out only changes since the cursor, for deployed nodes, with 
   assert.equal(hub.exchange('b',{cursor:999999}).sessions.length,1);
 });
 
+test('peer health is judged by the hub clock, whatever the wall clock says',()=>{
+  const {store,data}=fixture(),b=data.agents.find(agent=>agent.id==='b'),wall=Date.now();
+  let now=wall;
+  const hub=new SteeringHub({store,clock:()=>now});
+  // Every way the hub hands peer health out: to a machine, to the panel, and directly.
+  const healthy=(clock,lastSeen)=>{now=clock;b.lastSeen=new Date(lastSeen).toISOString();return [hub.exchange('local',{}).peers,hub.view().machines,hub.peers()].map(peers=>peers.find(peer=>peer.id==='b').healthy)};
+  assert.deepEqual({
+    fresh:healthy(wall-120_000,wall-121_000), // seen a second ago by the hub clock, two minutes ago by the wall clock
+    stale:healthy(wall+120_000,wall)          // seen just now by the wall clock, two minutes ago by the hub clock
+  },{fresh:[true,true,true],stale:[false,false,false]});
+});
+
 test('a client type that keeps failing to follow redirects is excluded automatically',()=>{
   const {store,data}=fixture(),excluded=[];
   const hub=new SteeringHub({store,onAutoExclude:client=>{excluded.push(client);data.settings.steering.autoExcluded={[client]:'now'}}});

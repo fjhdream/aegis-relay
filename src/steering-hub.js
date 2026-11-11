@@ -238,7 +238,7 @@ export class SteeringHub {
     return syncResponse({
       serverTime:now,cursor:changed.length===BATCH?changed.at(-1).seq:this.seq,
       sessions:changed.map(session=>sessionUpdate(session,this.prior(session,now))),
-      peers:this.peers(),
+      peers:this.peers(now),
       excludedClients:excludedClients(settings),
       boundedClients:boundedClientList(settings),trialClients:this.trialClients(settings),boundBytes:settings.boundMB*1024*1024
     });
@@ -247,12 +247,14 @@ export class SteeringHub {
   // The operator cleared the automatic capped-range results: forget the evidence behind them as well.
   clearRangeVerdicts() { this.bounds.clear(); }
 
-  peers() {
+  // A machine's last contact is judged by the hub's clock like every other time here. In production that
+  // is the clock the panel stamps lastSeen with; reading the wall clock would ignore an injected one.
+  peers(now=this.clock()) {
     const out=[];
     for(const agent of this.store.data.agents||[]){
       if(agent.state==='revoked')continue;
       const local=agent.id===LOCAL_AGENT_ID,health=this.health.get(agent.id);
-      const healthy=local||(remoteAgentStatus(agent)==='online'&&agent.proxyHealthy===true&&agentKnows(agent,STEERING_CAPABILITY)&&Number(agent.desiredRevision||0)===Number(agent.appliedRevision||0));
+      const healthy=local||(remoteAgentStatus(agent,now)==='online'&&agent.proxyHealthy===true&&agentKnows(agent,STEERING_CAPABILITY)&&Number(agent.desiredRevision||0)===Number(agent.appliedRevision||0));
       out.push({id:agent.id,healthy,at:health?.at||0,routes:health?.routes||{}});
     }
     return out;
@@ -265,7 +267,7 @@ export class SteeringHub {
     const clients=[...this.clients.values()].map(stat=>{const landed=stat.results.filter(Boolean).length;return{client:stat.client,total:stat.results.length,landed,autoExcluded:auto.has(stat.client.toLowerCase())}});
     const bounded=new Set(boundedClientList(settings).map(client=>client.toLowerCase())),trials=new Set(this.trialClients(settings).map(client=>client.toLowerCase()));
     const ranges=[...this.bounds.values()].map(stat=>{const key=stat.client.toLowerCase();return{client:stat.client,continued:stat.results.filter(Boolean).length,total:stat.results.length,trialContinued:stat.trials.filter(Boolean).length,trialTotal:stat.trials.length,state:bounded.has(key)?'on':trials.has(key)?'trial':'off'}});
-    return {sessions,events:this.events.slice(-50).reverse(),clients,ranges,effects:this.effectSummary(),networks:this.history.size,machines:this.peers(),playback:this.playback.view(now)};
+    return {sessions,events:this.events.slice(-50).reverse(),clients,ranges,effects:this.effectSummary(),networks:this.history.size,machines:this.peers(now),playback:this.playback.view(now)};
   }
 
   effectSummary() {
