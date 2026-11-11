@@ -29,10 +29,16 @@ function handSleep(){
     const entry={ms,release(){const at=pending.indexOf(entry);if(at>=0)pending.splice(at,1);resolve()}};
     pending.push(entry);signal?.addEventListener('abort',entry.release,{once:true});
   });
-  const next=(match,what)=>until(()=>pending.find(entry=>match(entry.ms)),what);
+  const next=(match,what)=>until(()=>pending.find(entry=>match(entry.ms,entry)),what);
   return {sleep,next,pending};
 }
 const heartbeatWait=ms=>ms===HEARTBEAT_MS,otherWait=ms=>ms!==HEARTBEAT_MS;
+// The n-th wait of a backoff: 2s doubled n-1 times, held to the cap, a quarter shorter to a quarter
+// longer and never over the cap.
+const backoffWait=(ms,n,cap)=>{const nominal=Math.min(cap,2_000*2**(n-1));return ms>=nominal*0.75&&ms<=Math.min(cap,nominal*1.25)};
+// Release wait after wait of one loop and return how long each was; the last one is left pending.
+async function waitsOf(sleeps,match,count){const seen=[];for(let i=0;i<count;i++){const wait=await sleeps.next(match,`wait ${i+1}`);seen.push(wait.ms);if(i<count-1)wait.release()}return seen}
+const assertBackoff=(seen,cap,what)=>seen.forEach((ms,i)=>assert.ok(backoffWait(ms,i+1,cap),`${what}: wait ${i+1} was ${ms}ms`));
 
 // A panel with one node deployed to whoever enrolls, an Emby stand-in behind it, and the machines the
 // test starts. Everything is torn down in order when the test ends.
@@ -152,19 +158,21 @@ test('the heartbeat brings down the domain the panel wants, and reports how the 
 
 test('a snapshot the agent cannot apply is reported; it keeps serving the last one and recovers',async t=>{
   const {panel,dir,agent,agentId,record,sleeps,beat,logs}=await runningAgent(t),blocker=path.join(dir,'previous.snapshot');
+  const beatWait=await sleeps.next(heartbeatWait,'the heartbeat wait'),retryWait=(_ms,entry)=>entry!==beatWait;
   // The disk refuses the next snapshot: the copy of the current one cannot be put in place.
   fs.mkdirSync(blocker);
   panel.deploy(agentId,['movies','shows']);
-  const first=await sleeps.next(otherWait,'the wait after the refusal');
+  const first=await sleeps.next(retryWait,'the wait after the refusal');
   assert.deepEqual([record.applyState,record.lastAck.status,record.lastAck.revision,record.appliedRevision,record.desiredRevision],['error','rejected',2,1,2]);
   assert.ok(record.lastAck.error&&record.error===record.lastAck.error,'the panel is told why');
   assert.ok(logs.includes(`[aegis-agent] ${record.lastAck.error}`.slice(0,174)));
   assert.equal((await get(agent.port,'/movies/System/Info')).status,200,'the last good snapshot is still served');
   assert.equal((await get(agent.port,'/shows/Items')).status,404);
-  // It tries again, a little later each time.
-  assert.equal(first.ms,2_000);first.release();
-  const second=await sleeps.next(otherWait,'the second wait');assert.equal(second.ms,4_000);second.release();
-  const third=await sleeps.next(otherWait,'the third wait');assert.equal(third.ms,8_000);
+  // It tries again, about twice as much later each time.
+  first.release();
+  const second=await sleeps.next(retryWait,'the second wait');second.release();
+  const third=await sleeps.next(retryWait,'the third wait');
+  assertBackoff([first.ms,second.ms,third.ms],60_000,'a refused snapshot');
   assert.equal(panel.audits.filter(item=>item===`agent.config_rejected ${agentId} revision 2`).length,3);
   // Meanwhile the heartbeat reports the snapshot it serves, and that the newer one is still refused.
   const reason=record.error;
@@ -178,37 +186,49 @@ test('a snapshot the agent cannot apply is reported; it keeps serving the last o
 });
 
 test('the agent keeps relaying while the panel is unreachable, backs off, and picks up where it left',async t=>{
-  const {panel,agent,agentId,sleeps,logs}=await runningAgent(t);
-  const waits=async(match,count)=>{const seen=[];for(let i=0;i<count;i++){const wait=await sleeps.next(match,`wait ${i+1}`);seen.push(wait.ms);if(i<count-1)wait.release()}return seen};
-  // Heartbeats fail: each wait doubles the last, up to five minutes.
+  const {panel,agent,agentId,sleeps,logs}=await runningAgent(t),anyWait=()=>true;
+  // Heartbeats fail. Only the heartbeat is waiting here: the long poll is parked at the panel.
   panel.unreachable=pathname=>pathname.endsWith('/check-in');
   (await sleeps.next(heartbeatWait,'the heartbeat wait')).release();
-  assert.deepEqual(await waits(otherWait,5),[60_000,120_000,240_000,300_000,300_000]);
+  const heartbeats=await waitsOf(sleeps,anyWait,11);
+  assertBackoff(heartbeats,300_000,'heartbeat');
+  assert.ok(heartbeats[0]<=2_500&&heartbeats.slice(-2).every(ms=>ms>=225_000&&ms<=300_000),`2 seconds first, five minutes at most: ${heartbeats}`);
+  assert.ok(heartbeats.some((ms,i)=>ms!==Math.min(300_000,2_000*2**i)),`no two agents wait exactly alike: ${heartbeats}`);
   assert.ok(logs.includes('[aegis-agent] fetch failed'));
   assert.equal((await get(agent.port,'/movies/System/Info')).status,200,'the relay does not depend on the panel');
   // The panel is back: the next heartbeat goes through and the beat returns to what the panel asks.
   panel.unreachable=()=>false;
-  const heartbeats=panel.count('POST check-in');
-  (await sleeps.next(otherWait,'the last backoff')).release();
-  await until(()=>panel.count('POST check-in')>heartbeats,'a check-in after the outage');
-  await sleeps.next(heartbeatWait,'the regular beat');
+  const before=panel.count('POST check-in');
+  (await sleeps.next(anyWait,'the last backoff')).release();
+  await until(()=>panel.count('POST check-in')>before,'a check-in after the outage');
+  const beatWait=await sleeps.next(anyWait,'the regular beat');
+  assert.equal(beatWait.ms,HEARTBEAT_MS);
+  // The next failure starts over at 2 seconds, not at twice the beat.
+  panel.unreachable=pathname=>pathname.endsWith('/check-in');
+  beatWait.release();
+  assertBackoff(await waitsOf(sleeps,anyWait,1),300_000,'heartbeat after a recovery');
+  panel.unreachable=()=>false;
+  (await sleeps.next(anyWait,'the backoff')).release();
+  const steady=await sleeps.next(heartbeatWait,'the regular beat again'),pollWait=(_ms,entry)=>entry!==steady;
 
-  // The long poll fails: 2, 4, 8 … seconds, up to a minute. A change made meanwhile is not lost.
+  // The long poll fails: the same rule, up to a minute. A change made meanwhile is not lost.
   panel.unreachable=pathname=>pathname.endsWith('/config');
   panel.api.wake([agentId]);
-  (await sleeps.next(ms=>ms<=5_000,'the poll floor')).release();
-  assert.deepEqual(await waits(otherWait,7),[2_000,4_000,8_000,16_000,32_000,60_000,60_000]);
+  (await sleeps.next(pollWait,'the poll floor')).release();
+  const polls=await waitsOf(sleeps,pollWait,8);
+  assertBackoff(polls,60_000,'long poll');
+  assert.ok(polls.slice(-2).every(ms=>ms>=45_000&&ms<=60_000),`a minute at most: ${polls}`);
   panel.deploy(agentId,['movies','shows']);
   assert.equal((await get(agent.port,'/shows/Items')).status,404);
   panel.unreachable=()=>false;
-  (await sleeps.next(otherWait,'the last backoff')).release();
+  (await sleeps.next(pollWait,'the last backoff')).release();
   await until(()=>panel.applied(agentId,2),'the change made during the outage');
   assert.equal((await get(agent.port,'/shows/Items')).status,200);
   // A later failure starts the backoff over.
   panel.unreachable=pathname=>pathname.endsWith('/config');
   panel.api.wake([agentId]);
-  (await sleeps.next(ms=>ms<=5_000,'the poll floor')).release();
-  assert.deepEqual(await waits(otherWait,1),[2_000]);
+  (await sleeps.next(pollWait,'the poll floor')).release();
+  assertBackoff(await waitsOf(sleeps,pollWait,1),60_000,'long poll after a recovery');
 });
 
 test('an agent restarted while the panel is away serves from its cache; a stopped one frees the port',async t=>{
@@ -229,14 +249,14 @@ test('answers that are not signed by the panel the agent enrolled with are not a
   const rewrite=async response=>{const headers=new Headers(response.headers),body=Buffer.from(await response.arrayBuffer());return new Response(response.status===204?null:Buffer.concat([body,Buffer.from(' ')]),{status:response.status,headers})};
   w.panel.tamper=(pathname,response)=>pathname.endsWith('/config')?resign(response):response;
   const {agent,sleeps}=await w.start(dir);
-  (await sleeps.next(ms=>ms===2_000,'the wait after the refused answer')).release();
+  (await sleeps.next(ms=>backoffWait(ms,1,60_000),'the wait after the refused answer')).release();
   w.panel.tamper=(pathname,response)=>pathname.endsWith('/config')?rewrite(response):response;
-  await sleeps.next(ms=>ms===4_000,'the wait after the second refused answer');
+  await sleeps.next(ms=>backoffWait(ms,2,60_000),'the wait after the second refused answer');
   assert.ok(w.logs.includes('[aegis-agent] panel response signature rejected')&&w.logs.includes('[aegis-agent] panel response identity rejected'));
   assert.equal(w.panel.applied(agentId,1),0);
   assert.equal((await get(agent.port,'/movies/System/Info')).status,404,'nothing from those answers is served');
   w.panel.tamper=null;
-  (await sleeps.next(ms=>ms===4_000,'the pending wait')).release();
+  (await sleeps.next(ms=>backoffWait(ms,2,60_000),'the pending wait')).release();
   await until(()=>w.panel.applied(agentId,1),'the genuine snapshot');
   assert.equal((await get(agent.port,'/movies/System/Info')).status,200);
 });
