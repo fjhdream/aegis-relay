@@ -212,7 +212,9 @@ export class AgentApi {
         if(parsed.telemetry!==undefined){const telemetry=sanitizeTelemetry(parsed.telemetry);if(!telemetry)throw Object.assign(new Error('invalid agent telemetry'),{status:400,nonce:requestNonce});agent.telemetry=telemetry;agent.lastTelemetryAt=at;}
         // Heartbeat state is disposable; the panel's periodic flush persists it. Writing the whole
         // encrypted store synchronously on every check-in stalled the event loop serving playback.
-        const snapshot=this.snapshots.desired(agent.id);delete agent.error;
+        // A machine that says it is still refusing its snapshot keeps the reason it gave with the
+        // acknowledgement; agents before 0.13.11 report 'active' here and lose it, as they always did.
+        const snapshot=this.snapshots.desired(agent.id);if(agent.applyState!=='error')delete agent.error;
         // Agents older than 0.10.21 poll config with wait=0, so such a machine only learns about a
         // change on its next heartbeat — and it is already asleep when the change happens. At a flat
         // 30s beat a node de-selected in the panel kept being served for up to half a minute, which reads as
