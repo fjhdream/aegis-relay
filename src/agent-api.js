@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { b64u, randomToken, RateLimiter, requestIp, timingEqual } from './security.js';
 import { ensurePanelSigningIdentity } from './snapshot.js';
 import { DesiredSnapshots } from './desired-snapshots.js';
-import { normalizeAgentDomain, replaceAgentDeployments } from './agent-registry.js';
+import { isCertificateEmail, normalizeAgentDomain, replaceAgentDeployments } from './agent-registry.js';
 import { sealAgentSnapshot } from './agent-config.js';
 import { sanitizeTelemetry } from './telemetry.js';
 import { cleanEntryStatus, desiredEntry, ENTRY_CAPABILITY } from './steering-topology.js';
@@ -17,7 +17,7 @@ const safeName=value=>{
   if(!name||name.length>80||/[\r\n\0]/.test(name))throw new Error('机器名称应为 1–80 个字符');
   return name;
 };
-export const normalizeCertificateEmail=value=>{const email=String(value||'').trim();if(!email||email.length>254||/[\r\n\0]/.test(email)||!/^[^\s@]+@[^\s@]+$/.test(email))throw new Error('请先配置有效的统一证书邮箱');return email;};
+export const normalizeCertificateEmail=value=>{const email=String(value||'').trim();if(!isCertificateEmail(email))throw new Error('请先配置有效的统一证书邮箱（仅限字母、数字和 . _ % + - 组成的常见邮箱地址）');return email;};
 const shellQuote=value=>`'${String(value).replaceAll("'",`'"'"'`)}'`;
 
 function publicHttpsOrigin(value) {

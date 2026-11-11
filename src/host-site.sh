@@ -168,6 +168,10 @@ for name in sys.argv[1:]:
 ' "$@"
 }
 
+# What a request is answered with when no switch came of it (the panel shows these).
+HOST_REQUEST_REFUSED="宿主机没有执行这个请求：请求无法读取或格式不符。请确认面板与这台机器的版本一致。"
+HOST_REQUEST_BROKE_OFF="宿主机脚本中途出错，切换没有完成。请查看这台机器的 systemd 日志后重试。"
+
 # Whether VALUE, all of it, matches PATTERN (an extended regular expression from ^ to $). grep judges
 # a line at a time: a value with a line break in it would pass as soon as one of its lines matched,
 # and the other lines would go wherever the value goes (an Nginx site, an argument to certbot).
@@ -177,6 +181,13 @@ value_matches(){
 '*) return 1 ;; esac
   printf '%s' "$1" | grep -Eq -e "$2"
 }
+
+# Whether VALUE is a certificate email this host will hand to certbot and write into .env: at most 254
+# characters of plain ASCII from the usual set. Nothing in it is syntax to a shell, to Compose (which
+# expands \${…} when it reads .env) or to Nginx. The panel goes by the same rule
+# (isCertificateEmail in src/agent-registry.js).
+#   email_ok VALUE
+email_ok(){ [ "${#1}" -le 254 ] && value_matches "$1" '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$'; }
 
 # Take away whatever is at a request's name, so that the path unit watching it comes to rest. A
 # request is a file; if the container put a directory or a link there, that goes too (a link is
@@ -317,7 +328,7 @@ agent_switch(){
 agent_serve_domain(){
   aegis_domain=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
   value_matches "$aegis_domain" '^[A-Za-z0-9.-]+$' || { echo "域名格式无效" >&2; return 1; }
-  value_matches "${2:-}" '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "邮箱格式无效" >&2; return 1; }
+  email_ok "${2:-}" || { echo "邮箱格式无效" >&2; return 1; }
   agent_switch domain "$aegis_domain" agent_domain_steps "$aegis_domain" "$2"
 }
 

@@ -13,7 +13,7 @@ EMAIL=$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')
 PROXY_DOMAIN=$(printf '%s' "${3:-}" | tr '[:upper:]' '[:lower:]')
 
 valid_domain() { printf '%s' "$1" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$'; }
-valid_email() { printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$'; }
+valid_email() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$'; } # the rule every configure script goes by
 
 TTY_OK=0
 if (exec < /dev/tty > /dev/tty) 2>/dev/null; then TTY_OK=1; fi

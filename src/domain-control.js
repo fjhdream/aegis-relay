@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomToken } from './security.js';
 import { writeAtomic } from './store.js';
-import { normalizeAgentDomain } from './agent-registry.js';
+import { isCertificateEmail, normalizeAgentDomain } from './agent-registry.js';
 import { cleanEntryStatus, entryAttempt } from './steering-topology.js';
 
 // Host changes a containerised process cannot make itself (Nginx, certificates): it drops a request
@@ -50,7 +50,7 @@ export function requestDomainSwitch({dir,domain,email,currentDomain='',nowMs=Dat
   const desiredDomain=normalizeAgentDomain(domain),certificateEmail=String(email||'').trim().toLowerCase();
   if(!/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(desiredDomain))throw new Error('代理域名必须是未携带端口或路径的完整 DNS 域名');
   if(!certificateEmail)throw new Error('请先在部署向导保存统一证书邮箱');
-  if(!/^[^\s@]+@[^\s@]+$/.test(certificateEmail)||certificateEmail.length>254)throw new Error('证书邮箱格式无效');
+  if(!isCertificateEmail(certificateEmail))throw new Error('证书邮箱格式无效');
   const requestId=randomToken(18),requestedAt=new Date(nowMs).toISOString();
   const request={version:1,requestId,mode:'domain',desiredDomain,certificateEmail,requestedAt};
   const status={requestId,state:'pending',mode:'domain',desiredDomain,currentDomain,message:'等待主机申请证书并切换 Nginx',updatedAt:requestedAt};

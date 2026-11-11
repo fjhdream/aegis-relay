@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { isCertificateEmail } from '../src/agent-registry.js';
 import { DOMAIN_REQUEST_FILE, followDomain, readDomainStatus, servingAddress } from '../src/domain-control.js';
 
 // The host scripts, run for real against a stand-in host: a temporary directory holds Nginx's site
@@ -46,7 +47,8 @@ const QUIET_STUBS={
   od:`[ "\${TEST_KNOWN_RANDOM:-0}" = 1 ] && { echo " 01 02 03 04 05 06 07 08"; exit 0; }\nexec ${which('od')} "$@"`,
   // A temporary file in the agent's data directory that its owner swapped for something else the
   // moment it appeared: mktemp hands back the name, and what is there now is not what it made.
-  mktemp:`for a in "$@"; do case "$a" in */data/.host-domain-status.*) [ -n "\${TEST_SWAPPED_TEMP:-}" ] && { echo "$TEST_SWAPPED_TEMP"; exit 0; };; esac; done\nexec ${which('mktemp')} "$@"`
+  // And a log in /tmp that cannot be made (TEST_NO_LOG=1): the step after a request was accepted fails.
+  mktemp:`for a in "$@"; do case "$a" in */data/.host-domain-status.*) [ -n "\${TEST_SWAPPED_TEMP:-}" ] && { echo "$TEST_SWAPPED_TEMP"; exit 0; };; /tmp/aegis-*) [ "\${TEST_NO_LOG:-0}" = 1 ] && { echo "mktemp: cannot create" >&2; exit 1; };; esac; done\nexec ${which('mktemp')} "$@"`
 };
 
 // One set of stand-ins for the whole file (each records its calls in the host it was run for), and
@@ -73,7 +75,7 @@ function host() {
   fs.writeFileSync(path.join(dir('panel'),'.env'),'ADMIN_PATH=secret-admin\n');
   const env={PATH:`${BIN}:${process.env.PATH}`,TMPDIR:dir('tmp'),TEST_CALLS:calls,AEGIS_NGINX_DIR:dir('nginx'),AEGIS_LETSENCRYPT_DIR:dir('letsencrypt'),AEGIS_AGENT_DIR:dir('agent'),AEGIS_PANEL_DIR:dir('panel'),AEGIS_ACME_ROOT:path.join(dir('acme-root'),'acme')};
   const read=file=>{try{return fs.readFileSync(file,'utf8')}catch{return null}};
-  const sh=(args,extra)=>{const result=spawnSync('/bin/sh',args,{encoding:'utf8',timeout:30_000,env:{...env,...extra}});return {...result,output:`${result.stdout}${result.stderr}`}};
+  const sh=(args,extra,cwd)=>{const result=spawnSync('/bin/sh',args,{encoding:'utf8',timeout:30_000,env:{...env,...extra},...(cwd?{cwd}:{})});return {...result,output:`${result.stdout}${result.stderr}`}};
   const dotenv=install=>Object.fromEntries((read(path.join(dir(install),'.env'))||'').split('\n').filter(Boolean).map(line=>[line.slice(0,line.indexOf('=')),line.slice(line.indexOf('=')+1)]));
   // The agent container reads .env once, when it is created. Nothing here recreates it unless a test says so.
   const installedWith=()=>{const values=dotenv('agent');return {mode:values.AGENT_PROXY_MODE||'',domain:values.AGENT_DOMAIN||'',ip:values.AGENT_PROXY_IP||''}};
@@ -81,7 +83,7 @@ function host() {
   return {
     root,dir,
     // Run a script as the machine would: an agent's from its install directory, the panel's from scripts/.
-    run:(script,args=[],extra={})=>sh([path.join(dir(INSTALLED_ON_AGENT.includes(script)?'agent':'panel/scripts'),script),...args],extra),
+    run:(script,args=[],extra={},cwd)=>sh([path.join(dir(INSTALLED_ON_AGENT.includes(script)?'agent':'panel/scripts'),script),...args],extra,cwd),
     site:name=>read(path.join(dir('nginx'),'sites-available',`${name}.conf`)),
     enabled:name=>fs.existsSync(path.join(dir('nginx'),'sites-enabled',`${name}.conf`)),
     // What an upgrade does once the new agent is up, in the form agent-upgrade.sh calls it: on the left
@@ -362,8 +364,11 @@ test('a request from the panel is checked before it reaches Nginx, and answered 
     ['a domain that is not a string',{...good,desiredDomain:['hk.example.com']}],['not JSON','{']]){
     h.request(request);
     assert.equal(h.run('agent-host-domain-apply.sh').status,1,what);
-    assert.deepEqual([h.requested(),quiet(),h.status()],[false,calls,before],what);
+    // Nothing was done, and the agent is told so: it reports the address it had, and asks again later.
+    assert.deepEqual([h.requested(),quiet(),turnedAway(h.status()),h.status().currentDomain,h.reported()],[false,calls,true,before.currentDomain,{mode:'ip',domain:'203.0.113.9'}],what);
   }
+  assert.equal(followDomain({dir:h.dir('agent/data'),desired:{mode:'',domain:'hk.example.com',email:'ops@example.com'},installed:h.containerEnv()}),true,'a request that was turned away is filed again');
+  fs.rmSync(path.join(h.dir('agent/data'),DOMAIN_REQUEST_FILE));
   // A switch that fails is reported with the reason, under the request's id, and the request is gone.
   h.request(good);
   const failed=h.run('agent-host-domain-apply.sh',[],{TEST_CERTBOT_FAILS:'1',TEST_CERTBOT_SAYS:'Challenge failed for "hk.example.com":\tDNS problem\\NXDOMAIN'});
@@ -380,12 +385,18 @@ test('a request from the panel is checked before it reaches Nginx, and answered 
   assert.equal(broken.run('agent-host-domain-apply.sh').status,1);
   assert.deepEqual([broken.requested(),broken.status().requestId,broken.status().state,broken.status().message],[false,'request-0004','failed','未找到 Agent 安装']);
   // And one that has lost the library: the request must at least not sit there re-triggering the unit.
-  const damaged=agentOnItsIp();fs.rmSync(path.join(damaged.dir('agent/src'),'host-site.sh'));
-  damaged.request(good);
+  // The status is left alone, since it is also the agent's record of the address it serves.
+  const damaged=agentOnItsIp(),wanted={dir:damaged.dir('agent/data'),desired:{mode:'',domain:'hk.example.com',email:'ops@example.com'},installed:damaged.containerEnv()};
+  assert.equal(followDomain(wanted),true);
+  const waiting=damaged.status(),library=path.join(damaged.dir('agent/src'),'host-site.sh'),kept=fs.readFileSync(library);
+  fs.rmSync(library);
   const helpless=damaged.run('agent-host-domain-apply.sh');
-  assert.deepEqual([helpless.status,damaged.requested(),damaged.status(),/sudo aegis-relay-agent update/.test(helpless.output)],[1,false,null,true]);
-  // With no answer on record the agent asks again on its next heartbeat, instead of waiting for ever.
-  assert.equal(followDomain({dir:damaged.dir('agent/data'),desired:{mode:'',domain:'hk.example.com',email:'ops@example.com'},installed:{mode:'ip',domain:'',ip:'203.0.113.9'}}),true);
+  assert.deepEqual([helpless.status,damaged.requested(),damaged.status(),damaged.reported(),/sudo aegis-relay-agent update/.test(helpless.output)],[1,false,waiting,{mode:'ip',domain:'203.0.113.9'},true]);
+  assert.equal(followDomain(wanted),false,'the agent waits for the host to be repaired');
+  // The update the message asks for brings the library back and records what is served: the agent asks again.
+  fs.writeFileSync(library,kept);
+  assert.equal(damaged.upgrade().status,0);
+  assert.deepEqual([damaged.status().state,followDomain(wanted)],['active',true]);
 });
 
 test('a switch that fails leaves the agent serving on the address it had',t=>{
@@ -610,11 +621,14 @@ test('the status file is written without following anything the agent container 
 
 test('a value is written into .env as it is, and a write that fails leaves .env as it was',()=>{
   const h=agentOnItsIp(),envFile=path.join(h.dir('agent'),'.env');
-  // An email with backslash sequences passes the checks (it has no space in it). Given to awk the usual
-  // way, \012 would become a line break and the rest a second line of .env.
-  const email='ops@example.com\\012PANEL_URL=https://elsewhere.example';
-  assert.equal(h.run('agent-configure-domain.sh',['hk.example.com',email]).status,0);
-  assert.deepEqual([h.env('agent').AGENT_EMAIL,h.env('agent').PANEL_URL,fs.readFileSync(envFile,'utf8').split('\n').filter(line=>line.startsWith('PANEL_URL=')).length],[email,'https://panel.example.com',1]);
+  // A value with backslash sequences: given to awk the usual way, \012 would become a line break and
+  // the rest a second line of .env. (An email like that no longer gets as far as .env; whatever does
+  // get there is written as it is.)
+  const value='ops@example.com\\012PANEL_URL=https://elsewhere.example';
+  assert.deepEqual([h.run('agent-configure-domain.sh',['hk.example.com',value]).status,h.env('agent').AGENT_EMAIL],[1,''],'refused as an email');
+  assert.equal(spawnSync('/bin/sh',['-c','. "$1"; set_env "$2" AGENT_EMAIL "$3"','sh',LIBRARY,envFile,value],{env:{PATH:`${BIN}:${process.env.PATH}`}}).status,0);
+  assert.deepEqual([h.env('agent').AGENT_EMAIL,h.env('agent').PANEL_URL,fs.readFileSync(envFile,'utf8').split('\n').filter(line=>line.startsWith('PANEL_URL=')).length],[value,'https://panel.example.com',1]);
+  assert.equal(h.run('agent-configure-domain.sh',['hk.example.com','ops@example.com']).status,0);
   // A full disk: the new .env cannot be written. .env is not replaced by an empty file, the site Nginx
   // had is back, and the switch is reported as failed, by every way of asking.
   const before=fs.readFileSync(envFile,'utf8'),site=h.site('aegis-relay-agent'),full={TEST_DISK_FULL:'1'};
@@ -641,16 +655,20 @@ test('a value is written into .env as it is, and a write that fails leaves .env 
 const APPLIERS={
   'agent-host-domain-apply.sh':{data:'agent/data',request:'host-domain-request.json',status:'host-domain-status.json',
     good:{version:1,requestId:'request-0101',mode:'domain',desiredDomain:'hk.example.com',certificateEmail:'ops@example.com'},
-    prepare:()=>agentOnItsIp(),run:(h,extra)=>h.run('agent-host-domain-apply.sh',[],extra),acted:h=>/server_name hk\.example\.com;/.test(h.site('aegis-relay-agent'))},
+    prepare:()=>agentOnItsIp(),run:(h,extra,cwd)=>h.run('agent-host-domain-apply.sh',[],extra,cwd),acted:h=>/server_name hk\.example\.com;/.test(h.site('aegis-relay-agent'))},
   'host-domain-apply.sh':{data:'panel/data',request:'host-domain-request.json',status:'host-domain-status.json',
     good:{requestId:'request-0102',desiredDomain:'emby.example.com',certificateEmail:'ops@example.com'},
     prepare:()=>{const h=host();assert.equal(h.run('configure-domain.sh',['panel.example.com','ops@example.com']).status,0);return h},
-    run:(h,extra)=>h.run('host-domain-apply.sh',[],extra),acted:h=>h.env('panel').LOCAL_PROXY_BASE_URL==='https://emby.example.com'},
+    run:(h,extra,cwd)=>h.run('host-domain-apply.sh',[],extra,cwd),acted:h=>h.env('panel').LOCAL_PROXY_BASE_URL==='https://emby.example.com'},
   'host-entry-apply.sh':{data:'agent/data',request:'host-entry-request.json',status:'host-entry-status.json',
     good:{version:1,requestId:'request-0103',entryDomain:'entry.example.com',certificateEmail:'ops@example.com',peers:['peer-a.example.com'],attempt:1},
-    prepare:()=>agentOnItsIp(),run:(h,extra)=>h.run('host-entry-apply.sh',[h.dir('agent')],extra),acted:h=>h.enabled('aegis-relay-entry')}
+    prepare:()=>agentOnItsIp(),run:(h,extra,cwd)=>h.run('host-entry-apply.sh',[h.dir('agent')],extra,cwd),acted:h=>h.enabled('aegis-relay-entry')}
 };
 const readJson=file=>{try{return JSON.parse(fs.readFileSync(file,'utf8'))}catch{return null}};
+// The answer to a request that was turned away, and to one that was accepted but not seen through.
+const REFUSED='宿主机没有执行这个请求：请求无法读取或格式不符。请确认面板与这台机器的版本一致。',BROKE_OFF='宿主机脚本中途出错，切换没有完成。请查看这台机器的 systemd 日志后重试。';
+// A status that says so: failed, naming no request and nothing asked for.
+const turnedAway=status=>status&&[status.requestId,status.state,status.desiredDomain??status.entryDomain,status.message].join('|')===`|failed||${REFUSED}`;
 // The logs two of the scripts keep in /tmp while they work.
 const hostLogs=()=>fs.readdirSync('/tmp').filter(name=>/^aegis-(entry-)?domain\./.test(name)).sort();
 
@@ -682,13 +700,13 @@ test('a request is acted on only if it is a small regular file; anything else at
       'the request in UTF-16':(h,file)=>fs.writeFileSync(file,Buffer.from(`\ufeff${text}`,'utf16le'))
     };
     for(const [what,plant] of Object.entries(planted)){
-      const h=applier.prepare(),file=at(h),status=readJson(statusOf(h)),calls=h.calls().length,started=Date.now();
+      const h=applier.prepare(),file=at(h),calls=h.calls().length,started=Date.now();
       plant(h,file);
       const result=applier.run(h);
       assert.deepEqual([result.status,result.error?.code],[1,undefined],`${script}, ${what}: ${result.output}`);
       assert.ok(Date.now()-started<10_000,`${script}, ${what}: took ${Date.now()-started}ms`);
       assert.throws(()=>fs.lstatSync(file),/ENOENT/,`${script}, ${what}: nothing is left for the path unit to start on again`);
-      assert.deepEqual([applier.acted(h),readJson(statusOf(h)),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call))],[false,status,[]],`${script}, ${what}: nothing was done`);
+      assert.deepEqual([applier.acted(h),turnedAway(readJson(statusOf(h))),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call))],[false,true,[]],`${script}, ${what}: nothing was done, and the request is answered so`);
       if(what.startsWith('a link to a file'))assert.equal(fs.readFileSync(path.join(h.root,'elsewhere.json'),'utf8'),text,'the file behind the link is left alone');
     }
     // No request at all: nothing to do.
@@ -757,13 +775,13 @@ test('a request with a line break in a field is never acted on: one line passing
     // Each field followed by the value of the next: unnoticed, it would stand in for that field.
     for(let i=0;i+1<texts.length;i++)requests.push([`${texts[i]} carrying the next field's value`,{...good,[texts[i]]:`${good[texts[i]]}\n${good[texts[i+1]]}`}]);
     if(good.peers)requests.push(['a peer ending in a line break',{...good,peers:[`${good.peers[0]}\n`]}],['a peer, then more lines',{...good,peers:[`${good.peers[0]}\n${SMUGGLED}`]}],['a peer after other lines',{...good,peers:[`${SMUGGLED}\n${good.peers[0]}`]}]);
-    const h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request),status=readJson(path.join(h.dir(applier.data),applier.status)),sites=sitesOf(h);
+    const h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request),sites=sitesOf(h);
     for(const [what,request] of requests){
       const calls=h.calls().length;
       fs.writeFileSync(file,JSON.stringify(request));
       const result=applier.run(h);
       assert.deepEqual([result.status,fs.existsSync(file)],[1,false],`${script}, ${what}: ${result.output}`);
-      assert.deepEqual([applier.acted(h),readJson(path.join(h.dir(applier.data),applier.status)),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call)),sitesOf(h)===sites],[false,status,[],true],`${script}, ${what}: nothing was done`);
+      assert.deepEqual([applier.acted(h),turnedAway(readJson(path.join(h.dir(applier.data),applier.status))),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call)),sitesOf(h)===sites],[false,true,[],true],`${script}, ${what}: nothing was done`);
     }
     // The same host still does what a well-formed request asks.
     fs.writeFileSync(file,JSON.stringify(good));
@@ -811,6 +829,59 @@ test('the entry request says how many times it was tried in a whole number, and 
   assert.deepEqual([applier.run(h).status,readJson(path.join(h.dir(applier.data),applier.status)).attempt],[0,1],'a request that does not say is a first attempt');
 });
 
+test('a certificate email is plain ASCII from the usual set, for every script and for the panel alike',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  // It goes to certbot and into .env, which Compose reads: `${` there is the start of a variable. The
+  // old rule let through anything without a space or a second @.
+  const fine=['ops@example.com','first.last+relay_1%x-y@sub.example-domain.com','A@B.CO'];
+  const odd=['ops${x@example.com','ops$HOME@example.com','ops@ex\u0001ample.com','ops@example.com x','用户@example.com','ops@例子.com','a\'b@example.com','"a"@example.com','a`b@example.com','a;b@example.com','a b@example.com','a@b@example.com','@example.com','ops@','ops',`${'a'.repeat(243)}@example.com`,''];
+  // The hosts and the panel go by one rule.
+  for(const email of [...fine,...odd,`${'a'.repeat(242)}@example.com`]){
+    const shell=spawnSync('/bin/sh',['-c','. "$1"; email_ok "$2"','sh',LIBRARY,email],{env:{PATH:process.env.PATH}}).status===0;
+    assert.deepEqual([shell,isCertificateEmail(email)],[fine.includes(email)||email.length===254,fine.includes(email)||email.length===254],JSON.stringify(email));
+  }
+  for(const [script,applier] of Object.entries(APPLIERS)){
+    const h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request);
+    for(const email of odd){
+      const calls=h.calls().length;
+      fs.writeFileSync(file,JSON.stringify({...applier.good,certificateEmail:email}));
+      // Even where python has been told to skip its assertions.
+      const result=applier.run(h,{PYTHONOPTIMIZE:'1'});
+      // Turned away where the request is checked: not accepted and then tripped over by a later step.
+      assert.deepEqual([result.status,result.output,fs.existsSync(file),applier.acted(h),turnedAway(readJson(path.join(h.dir(applier.data),applier.status))),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call))],[1,'',false,false,true,[]],`${script}, ${JSON.stringify(email)}: ${result.output}`);
+    }
+    fs.writeFileSync(file,JSON.stringify({...applier.good,certificateEmail:'First.Last+relay_1%x-y@Sub.Example-Domain.com'}));
+    assert.deepEqual([applier.run(h).status,applier.acted(h)],[0,true],script);
+    assert.ok(h.calls().some(call=>call.startsWith('certbot ')&&call.includes('first.last+relay_1%x-y@sub.example-domain.com')),`${script}: certbot was given the address, in lower case`);
+  }
+  // And on a command line.
+  const agent=agentOnItsIp(),refused=agent.run('agent-configure-domain.sh',['hk.example.com','ops${x@example.com']);
+  assert.deepEqual([refused.status,/邮箱格式无效/.test(refused.output),agent.env('agent').AGENT_EMAIL],[1,true,'']);
+});
+
+test('a request that was accepted but not seen through is answered failed, under its own name',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  // The two scripts that report for themselves: the step after the request was accepted cannot be taken
+  // (no log can be made). Left as it was, the status would say "applying" for ever.
+  for(const [script,asked] of [['host-domain-apply.sh','desiredDomain'],['host-entry-apply.sh','entryDomain']]){
+    const applier=APPLIERS[script],h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request),calls=h.calls().length;
+    fs.writeFileSync(file,JSON.stringify(applier.good));
+    const result=applier.run(h,{TEST_NO_LOG:'1'}),status=readJson(path.join(h.dir(applier.data),applier.status));
+    assert.deepEqual([result.status,fs.existsSync(file),applier.acted(h),h.since(calls).filter(call=>/^(nginx|certbot|systemctl) /.test(call)),status.requestId,status.state,status[asked],status.message],
+      [1,false,false,[],applier.good.requestId,'failed',applier.good[asked],BROKE_OFF],`${script}: ${result.output}`);
+  }
+});
+
+test('an apply script started from the container\'s directory loads nothing the container left there',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  // python looks for modules in the current directory first. Under systemd that is /, but a person
+  // may run the script by hand from inside data/.
+  for(const [script,applier] of Object.entries(APPLIERS)){
+    const h=applier.prepare(),data=h.dir(applier.data),marker=path.join(h.root,'loaded');
+    for(const name of ['json','stat','re','tempfile','datetime'])fs.writeFileSync(path.join(data,`${name}.py`),`open(${JSON.stringify(marker)}, 'a').write('${name}\\n')\nraise ImportError('planted')\n`);
+    fs.writeFileSync(path.join(data,applier.request),JSON.stringify(applier.good));
+    const result=applier.run(h,{},data);
+    assert.deepEqual([fs.existsSync(marker),result.status,applier.acted(h)],[false,0,true],`${script}: ${result.output}`);
+  }
+});
+
 // GNU mv can be told to rename and nothing else (host_rename); another mv moves a file into a
 // directory of that name, so there the agent's status would be written inside it.
 const GNU_MV=spawnSync('mv',['--version']).status===0;
@@ -829,20 +900,21 @@ test('a request is gone when its script ends, even where the answer cannot be wr
   }
 });
 
-test('an apply script that has lost the library takes the request and its unanswered status away, whatever they are',()=>{
+test('an apply script that has lost the library takes the request away, whatever it is, and a status nobody will answer',()=>{
   // Each script can only reach the data directory by its own location, or (the entry script, which is
   // told its install directory) one of the two real ones: so in this temporary host the entry script
   // leaves the files, and what matters there is that it stops at once and says why.
-  for(const [script,prepare,src,data,name,run,takesAway] of [
-    ['agent-host-domain-apply.sh',agentOnItsIp,'agent/src','agent/data','host-domain',h=>h.run('agent-host-domain-apply.sh'),true],
-    ['host-domain-apply.sh',host,'panel/src','panel/data','host-domain',h=>h.run('host-domain-apply.sh'),true],
-    ['host-entry-apply.sh',agentOnItsIp,'agent/src','agent/data','host-entry',h=>h.run('host-entry-apply.sh',[h.dir('agent')]),false]
+  // An agent's domain status stays in any case: it is also the record of the address the agent serves.
+  for(const [script,prepare,src,data,name,run,left] of [
+    ['agent-host-domain-apply.sh',agentOnItsIp,'agent/src','agent/data','host-domain',h=>h.run('agent-host-domain-apply.sh'),[false,true]],
+    ['host-domain-apply.sh',host,'panel/src','panel/data','host-domain',h=>h.run('host-domain-apply.sh'),[false,false]],
+    ['host-entry-apply.sh',agentOnItsIp,'agent/src','agent/data','host-entry',h=>h.run('host-entry-apply.sh',[h.dir('agent')]),[true,true]]
   ])for(const what of ['files','directories']){
     const h=prepare(),request=path.join(h.dir(data),`${name}-request.json`),status=path.join(h.dir(data),`${name}-status.json`);
     fs.rmSync(path.join(h.dir(src),'host-site.sh'));fs.rmSync(status,{force:true});
     for(const file of [request,status]){if(what==='files')fs.writeFileSync(file,'{"state":"pending"}');else{fs.mkdirSync(file);fs.writeFileSync(path.join(file,'inside'),'{}')}}
     const calls=h.calls().length,result=run(h);
-    assert.deepEqual([result.status,/host-site\.sh is missing/.test(result.output),h.since(calls),fs.existsSync(request),fs.existsSync(status)],[1,true,[],!takesAway,!takesAway],`${script}, ${what}: ${result.output}`);
+    assert.deepEqual([result.status,/host-site\.sh is missing/.test(result.output),h.since(calls),[fs.existsSync(request),fs.existsSync(status)]],[1,true,[],left],`${script}, ${what}: ${result.output}`);
   }
 });
 

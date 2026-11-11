@@ -8,7 +8,7 @@ PROXY_DOMAIN=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
 value_matches "$PROXY_DOMAIN" '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' || { echo "代理域名格式无效" >&2; exit 1; }
-value_matches "$EMAIL" '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证书邮箱格式无效" >&2; exit 1; }
+email_ok "$EMAIL" || { echo "证书邮箱格式无效" >&2; exit 1; }
 [ -f "$INSTALL_DIR/.env" ] || { echo "未找到 AegisRelay 安装" >&2; exit 1; }
 PUBLIC_BASE_URL=$(sed -n 's/^PUBLIC_BASE_URL=//p' "$INSTALL_DIR/.env" | head -n1)
 PANEL_DOMAIN=$(printf '%s' "$PUBLIC_BASE_URL" | sed -n 's#^https://\([^/:]*\)/\{0,1\}$#\1#p' | tr '[:upper:]' '[:lower:]')
