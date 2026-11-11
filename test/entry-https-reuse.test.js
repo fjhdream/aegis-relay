@@ -30,7 +30,7 @@ script=$1; shift
 . "$script"
 `;
   try{
-    const result=spawnSync('/bin/sh',['-c',shell,'entry-test',new URL('../scripts/configure-entry-domain.sh',import.meta.url).pathname,'entry.example.com','ops@example.com','peer.example.com'],{encoding:'utf8',env:{...process.env,...extra,TEST_CALLS:log}});
+    const result=spawnSync('/bin/sh',['-c',shell,'entry-test',new URL('../scripts/configure-entry-domain.sh',import.meta.url).pathname,'entry.example.com','ops@example.com','peer.example.com'],{encoding:'utf8',env:{...process.env,...extra,TEST_CALLS:log,AEGIS_HOST_SITE_LIB:new URL('../scripts/host-site.sh',import.meta.url).pathname}});
     return {...result,calls:fs.existsSync(log)?fs.readFileSync(log,'utf8'):''};
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 }

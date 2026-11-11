@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 umask 077
-INSTALL_DIR=/opt/aegis-relay-agent
+. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
+INSTALL_DIR=$AEGIS_AGENT_DIR
 DOMAIN=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$2
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
@@ -11,13 +12,10 @@ printf '%s' "$EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "邮
 # 真正缺包时下面的 apt-get install 仍会明确报错。
 apt-get update || echo "警告：apt 源索引更新失败（常见于机器上某个第三方软件源失效），将沿用现有索引继续。" >&2
 DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot python3-certbot-nginx
-SITE=/etc/nginx/sites-available/aegis-relay-agent.conf
-cat > "$SITE" <<EOF
-map \$http_upgrade \$aegis_agent_connection_upgrade { default upgrade; '' ''; }
-upstream aegis_agent_backend {
-    server 127.0.0.1:8080;
-    keepalive 64;
-}
+SITE=$AEGIS_NGINX_DIR/sites-available/aegis-relay-agent.conf
+{
+  data_plane_upstream aegis_agent_backend aegis_agent_connection_upgrade
+  cat <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -25,41 +23,16 @@ server {
     access_log off;
     client_max_body_size 0;
     if (\$host != $DOMAIN) { return 421; }
-    location / {
-        proxy_pass http://aegis_agent_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$aegis_agent_connection_upgrade;
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-        proxy_max_temp_file_size 0;
-        # With buffering disabled this is the maximum read size per event. The platform default is
-        # only one memory page (4K/8K), which creates needless syscall churn on fast media streams.
-        proxy_buffer_size 256k;
-        proxy_buffers 4 256k;
-        proxy_busy_buffers_size 512k;
-        proxy_ignore_headers X-Accel-Buffering X-Accel-Limit-Rate;
-        proxy_socket_keepalive on;
-        proxy_limit_rate 0;
-        limit_rate 0;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        send_timeout 3600s;
-    }
-}
 EOF
-ln -sfn "$SITE" /etc/nginx/sites-enabled/aegis-relay-agent.conf
+  data_plane_location aegis_agent_backend aegis_agent_connection_upgrade
+  echo "}"
+} > "$SITE"
+ln -sfn "$SITE" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-agent.conf"
 nginx -t
 systemctl enable --now nginx
 systemctl reload nginx
 certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"
 systemctl enable --now certbot.timer 2>/dev/null || true
-set_env(){ KEY=$1 VALUE=$2 FILE="$INSTALL_DIR/.env" TMP="$INSTALL_DIR/.env.tmp"; awk -v key="$KEY" -v value="$VALUE" 'BEGIN{done=0} $0 ~ "^"key"=" {print key"="value;done=1;next} {print} END{if(!done)print key"="value}' "$FILE" > "$TMP"; chmod 600 "$TMP"; mv "$TMP" "$FILE"; }
-set_env AGENT_DOMAIN "$DOMAIN"
-set_env AGENT_EMAIL "$EMAIL"
+set_env "$INSTALL_DIR/.env" AGENT_DOMAIN "$DOMAIN"
+set_env "$INSTALL_DIR/.env" AGENT_EMAIL "$EMAIL"
 echo "Agent HTTPS 已就绪: https://$DOMAIN/"

@@ -12,6 +12,7 @@
 # certificate; no DNS API token is needed and no private key ever leaves a machine.
 set -eu
 umask 022
+. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
 usage(){ echo "用法: configure-entry-domain.sh 入口域名 证书邮箱 [其他机器的直连域名 ...]" >&2; }
 [ "$#" -ge 2 ] || { usage; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
@@ -25,8 +26,8 @@ printf '%s' "$EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证
 # This machine's own (direct) domain must differ from the entry domain: a steering redirect targets the
 # direct domain precisely because it always reaches this one machine.
 OWN=""
-[ -f /opt/aegis-relay-agent/.env ] && OWN="$OWN $(sed -n 's/^AGENT_DOMAIN=//p' /opt/aegis-relay-agent/.env | head -n1)"
-[ -f /opt/aegis-relay/.env ] && OWN="$OWN $(sed -n 's#^\(LOCAL_PROXY_BASE_URL\|PUBLIC_BASE_URL\)=https://\([^/:]*\).*#\2#p' /opt/aegis-relay/.env | tr '\n' ' ')"
+[ -f "$AEGIS_AGENT_DIR/.env" ] && OWN="$OWN $(sed -n 's/^AGENT_DOMAIN=//p' "$AEGIS_AGENT_DIR/.env" | head -n1)"
+[ -f "$AEGIS_PANEL_DIR/.env" ] && OWN="$OWN $(sed -nE 's#^(LOCAL_PROXY_BASE_URL|PUBLIC_BASE_URL)=https://([^/:]*).*#\2#p' "$AEGIS_PANEL_DIR/.env" | tr '\n' ' ')"
 for own in $OWN; do
   if [ "$(printf '%s' "$own" | tr '[:upper:]' '[:lower:]')" = "$ENTRY" ]; then
     echo "入口域名 $ENTRY 目前就是这台机器的直连域名。请先在面板「代理机器」里给这台机器换一个只解析到它自己的域名，再执行本命令。" >&2
@@ -65,24 +66,18 @@ if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; t
   DEBIAN_FRONTEND=noninteractive apt-get install -y nginx certbot
 fi
 
-ACME_ROOT=/var/lib/aegis-relay/acme
+ACME_ROOT=${AEGIS_ACME_ROOT:-/var/lib/aegis-relay/acme}
 mkdir -p "$ACME_ROOT/.well-known/acme-challenge"
-chmod 755 /var/lib/aegis-relay "$ACME_ROOT" "$ACME_ROOT/.well-known" "$ACME_ROOT/.well-known/acme-challenge"
-SITE=/etc/nginx/sites-available/aegis-relay-entry.conf
-ENABLED=/etc/nginx/sites-enabled/aegis-relay-entry.conf
-CERT="/etc/letsencrypt/live/$ENTRY/fullchain.pem"
-KEY="/etc/letsencrypt/live/$ENTRY/privkey.pem"
+chmod 755 "$(dirname "$ACME_ROOT")" "$ACME_ROOT" "$ACME_ROOT/.well-known" "$ACME_ROOT/.well-known/acme-challenge"
+SITE=$AEGIS_NGINX_DIR/sites-available/aegis-relay-entry.conf
+ENABLED=$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-entry.conf
+CERT="$AEGIS_LETSENCRYPT_DIR/live/$ENTRY/fullchain.pem"
+KEY="$AEGIS_LETSENCRYPT_DIR/live/$ENTRY/privkey.pem"
 
 write_site(){
   TLS=$1
   {
-    cat <<EOF
-map \$http_upgrade \$aegis_entry_connection_upgrade { default upgrade; '' ''; }
-upstream aegis_entry_backend {
-    server 127.0.0.1:8080;
-    keepalive 64;
-}
-EOF
+    data_plane_upstream aegis_entry_backend aegis_entry_connection_upgrade
     if [ -n "$PEERS" ]; then
       echo "upstream aegis_acme_peers {"
       for peer in $PEERS; do echo "    server $peer:80;"; done
@@ -131,35 +126,10 @@ server {
     ssl_certificate $CERT;
     ssl_certificate_key $KEY;
 EOF
-    [ -f /etc/letsencrypt/options-ssl-nginx.conf ] && echo "    include /etc/letsencrypt/options-ssl-nginx.conf;"
-    cat <<EOF
-    if (\$host != $ENTRY) { return 421; }
-    location / {
-        proxy_pass http://aegis_entry_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$aegis_entry_connection_upgrade;
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-        proxy_max_temp_file_size 0;
-        proxy_buffer_size 256k;
-        proxy_buffers 4 256k;
-        proxy_busy_buffers_size 512k;
-        proxy_ignore_headers X-Accel-Buffering X-Accel-Limit-Rate;
-        proxy_socket_keepalive on;
-        proxy_limit_rate 0;
-        limit_rate 0;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        send_timeout 3600s;
-    }
-}
-EOF
+    [ -f "$AEGIS_LETSENCRYPT_DIR/options-ssl-nginx.conf" ] && echo "    include $AEGIS_LETSENCRYPT_DIR/options-ssl-nginx.conf;"
+    echo "    if (\$host != $ENTRY) { return 421; }"
+    data_plane_location aegis_entry_backend aegis_entry_connection_upgrade
+    echo "}"
   } > "$SITE"
 }
 
