@@ -356,3 +356,81 @@ export function accessView(d,routes){
     return `<details class="panel access-node ${n.suspicious?'suspicious':''}"><summary class="access-node-head"><span class="access-node-name">${escapeHtml(n.name)} <small class="muted">/${escapeHtml(n.alias)}/</small></span><span class="node-status ${n.suspicious?'bad':'ok'}">${n.suspicious?'⚠ 疑似多人共享':'✓ 安全'}</span><span class="pill off">通道 ${(n.channels||[]).length}</span><span class="pill off">设备合计 ${n.distinctDevices}</span></summary><div class="access-node-body">${channels||'<p class="muted">暂无访问记录。</p>'}</div></details>`;
   }).join('')}};
 }
+
+// ---------------------------------------------------------------------------------------------------
+// The panel's answers, signing in, and the smaller pages.
+
+// What an answer from the panel's API comes to: its data, or what went wrong (`error`). `signedOut`
+// says the session is over: any 401 except the one a wrong password gets at /login.
+export function readResponse({status,ok,type,body,path}){
+  let data={};
+  if(String(type||'').includes('application/json')){try{data=body?JSON.parse(body):{}}catch{return {error:'管理接口返回了损坏的数据，请刷新页面后重试'}}}
+  else if(status===401&&path!=='/login')return {error:'登录已失效，请重新登录',signedOut:true};
+  else if([502,503,504].includes(status))return {error:`管理服务连接中断（HTTP ${status}），容器可能正在重启，请稍后重试并检查服务日志`};
+  else return {error:ok?`管理接口返回了网页而不是数据（HTTP ${status}），请刷新页面后重试`:`请求未到达管理接口（HTTP ${status}），请检查 Nginx/CDN 是否允许 /api/ 路径`};
+  if(status===401&&path!=='/login')return {error:'登录已失效，请重新登录',signedOut:true};
+  if(!ok)return {error:data.error||'请求失败'};
+  return {data};
+}
+// The live feed arrives in pieces: the data of each whole event in what has been read so far, and the
+// unfinished rest to keep for the next piece.
+export function feedEvents(buffer){
+  const chunks=buffer.split('\n\n'),rest=chunks.pop(),events=[];
+  for(const chunk of chunks){const line=chunk.split('\n').find(x=>x.startsWith('data: '));if(line)events.push(line.slice(6))}
+  return {events,rest};
+}
+
+// What signing in sends: the password and one second factor, never both. With two-step verification
+// on, a saved recovery code stands in for the authenticator's code when its field is the one showing.
+export const loginRequest=({password,code,recovery,usingRecovery})=>usingRecovery?{password,recovery:String(recovery).trim()}:{password,code};
+// Swapping between the two: the field put away is emptied, and the one now showing is to be focused.
+export function secondFactorView(toRecovery){
+  return {focus:toRecovery?'#recovery':'#code',changes:{'#code-field':{hidden:toRecovery},'#recovery-field':{hidden:!toRecovery},[toRecovery?'#code':'#recovery']:{value:''},'#recovery-toggle':{text:toRecovery?'改用动态验证码':'丢失验证器？使用恢复码'}}};
+}
+
+// Something to copy, shown once in the dialog: a node's address by default.
+export function secretView(content,{eyebrow='连接信息',title='节点连接信息',description='完整节点地址和连接密码可由管理员随时再次查看。'}={}){
+  return {'#modal-eyebrow':{text:eyebrow},'#modal-title':{text:title},'#modal-description':{text:description},'#secret':{text:content},'#modal':{hidden:false}};
+}
+export const iconStateView=custom=>({'#icon-state':{text:custom?'自定义':'默认',className:`pill ${custom?'on':''}`}});
+
+// Diagnostics: the nodes to choose from, each upstream's standing, and a probe's report.
+export const diagnosticOptions=routes=>routes.map(r=>`<option value="${r.id}">${escapeHtml(r.name)}</option>`).join('');
+export const runtimeView=d=>({'#diag-runtime':{html:d.nodes.flatMap(n=>n.upstreams.map((u,i)=>`<span class="pill ${u.circuitOpen||u.lastError?'warn':'on'}">${escapeHtml(n.alias)} · 线路 ${i+1} · ${u.circuitOpen?'熔断':u.lastError?escapeHtml(u.lastError):'就绪'}</span>`)).join('')}});
+export const DIAGNOSTIC_RUNNING={'#diagnostic-result':{html:'<article class="panel empty-state"><h3>正在探测回源…</h3></article>'}};
+export function diagnosticView(d){
+  const section=(title,list)=>`<article class="panel diag-card"><span class="eyebrow">${title}</span><h3>${escapeHtml(d.node.name)}</h3>${(list||[]).map(x=>{const lat=Number(x.latencyMs),lcls=!x.online?'bad':lat<300?'good':lat<800?'warn':'bad';return`<div class="diag-line"><span>连接状态</span><b class="${x.online?'good':'bad'}">${x.online?'在线':'失败'}</b></div><div class="diag-line"><span>HTTP 状态</span><b>${x.status||'—'}</b></div><div class="diag-line"><span>响应延迟</span><b class="${lcls}">${isFinite(lat)?lat+' ms':x.latencyMs}</b></div><div class="diag-line"><span>Emby 版本</span><b>${escapeHtml(x.embyVersion||'—')}</b></div>${x.tls?`<div class="diag-line"><span>TLS</span><b class="${x.tls.authorized?'good':'warn'}">${x.tls.authorized?'有效':'未验证'}</b></div><div class="diag-line"><span>证书到期</span><b>${escapeHtml(x.tls.validTo||'—')}</b></div>`:''}${x.error?`<div class="diag-line"><span>错误</span><b class="bad">${escapeHtml(x.error)}</b></div>`:''}`}).join('')}</article>`;
+  return {'#diagnostic-result':{html:section('主回源',d.main)+(d.stream?section('推流域名',d.stream):'')+`<article class="panel diag-card"><span class="eyebrow">请求头</span><h3>请求头策略</h3>${Object.entries(d.headerPreview).map(([k,v])=>`<div class="diag-line"><span>${escapeHtml(k)}</span><b>${escapeHtml(v)}</b></div>`).join('')}</article>`}};
+}
+export const auditView=d=>({'#audit-list':{html:d.audit.map(x=>`<div class="event"><time>${localTime(x.at)}</time><strong>${escapeHtml(x.action)}</strong><div><span>${escapeHtml(x.ip)}</span><br>${escapeHtml(x.detail)}</div></div>`).join('')||'<div class="empty-state"><p>暂无审计事件</p></div>'}});
+
+export function deploymentView(d){
+  return {'#deployment-status':{html:`<article class="deploy-card"><small>管理面板域名</small><strong>${escapeHtml(d.publicBaseUrl||'尚未设置')}</strong></article><article class="deploy-card"><small>本地代理域名</small><strong>${escapeHtml(d.localProxyBaseUrl||'尚未设置')}</strong></article><article class="deploy-card"><small>域名隔离</small><strong>${d.splitDomains?'已分离':'等待在代理机器中切换'}</strong></article>`},'#certificate-email':{value:d.certificateEmail||''},'#certificate-email-state':{text:d.certificateEmail?'已配置':'未配置',className:`pill ${d.certificateEmail?'on':'warn'}`}};
+}
+// Telegram: whether it is set up; the token and chat are never shown back.
+export const notificationsView=d=>({'#telegram-state':{text:d.telegram.configured?'已配置':'未配置'},'#telegram-enabled':{checked:d.telegram.enabled},'#telegram-chat':{value:''},'#telegram-token':{value:''}});
+
+// The account page: who is signed in, and two-step verification in one of its three stages (off, being
+// set up, on). Every password and code field is emptied whenever the page is drawn.
+export const totpStageView=stage=>Object.fromEntries(['totp-off','totp-setup','totp-on'].map(id=>[`#${id}`,{hidden:id!==stage}]));
+export function accountView(d){
+  return {'#account-user':{text:d.username||'admin'},'#totp-state':{text:d.totpEnabled?'已开启':'未开启',className:`pill ${d.totpEnabled?'on':'warn'}`},
+    '#totp-hint':{text:d.totpEnabled?`登录时需要输入动态验证码。剩余恢复码 ${d.recoveryRemaining} 个。`:'开启后，登录时除密码外还需要输入动态验证码。'},...totpStageView(d.totpEnabled?'totp-on':'totp-off'),
+    ...Object.fromEntries(['#pw-current','#pw-new','#pw-confirm','#totp-password','#totp-code','#totp-off-password','#totp-off-code'].map(id=>[id,{value:''}]))};
+}
+// A new password is checked here before the panel is asked: long enough, and typed the same twice.
+export function passwordChange({current,next,again}){
+  if(next.length<14)return {error:'新密码至少 14 位'};
+  if(next!==again)return {error:'两次输入的新密码不一致'};
+  return {body:{currentPassword:current,newPassword:next}};
+}
+export const totpSetupView=d=>({'#totp-qr':{html:qrSvg(d.qr)},'#totp-secret':{text:d.secret},...totpStageView('totp-setup')});
+export const recoveryCodes=d=>({content:`恢复码（每行一个，只显示这一次）\n${d.recovery.join('\n')}`,options:{eyebrow:'恢复码',title:'两步验证已开启',description:'请立即离线保存这些恢复码；丢失验证器时可用它们登录。'}});
+
+// Import and export: what an import made (the new nodes' addresses, when any were made), and the
+// name an export is saved under.
+export function importOutcome(d){
+  const secrets=d.credentials.map(x=>`${x.alias}\n${x.clientPath}${x.accessKey?`\n${x.accessKey}`:''}`).join('\n\n');
+  return {message:`已导入 ${d.imported} 个节点`,secret:secrets?{content:`新生成的节点凭据\n\n${secrets}`,options:{eyebrow:'IMPORT CREDENTIALS',title:'导入节点连接信息',description:'这些节点地址和连接密码可由管理员随时再次查看。'}}:null};
+}
+export const exportName=now=>`aegis-relay-${new Date(now).toISOString().slice(0,10)}.json`;
