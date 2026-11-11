@@ -475,3 +475,59 @@ test('saving the steering settings sends them as typed; an empty segment size me
   assert.deepEqual([view.steeringSave({...typed,'#steering-bound':''}).boundMB,view.steeringSave(typed,{clearAutoExcluded:true}).clearAutoExcluded,Object.keys(view.steeringSave(typed,{clearRangeAuto:true})).at(-1)],[64,true,'clearRangeAuto']);
   for(const field of view.STEERING_FIELDS)assert.ok(control(field.id),field.id);
 });
+
+// ---------------------------------------------------------------------------------------------------
+// Dashboard, traffic and access.
+test('the dashboard sums up nodes, traffic and machines, and charts the last two weeks',()=>{
+  const day=ago=>new Date(NOW-ago*86400000).toISOString().slice(0,10),GB=1024**3;
+  const data={running:2,totalBytes:100*GB,monthBytes:40*GB,totalRequests:1234567,playbackRequests:4321,active:7,daily:{[day(0)]:2*GB,[day(1)]:8*GB,[day(6)]:GB,[day(7)]:16*GB,[day(20)]:999*GB},
+    machines:[{id:'local',name:'<本机>',domain:'emby.example.com',transport:'loopback',status:'online',proxyHealthy:true,inSync:true,telemetry:{totalBytes:25*GB,monthBytes:10*GB,totalRequests:1000,playbackRequests:10,active:3},lastTelemetryAt:'2026-11-11T07:59:00Z'},
+      {id:'hk',name:'HK',domain:'',transport:'poll',status:'online',proxyHealthy:false,inSync:false,telemetry:null,lastTelemetryAt:null},{id:'gone',name:'Gone',domain:'',transport:'',status:'offline',proxyHealthy:false,inSync:false,telemetry:{totalBytes:0,monthBytes:0,totalRequests:0,playbackRequests:0},lastTelemetryAt:null}],
+    nodes:[{id:'r1',bytesOut:5*GB,active:2}]};
+  const routes=[node({id:'r1',name:'<Movies>',alias:'m"1'}),node({id:'r2',name:'Shows',alias:'shows',enabled:false}),...Array.from({length:6},(_,i)=>node({id:`x${i}`,name:`N${i}`,alias:`n${i}`}))];
+  const page=view.dashboardView({data,routes,now:NOW});
+  assert.deepEqual(['#m-nodes','#m-running','#m-traffic','#m-month-traffic','#m-requests','#m-active','#m-agents','#m-agent-state'].map(id=>page[id].text),[8,'2 个运行中','100 GB','本月 40 GB',(1234567).toLocaleString(),'7 个活动连接','1 / 3','2 台需关注']);
+  const days=page['#traffic-chart'].html.split('<div class="traffic-day').slice(1);
+  assert.equal(days.length,14);
+  assert.ok(days.at(-1).startsWith(`" title="${day(0)} · 2.0 GB"><div class="traffic-track"><i style="height:12.5%"></i><b class="traffic-value" style="bottom:calc(12.5% + 6px)">2.0 GB</b>`),days.at(-1));
+  assert.ok(days.at(-8).includes('height:100%')&&days.at(-3).startsWith(' empty"')&&!days.at(-3).includes('traffic-value'),'the tallest day fills the chart; a day without traffic has no bar');
+  assert.equal(page['#traffic-insights'].html,`<div><small>今日流量</small><strong>2.0 GB</strong></div><div><small>近 7 天</small><strong>11 GB</strong></div><div><small>单日峰值</small><strong>16 GB</strong><em>${new Date(NOW-7*86400000).getUTCMonth()+1}/${new Date(NOW-7*86400000).getUTCDate()}</em></div><div><small>播放请求</small><strong>${(4321).toLocaleString()}</strong></div>`);
+  const machines=page['#dashboard-machines'].html.split('<div class="machine-tile"').slice(1);
+  for(const text of ['data-status="online"','<i class="machine-dot "></i>&lt;本机&gt;</strong><small>emby.example.com</small>','<span class="pill on">在线</span><span class="pill info">已同步</span>','<small>累计流量</small><strong>25 GB</strong>','<i style="width:25%"></i>',`占全网流量 25.0% · 最近上报 ${view.localTime('2026-11-11T07:59:00Z')}`])assert.ok(machines[0].includes(text),text);
+  for(const text of ['<i class="machine-dot off"></i>HK</strong><small>poll</small>','<span class="pill warn">在线</span><span class="pill warn">待同步</span>','<div class="telemetry-missing">等待该 Agent 升级后上报流量</div>'])assert.ok(machines[1].includes(text),text);
+  for(const text of ['<small>尚未设置域名</small>','<span class="pill warn">失联</span>','占全网流量 0.0% · 最近上报 —'])assert.ok(machines[2].includes(text),text);
+  // The six first nodes, with what the panel machine carried for each.
+  const rows=page['#dashboard-nodes'].html.split('<div class="mini-row">').slice(1);
+  assert.equal(rows.length,6);
+  assert.ok(rows[0].includes('<i class="status-dot "></i>&lt;Movies&gt;</strong><small>/m&quot;1/ · 主代理机 5.0 GB</small></div><span class="pill">2 活动</span>')&&rows[1].includes('<i class="status-dot off"></i>Shows</strong><small>/shows/ · 主代理机 0 B</small></div><span class="pill">0 活动</span>'));
+  // A panel with nothing yet.
+  const empty=view.dashboardView({data:{running:0,daily:{}},routes:[],now:NOW});
+  assert.deepEqual([empty['#m-agents'].text,empty['#m-agent-state'].text,empty['#m-requests'].text,empty['#m-active'].text,/还没有代理机器/.test(empty['#dashboard-machines'].html),/还没有节点/.test(empty['#dashboard-nodes'].html),empty['#traffic-chart'].html.split('traffic-day empty').length-1],['0 / 0','暂无代理机器','0','0 个活动连接',true,true,14]);
+});
+
+test('traffic is listed per node against its monthly quota',()=>{
+  const GB=1024**3,routes=[node({id:'r1',name:'<Movies>',alias:'movies'}),node({id:'r2',name:'Shows',alias:'shows'}),node({id:'r3',name:'New',alias:'new'})];
+  const rows=view.trafficView({routes,data:{nodes:[{id:'r1',requests:12345,playbackRequests:678,bytesOut:9*GB,monthBytes:480*GB,quotaBytes:500*GB,speedLimitMbps:80,errors:2},{id:'r2',requests:1,playbackRequests:0,bytesOut:GB,monthBytes:30*GB,quotaBytes:0,speedLimitMbps:0,errors:0}]}})['#traffic-table'].html.split('<tr>').slice(1);
+  assert.equal(rows[0],`<td><strong>&lt;Movies&gt;</strong><br><small class="muted">/movies/</small></td><td>${(12345).toLocaleString()}</td><td>678</td><td>9.0 GB</td><td>480 GB / 500 GB<div class="progress"><i class="danger" style="width:96%"></i></div></td><td>80 Mbps</td><td>2</td></tr>`);
+  assert.ok(rows[1].includes('<td>30 GB / 不限额<div class="progress"><i class="" style="width:0%"></i></div></td><td>不限速</td><td>0</td>'));
+  assert.ok(rows[2].includes('<td>0</td><td>0</td><td>0 B</td><td>0 B / 不限额'),'a node the panel has no figures for yet');
+  const bar=(month,quota)=>/<i class="(\w*)" style="width:([\d.]+)%">/.exec(view.trafficView({routes:[routes[0]],data:{nodes:[{id:'r1',monthBytes:month,quotaBytes:quota}]}})['#traffic-table'].html).slice(1);
+  assert.deepEqual([bar(50,100),bar(51,100),bar(85,100),bar(86,100),bar(300,100)],[['','50'],['warn','51'],['warn','85'],['danger','86'],['danger','100']]);
+});
+
+test('access is shown node by node and channel by channel, only for nodes that still exist',()=>{
+  const routes=[node({id:'r1'}),node({id:'r2'})];
+  const d={nodes:[{id:'r1',name:'<Movies>',alias:'movies',suspicious:true,distinctDevices:9,channels:[
+      {label:'Friend <A>',suspicious:true,distinctDevices:8,distinctIps:5,viewers:[{ip:'2001:db8::1',deviceName:'Apple <TV>',client:'Infuse',ua:`UA<${'x'.repeat(60)}`,machine:'HK <1>',hits:42,lastSeen:String(NOW)},{ip:'203.0.113.5',deviceName:'',client:'',ua:'',machine:'',hits:0,lastSeen:0}]},
+      {label:'Empty',suspicious:false,distinctDevices:0,distinctIps:0,viewers:[]}]},
+    {id:'r2',name:'Shows',alias:'shows',suspicious:false,distinctDevices:0,channels:[]},{id:'deleted',name:'Gone',alias:'gone',suspicious:false,distinctDevices:1,channels:[]}]};
+  const html=view.accessView(d,routes)['#access-list'].html,nodes=html.split('<details class="panel access-node').slice(1);
+  assert.equal(nodes.length,2,'a node that was deleted is left out');
+  for(const text of [' suspicious">','&lt;Movies&gt; <small class="muted">/movies/</small>','<span class="node-status bad">⚠ 疑似多人共享</span><span class="pill off">通道 2</span><span class="pill off">设备合计 9</span>','<details class="chan-detail suspicious"><summary><span class="chan-name">Friend &lt;A&gt;</span><span class="pill warn">设备 8</span><span class="pill off" title="动态 IP 仅供参考">IP 5</span><span class="pill danger">⚠ 疑似转分发</span>',
+    `<tr><td><code>2001:db8::1</code></td><td>Apple &lt;TV&gt;<br><small class="muted">Infuse</small></td><td><small class="muted">UA&lt;${'x'.repeat(47)}</small></td><td>HK &lt;1&gt;</td><td>42</td><td>${new Date(NOW).toLocaleString()}</td></tr>`,
+    '<tr><td><code>203.0.113.5</code></td><td>—</td><td><small class="muted"></small></td><td>—</td><td>0</td><td>—</td></tr>','<details class="chan-detail "><summary><span class="chan-name">Empty</span><span class="pill info">设备 0</span>','<p class="muted">该通道暂无观看记录。</p>'])assert.ok(nodes[0].includes(text),text);
+  assert.ok(nodes[1].includes('<span class="node-status ok">✓ 安全</span><span class="pill off">通道 0</span>')&&nodes[1].includes('<div class="access-node-body"><p class="muted">暂无访问记录。</p></div>'));
+  for(const nothing of [{nodes:[]},{},{nodes:[d.nodes[2]]}])assert.match(view.accessView(nothing,routes)['#access-list'].html,/暂无访问记录/);
+  assert.match(view.ACCESS_LOADING['#access-list'].html,/正在汇总访问记录/);
+  assert.equal(view.accessFailed('storage <down>')['#access-list'].html,'<article class="panel empty-state"><h3>加载失败</h3><p>storage &lt;down&gt;</p></article>');
+});
