@@ -317,3 +317,42 @@ export function steeringRefresher({ask,onPage,signedIn,hidden,show,status,toast,
   }
   return {load,tick:()=>{if(onPage()&&!hidden()&&signedIn())return load(true)}};
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Dashboard, traffic and access: what the panel counted.
+
+// The dashboard for the panel's figures (`data`), the nodes there are, and the moment it is drawn at
+// (the chart ends with that day).
+export function dashboardView({data,routes,now}){
+  const changes={};
+  const machines=Array.isArray(data.machines)?data.machines:[],online=machines.filter(machine=>machine.status==='online'&&machine.proxyHealthy).length;
+  Object.assign(changes,{'#m-nodes':{text:routes.length},'#m-running':{text:`${data.running} 个运行中`},'#m-traffic':{text:bytes(data.totalBytes)},'#m-month-traffic':{text:`本月 ${bytes(data.monthBytes)}`},'#m-requests':{text:Number(data.totalRequests||0).toLocaleString()},'#m-active':{text:`${data.active||0} 个活动连接`},'#m-agents':{text:`${online} / ${machines.length}`},'#m-agent-state':{text:machines.length?`${machines.length-online} 台需关注`:'暂无代理机器'}});
+  const days=recentDays(data.daily,now),max=Math.max(1,...days.map(day=>day.bytes)),today=days.at(-1)?.bytes||0,week=days.slice(-7).reduce((sum,day)=>sum+day.bytes,0),peak=days.reduce((best,day)=>day.bytes>best.bytes?day:best,days[0]);
+  changes['#traffic-chart']={html:days.map(day=>{const pct=day.bytes?Math.max(3,day.bytes/max*100):0;return`<div class="traffic-day${day.bytes?'':' empty'}" title="${day.key} · ${bytes(day.bytes)}"><div class="traffic-track"><i style="height:${pct}%"></i>${day.bytes?`<b class="traffic-value" style="bottom:calc(${pct}% + 6px)">${bytes(day.bytes)}</b>`:''}</div><small>${day.label}</small></div>`}).join('')};
+  changes['#traffic-insights']={html:`<div><small>今日流量</small><strong>${bytes(today)}</strong></div><div><small>近 7 天</small><strong>${bytes(week)}</strong></div><div><small>单日峰值</small><strong>${bytes(peak?.bytes||0)}</strong><em>${peak?.label||'—'}</em></div><div><small>播放请求</small><strong>${Number(data.playbackRequests||0).toLocaleString()}</strong></div>`};
+  const statusLabel={online:'在线',stale:'连接延迟',offline:'失联',revoked:'已撤销'};
+  changes['#dashboard-machines']={html:machines.map(machine=>{const t=machine.telemetry,share=data.totalBytes&&t?Math.min(100,t.totalBytes/data.totalBytes*100):0,healthy=machine.status==='online'&&machine.proxyHealthy;return`<div class="machine-tile" data-status="${escapeHtml(machine.status)}"><div class="machine-title"><div><strong><i class="machine-dot ${healthy?'':'off'}"></i>${escapeHtml(machine.name)}</strong><small>${escapeHtml(machine.domain||machine.transport||'尚未设置域名')}</small></div><div class="tag-row"><span class="pill ${healthy?'on':'warn'}">${statusLabel[machine.status]||'未知'}</span><span class="pill ${machine.inSync?'info':'warn'}">${machine.inSync?'已同步':'待同步'}</span></div></div>${t?`<div class="machine-stats"><div><small>累计流量</small><strong>${bytes(t.totalBytes)}</strong></div><div><small>本月流量</small><strong>${bytes(t.monthBytes)}</strong></div><div><small>请求 / 播放</small><strong>${Number(t.totalRequests).toLocaleString()} / ${Number(t.playbackRequests).toLocaleString()}</strong></div><div><small>活动连接</small><strong>${t.active||0}</strong></div></div><div class="machine-share"><i style="width:${share}%"></i></div><small class="machine-report">占全网流量 ${share.toFixed(1)}% · 最近上报 ${machine.lastTelemetryAt?localTime(machine.lastTelemetryAt):'—'}</small>`:'<div class="telemetry-missing">等待该 Agent 升级后上报流量</div>'}</div>`}).join('')||'<div class="empty-state"><p>还没有代理机器</p></div>'};
+  const nodeMetrics=new Map((data.nodes||[]).map(x=>[x.id,x]));
+  changes['#dashboard-nodes']={html:routes.slice(0,6).map(r=>{const m=nodeMetrics.get(r.id)||{};return`<div class="mini-row"><div><strong><i class="status-dot ${r.enabled?'':'off'}"></i>${escapeHtml(r.name)}</strong><small>/${escapeHtml(r.alias)}/ · 主代理机 ${bytes(m.bytesOut)}</small></div><span class="pill">${m.active||0} 活动</span></div>`}).join('')||'<div class="empty-state"><p>还没有节点</p></div>'};
+  return changes;
+}
+// Traffic per node this month against its quota.
+export function trafficView({data,routes}){
+  const metrics=new Map(data.nodes.map(x=>[x.id,x]));
+  return {'#traffic-table':{html:routes.map(r=>{const m=metrics.get(r.id)||{},quota=m.quotaBytes||0,ratio=quota?Math.min(100,(m.monthBytes||0)/quota*100):0,rcls=ratio>85?'danger':ratio>50?'warn':'';return`<tr><td><strong>${escapeHtml(r.name)}</strong><br><small class="muted">/${escapeHtml(r.alias)}/</small></td><td>${Number(m.requests||0).toLocaleString()}</td><td>${Number(m.playbackRequests||0).toLocaleString()}</td><td>${bytes(m.bytesOut)}</td><td>${bytes(m.monthBytes)} / ${quota?bytes(quota):'不限额'}<div class="progress"><i class="${rcls}" style="width:${ratio}%"></i></div></td><td>${m.speedLimitMbps?`${m.speedLimitMbps} Mbps`:'不限速'}</td><td>${m.errors||0}</td></tr>`}).join('')}};
+}
+// Who watched what: node › channel › device, for the nodes there still are.
+export const ACCESS_LOADING={'#access-list':{html:'<article class="panel empty-state"><h3>正在汇总访问记录…</h3></article>'}};
+export const accessFailed=message=>({'#access-list':{html:`<article class="panel empty-state"><h3>加载失败</h3><p>${escapeHtml(message)}</p></article>`}});
+export function accessView(d,routes){
+  const nodes=(d.nodes||[]).filter(n=>routes.some(r=>r.id===n.id));
+  if(!nodes.length)return {'#access-list':{html:'<article class="panel empty-state"><h3>暂无访问记录</h3><p>有人通过反代观看后，这里会按“节点 › 分发通道 › 设备”折叠显示。</p></article>'}};
+  const fmt=t=>t?new Date(Number(t)).toLocaleString():'—';
+  return {'#access-list':{html:nodes.map(n=>{
+    const channels=(n.channels||[]).map(c=>{
+      const rows=(c.viewers||[]).map(v=>`<tr><td><code>${escapeHtml(v.ip)}</code></td><td>${escapeHtml(v.deviceName||v.client||'—')}${v.client&&v.deviceName?`<br><small class="muted">${escapeHtml(v.client)}</small>`:''}</td><td><small class="muted">${escapeHtml((v.ua||'').slice(0,50))}</small></td><td>${escapeHtml(v.machine||'—')}</td><td>${v.hits||0}</td><td>${fmt(v.lastSeen)}</td></tr>`).join('');
+      return `<details class="chan-detail ${c.suspicious?'suspicious':''}"><summary><span class="chan-name">${escapeHtml(c.label)}</span><span class="pill ${c.suspicious?'warn':'info'}">设备 ${c.distinctDevices}</span><span class="pill off" title="动态 IP 仅供参考">IP ${c.distinctIps}</span>${c.suspicious?'<span class="pill danger">⚠ 疑似转分发</span>':''}</summary>${rows?`<div class="table-wrap"><table><thead><tr><th>IP</th><th>设备 / 客户端</th><th>UA</th><th>机器</th><th>请求</th><th>最近访问</th></tr></thead><tbody>${rows}</tbody></table></div>`:'<p class="muted">该通道暂无观看记录。</p>'}</details>`;
+    }).join('');
+    return `<details class="panel access-node ${n.suspicious?'suspicious':''}"><summary class="access-node-head"><span class="access-node-name">${escapeHtml(n.name)} <small class="muted">/${escapeHtml(n.alias)}/</small></span><span class="node-status ${n.suspicious?'bad':'ok'}">${n.suspicious?'⚠ 疑似多人共享':'✓ 安全'}</span><span class="pill off">通道 ${(n.channels||[]).length}</span><span class="pill off">设备合计 ${n.distinctDevices}</span></summary><div class="access-node-body">${channels||'<p class="muted">暂无访问记录。</p>'}</div></details>`;
+  }).join('')}};
+}
