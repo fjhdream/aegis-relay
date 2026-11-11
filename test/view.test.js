@@ -635,3 +635,20 @@ test('an import says what it made, and an export is named for its day',()=>{
   assert.deepEqual(view.importOutcome({imported:0,credentials:[]}),{message:'已导入 0 个节点',secret:null});
   assert.equal(view.exportName(Date.parse('2026-03-02T23:30:00+08:00')),'aegis-relay-2026-03-02.json');
 });
+
+// ---------------------------------------------------------------------------------------------------
+// The seam itself: app.js is the page's side, and holds no view of its own.
+test('app.js names only what view.js has, and writes no markup of its own',()=>{
+  const app=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');
+  // Nothing imports app.js here (it needs a page), so a name view.js does not export would only show
+  // in a browser, as a panel that never loads.
+  const imports=[...app.matchAll(/^import \{([^}]*)\} from '([^']+)';$/gm)];
+  assert.deepEqual(imports.map(found=>found[2]),['./view.js']);
+  const names=imports[0][1].split(',');
+  assert.deepEqual([names.filter(name=>!(name in view)),names.length>40,new Set(names).size],[[],true,names.length]);
+  // Every name it imports is used, so the list says what the page's side depends on.
+  const body=app.replace(imports[0][0],'');
+  assert.deepEqual(names.filter(name=>!new RegExp(`(?<![\\w$.])${name.replace(/\$/g,'\\$')}(?![\\w$])`).test(body)),[]);
+  // What goes into the page is decided in view.js: no string in app.js starts a tag.
+  assert.deepEqual(app.match(/['"`]\s*<\/?[a-zA-Z]/g),null);
+});
