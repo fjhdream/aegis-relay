@@ -1,6 +1,6 @@
 // The page's side of the panel: it fetches, hands the data to view.js, writes what comes back into the
 // page and listens for what the person does next. What is shown is decided in view.js.
-import {ADDR_MASK,BRAND_MARK,DEFAULT_FAVICON,DEPLOY_HERE,ROUTE_FIELDS,TITLES,UA_PRESETS,agentSave,agentsView,awaitingSync,blankRouteForm,bytes,channelRows,channelsGate,clientAddress,credentialText,deployOptions,domainSwitch,egressOptions,enrollFormView,enrollmentView,escapeHtml,linePreviewView,moved,nodeListView,orderChanges,presetChips,presetIs,presetValues,qrSvg,recentDays,routeFormView,routeSave,routeToForm,routesChosen,switchProgress,testOutcome} from './view.js';
+import {ADDR_MASK,BRAND_MARK,DEFAULT_FAVICON,DEPLOY_HERE,ROUTE_FIELDS,STEERING_FIELDS,STEERING_REFRESH_MS,TITLES,UA_PRESETS,agentSave,agentsView,awaitingSync,blankRouteForm,bytes,channelRows,channelsGate,clientAddress,credentialText,deployOptions,domainSwitch,egressOptions,enrollFormView,enrollmentView,escapeHtml,linePreviewView,moved,nodeListView,orderChanges,presetChips,presetIs,presetValues,qrSvg,recentDays,routeFormView,routeSave,routeToForm,routesChosen,steeringLiveView,steeringRefresher,steeringSave,steeringView,switchProgress,testOutcome} from './view.js';
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 // A module has no document.currentScript; its own address says where the panel is served from.
 const scriptPath=new URL(import.meta.url).pathname;
@@ -329,60 +329,18 @@ $('#save-certificate-email').onclick=async()=>{try{await call('/deployment',{met
 async function streamDashboard(){if(!state.csrf)return;try{const response=await fetch(base+'/events',{headers:{'x-csrf-token':state.csrf}});if(response.status===401){showLogin();return}if(!response.ok||!String(response.headers.get('content-type')||'').includes('text/event-stream'))throw Error('event stream unavailable');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const{done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const chunks=buffer.split('\n\n');buffer=chunks.pop();for(const chunk of chunks){const line=chunk.split('\n').find(x=>x.startsWith('data: '));if(line){state.dashboard=JSON.parse(line.slice(6));renderDashboard(state.dashboard);renderTraffic(state.dashboard)}}}}catch{if(!state.csrf)return;$('#live-state').innerHTML='<i></i>重连中';setTimeout(streamDashboard,5000)}}
 start();
 
-// 自动切流: settings, readiness, the per-machine entry-domain command and the live view from the panel hub.
-const STEER_MODES={off:'关闭',shadow:'只测不切',on:'已开启'},STEER_REASONS={explore:'试探另一台',better_line:'切到更快的线路',history:'该网段历史上另一台更快',target_unavailable:'目标机器不可用，切回',landing_timeout:'客户端没有跟随跳转'},STEER_VERDICTS={ok:'正常',starved_down:'到观众的线路慢',starved_up:'源站或转码慢',unknown:'未知'};
-const mbps=bps=>bps?`${(bps*8/1e6).toFixed(1)} Mbps`:'—';
-const clockTime=ms=>ms?new Date(ms).toLocaleTimeString('zh-CN',{hour12:false}):'—';
-let steeringLoading=false;
-async function loadSteering(liveOnly=false){
-  if(steeringLoading)return;
-  steeringLoading=true;
-  try{
-    const data=await call('/steering',{signal:AbortSignal.timeout(10000)});
-    if(state.page!=='steering'||!state.csrf)return;
-    // Poll only the live tables: a refresh must never replace unsaved settings.
-    if(liveOnly)renderSteeringLive(data);else renderSteering(data);
-    $('#steering-refresh').textContent=`每 5 秒刷新 · 更新于 ${clockTime(Date.now())}`;
-  }catch(e){if(state.page==='steering'){$('#steering-refresh').textContent='刷新失败，保留上次结果，稍后重试';if(!liveOnly)toast(e.message,true)}}
-  finally{steeringLoading=false}
-}
-setInterval(()=>{if(state.page==='steering'&&!document.hidden&&state.csrf)return loadSteering(true)},5000);
+// 自动切流: the page is drawn by view.js; here are the fetching, the timer and the buttons.
+const steering=steeringRefresher({ask:()=>call('/steering',{signal:AbortSignal.timeout(10000)}),onPage:()=>state.page==='steering',signedIn:()=>!!state.csrf,hidden:()=>document.hidden,
+  show:(data,liveOnly)=>liveOnly?renderSteeringLive(data):renderSteering(data),status:text=>{$('#steering-refresh').textContent=text},toast,now:()=>Date.now()});
+const loadSteering=steering.load;
+setInterval(steering.tick,STEERING_REFRESH_MS);
 function renderSteering(d){
-  const st=d.settings||{},machines=d.machines||[],names=new Map(machines.map(m=>[m.id,m.name]));
-  const nameOf=id=>id?escapeHtml(names.get(id)||id):'收到请求的机器';
-  setValue('#steering-mode',st.mode||'off');setValue('#steering-entry',st.entryDomain||'');setValue('#steering-excluded',(st.excludedClients||[]).join('\n'));setValue('#steering-bounded',(st.boundedClients||[]).join('\n'));setValue('#steering-bound',st.boundMB||64);$('#steering-bound-auto').checked=st.boundAuto===true;
-  $('#steering-mode-state').textContent=STEER_MODES[st.mode]||'关闭';$('#steering-mode-state').className=`pill ${st.mode==='on'?'on':st.mode==='shadow'?'info':''}`;
-  const auto=Object.keys(st.autoExcluded||{});$('#steering-auto-excluded').textContent=auto.length?`自动排除（跳转后经常没有到达目标机器）：${auto.join('、')}`:'';
-  const rangeOn=Object.keys(st.autoBounded||{}),rangeOff=Object.keys(st.autoUnbounded||{});
-  $('#steering-auto-ranges').textContent=[rangeOn.length?`自动加入分段：${rangeOn.join('、')}`:'',rangeOff.length?`历史停用（可清空后重试）：${rangeOff.join('、')}`:''].filter(Boolean).join('；');
-  const ready=machines.filter(m=>!m.issues.length).length,steered=(d.routes||[]).filter(r=>!r.issues.length).length;
-  $('#steering-status').innerHTML=`<article class="deploy-card"><small>可参与切流的机器</small><strong>${ready} / ${machines.length}</strong></article><article class="deploy-card"><small>正在切流的节点</small><strong>${steered}</strong></article><article class="deploy-card"><small>入口域名</small><strong>${escapeHtml(st.entryDomain||'尚未设置')}</strong></article>`;
-  $('#steering-machines').innerHTML=machines.map(m=>`<tr><td><strong>${escapeHtml(m.name)}</strong>${m.local?'<br><small class="muted">面板本机</small>':''}</td><td>${escapeHtml(m.domain||'—')}</td><td>${m.issues.length?m.issues.map(i=>`<span class="pill warn">${escapeHtml(i)}</span>`).join(' '):'<span class="pill on">可参与</span>'}</td><td><label class="switch-row"><input type="checkbox" class="steer-target" data-id="${escapeHtml(m.id)}" ${m.steerTarget?'checked':''}></label></td></tr>`).join('')||'<tr><td colspan="4" class="muted">还没有机器</td></tr>';
+  write(steeringView(d,Date.now()));
   $$('.steer-target').forEach(box=>box.onchange=async()=>{try{await call(`/agents/${box.dataset.id}`,{method:'PATCH',body:JSON.stringify({steerTarget:box.checked})});await loadSteering()}catch(e){toast(e.message,true);box.checked=!box.checked}});
-  const commands=d.entryCommands||[];
-  const ENTRY_STATES={waiting:['','等待机器执行'],pending:['info','等待主机执行'],applying:['info','正在配置并申请证书'],active:['on','已生效'],failed:['warn','暂未成功，稍后自动重试']};
-  const entryState=c=>{const [tone,label]=ENTRY_STATES[c.state]||ENTRY_STATES.waiting;return `<span class="pill ${tone}">${label}${c.state==='failed'&&c.attempt?`（第 ${c.attempt} 次）`:''}</span>${c.message&&c.state!=='active'?`<small class="muted">${escapeHtml(c.message)}</small>`:''}`};
-  $('#steering-commands').innerHTML=commands.length?commands.map(c=>c.auto?`<div><div class="command-row"><strong>${escapeHtml(c.name)}</strong>${entryState(c)}</div><details><summary class="muted">自动配置；也可以手动执行</summary><pre>${escapeHtml(c.command)}</pre><button class="btn ghost copy-steer-command" data-command="${escapeHtml(c.command)}">复制命令</button></details></div>`:`<div><div class="command-row"><strong>${escapeHtml(c.name)}</strong><button class="btn ghost copy-steer-command" data-command="${escapeHtml(c.command)}">复制</button></div><pre>${escapeHtml(c.command)}</pre><small class="muted">这台机器的探针版本较旧，需要手动执行一次；升级后会自动配置。</small></div>`).join(''):`<p class="muted">${st.entryDomain?(d.certificateEmail?'还没有可参与切流的机器。':'请先在「部署向导」保存统一证书邮箱。'):'填写入口域名并保存后，这里会给出每台机器要执行的命令。'}</p>`;
   $$('.copy-steer-command').forEach(b=>b.onclick=async()=>{try{await navigator.clipboard.writeText(b.dataset.command);toast('命令已复制')}catch{toast('复制失败，请手动选择',true)}});
-  $('#steering-routes').innerHTML=(d.routes||[]).map(r=>`<tr><td><strong>${escapeHtml(r.name||r.alias)}</strong><br><small class="muted">/${escapeHtml(r.alias)}/</small></td><td>${r.enabled?'<span class="pill on">开启</span>':'<span class="pill off">关闭</span>'}</td><td>${r.issues.length?r.issues.filter(i=>r.enabled||i!=='未开启自动切流').map(i=>`<span class="pill warn">${escapeHtml(i)}</span>`).join(' ')||'—':`<span class="pill on">${st.mode==='on'?'切流中':st.mode==='shadow'?'只测不切':'总开关关闭'}</span>${(r.entryGaps||[]).length?` <span class="pill warn">${escapeHtml(r.entryGaps.join('、'))} 没有部署该节点，对外仍用直连地址</span>`:''}`}${r.egressAgentId?(r.egressActive?` <span class="pill info">统一出口：${nameOf(r.egressAgentId)}</span>`:(r.egressIssues||[]).map(i=>` <span class="pill danger">统一出口未生效：${escapeHtml(i)}</span>`).join('')):''}</td></tr>`).join('')||'<tr><td colspan="3" class="muted">还没有节点</td></tr>';
-  renderSteeringLive(d);
 }
-function renderSteeringLive(d){
-  const names=new Map((d.machines||[]).map(m=>[m.id,m.name])),routeNames=new Map((d.routes||[]).map(r=>[r.id,r.name||r.alias])),live=d.live||{};
-  const nameOf=id=>id?escapeHtml(names.get(id)||id):'收到请求的机器';
-  const PLAY_STATES={playing:'进度持续推进',paused:'已暂停',seeking:'刚拖动，重新采样',possible_stall:'疑似停滞',collecting:'收集播放进度',stopped:'已结束',unknown:'缺少新进度上报'};
-  const ADVICE={would_switch:'建议试切（未执行）',enough:'传输余量充足',low_margin:'传输余量偏低，继续观察',collecting:'等待更多分段',missing_bitrate:'缺少影片码率',stale:'传输样本已过期',inactive:'暂停／已结束',observe:'继续观察'};
-  $('#steering-playback').innerHTML=(live.playback||[]).map(x=>`<tr><td>${escapeHtml(x.client||'—')}<br><code>${escapeHtml(x.session)}</code></td><td>${escapeHtml(routeNames.get(x.routeId)||x.routeId)}</td><td><span class="pill ${x.state==='playing'?'on':x.state==='possible_stall'?'warn':''}">${escapeHtml(PLAY_STATES[x.state]||'未知')}</span></td><td>${clockTime(x.lastProgressAt)}</td><td>${(x.machines||[]).map(m=>`<div><strong>${nameOf(m.id)}</strong> · ${escapeHtml(ADVICE[m.advice]||'继续观察')}<br><small class="muted">传输 ${mbps(m.rateBps)} · 影片 ${mbps(m.bitrate/8)} · 最近 ${Math.min(m.samples,3)} 段${m.margin!==null?` · 码率余量 ${Number(m.margin).toFixed(2)}×`:''}</small></div>`).join('')||'等待完整分段样本'}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">等待新的播放进度或完整分段；已有缓存的播放可能暂时没有新取流请求。</td></tr>';
-  $('#steering-events').innerHTML=(live.events||[]).map(e=>`<tr><td>${clockTime(e.at)}</td><td>${escapeHtml(routeNames.get(e.routeId)||e.routeId)}</td><td>${nameOf(e.from)} → ${nameOf(e.to)}${e.mode==='shadow'?' <span class="pill info">本应切换</span>':''}</td><td>${escapeHtml(STEER_REASONS[e.reason]||e.reason)}</td><td>${mbps(e.fromRateBps)}${e.toRateBps?` → ${mbps(e.toRateBps)}`:''}</td><td>${escapeHtml(e.client||'—')}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">暂无切流决策</td></tr>';
-  $('#steering-sessions').innerHTML=(live.sessions||[]).map(x=>`<tr><td><code>${escapeHtml(x.session)}</code><br><small class="muted">最近取流 ${clockTime(x.lastSeen)}</small></td><td>${escapeHtml(routeNames.get(x.routeId)||x.routeId)}</td><td>${nameOf(x.assigned)}</td><td><span class="pill ${Date.now()-x.lastSeen<=60000?'on':''}">${Date.now()-x.lastSeen<=60000?'近 1 分钟有取流':'近期未取流'}</span></td><td><div class="steer-scores">${Object.entries(x.scores||{}).map(([id,sc])=>sc.verdict==='unknown'?`<span class="pill" title="尚未积累足够的测速样本，分段缓存时也可能出现">${nameOf(id)} · 测速样本不足</span>`:sc.stale?`<span class="pill" title="历史速率 ${mbps(sc.rateBps)} · 采样 ${clockTime(sc.at)}">${nameOf(id)} · 历史测速已过期</span>`:`<span class="pill ${sc.verdict==='ok'?'on':sc.verdict==='starved_down'?'warn':''}" title="采样 ${clockTime(sc.at)}">${nameOf(id)} · ${escapeHtml(STEER_VERDICTS[sc.verdict]||sc.verdict)} · ${mbps(sc.rateBps)}</span>`).join('')||'测速样本不足'}</div></td><td>${escapeHtml(x.client||'—')}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">最近 10 分钟没有取流会话</td></tr>';
-  const fx=live.effects||{},on=fx.on||{},sh=fx.shadow||{},pct=(n,d)=>d?`${Math.round(n*100/d)}%`:'—',gain=g=>g?`${g}×`:'—';
-  $('#steering-effects').innerHTML=`<article class="deploy-card"><small>真实切换（最近 ${on.total||0} 次）</small><strong>${pct(on.better||0,on.total)} 卡顿解除</strong><small>仍卡顿 ${on.worse||0} · 源站慢 ${on.upstream||0} · 没跟随跳转 ${on.notLanded||0} · 未测到 ${on.unmeasured||0} · 中位提速 ${gain(on.medianGain)}</small></article><article class="deploy-card"><small>只测不切：本应切换（最近 ${sh.total||0} 次）</small><strong>${pct(sh.persisted||0,sh.total)} 持续卡顿</strong><small>3 分钟内自行恢复 ${sh.recovered||0} · 未测到 ${sh.unmeasured||0}。持续卡顿占比越高，说明开启切流越有用。</small></article><article class="deploy-card"><small>已积累历史的客户端网段</small><strong>${live.networks||0}</strong><small>按网段记录各机器的表现，用来优先试最可能快的机器</small></article>`;
-  $('#steering-effect-pairs').innerHTML=(on.pairs||[]).map(p=>`<tr><td>${nameOf(p.from)} → ${nameOf(p.to)}</td><td>${p.total}</td><td>${p.better}</td><td>${p.worse}</td><td>${gain(p.medianGain)}</td></tr>`).join('')||'<tr><td colspan="5" class="muted">还没有真实切换</td></tr>';
-  const RANGE_STATES={on:'<span class="pill on">分段中</span>',trial:'<span class="pill info">试探中</span>',off:'<span class="pill off">不分段</span>'};
-  $('#steering-ranges').innerHTML=(live.ranges||[]).map(r=>`<tr><td>${escapeHtml(r.client)}</td><td>${r.continued} 次</td><td>${r.trialContinued} 次</td><td>${RANGE_STATES[r.state]||'—'}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">还没有已确认的分段接续</td></tr>';
-  $('#steering-clients').innerHTML=(live.clients||[]).map(c=>`<tr><td>${escapeHtml(c.client)}</td><td>${c.total}</td><td>${c.landed}</td><td>${c.autoExcluded?'<span class="pill danger">已自动排除</span>':'<span class="pill on">正常</span>'}</td></tr>`).join('')||'<tr><td colspan="4" class="muted">还没有跳转记录</td></tr>';
-}
-async function saveSteering(extra={}){try{renderSteering(await call('/steering',{method:'PUT',body:JSON.stringify({mode:value('#steering-mode'),entryDomain:value('#steering-entry'),excludedClients:value('#steering-excluded'),boundedClients:value('#steering-bounded'),boundMB:Number(value('#steering-bound')||64),boundAuto:$('#steering-bound-auto').checked,...extra})}));toast('切流设置已保存');await refreshAll()}catch(e){toast(e.message,true)}}
+function renderSteeringLive(d){write(steeringLiveView(d,Date.now()))}
+async function saveSteering(extra={}){try{renderSteering(await call('/steering',{method:'PUT',body:JSON.stringify(steeringSave(readForm(STEERING_FIELDS),extra))}));toast('切流设置已保存');await refreshAll()}catch(e){toast(e.message,true)}}
 $('#save-steering').onclick=()=>saveSteering();
 $('#clear-steering-excluded').onclick=()=>saveSteering({clearAutoExcluded:true});
 $('#clear-steering-ranges').onclick=()=>saveSteering({clearRangeAuto:true});
