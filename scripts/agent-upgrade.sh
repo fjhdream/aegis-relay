@@ -15,6 +15,8 @@ tar -xzf "$TMP_DIR/source.tar.gz" -C "$TMP_DIR/source" --strip-components=1
 cp "$TMP_DIR/source/Dockerfile.agent" "$TMP_DIR/source/compose.agent.yml" "$TMP_DIR/source/package.json" "$INSTALL_DIR/"
 rm -rf "$INSTALL_DIR/src"; cp -a "$TMP_DIR/source/src" "$INSTALL_DIR/src"
 install -m 0755 "$TMP_DIR/source/scripts/aegis-relay-agent" /usr/local/bin/aegis-relay-agent
+# The configure scripts source this one; it goes in first so they never run without it.
+install -m 0644 "$TMP_DIR/source/scripts/host-site.sh" "$INSTALL_DIR/host-site.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-domain.sh" "$INSTALL_DIR/agent-configure-domain.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-ip.sh" "$INSTALL_DIR/agent-configure-ip.sh"
 install -m 0755 "$TMP_DIR/source/scripts/configure-entry-domain.sh" "$INSTALL_DIR/configure-entry-domain.sh"

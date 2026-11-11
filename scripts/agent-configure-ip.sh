@@ -2,7 +2,8 @@
 # IP 反代模式：以本机公网 IP 作为入口，Nginx 监听 80 端口明文 HTTP 转发到本地 Agent。
 set -eu
 umask 077
-INSTALL_DIR=/opt/aegis-relay-agent
+. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
+INSTALL_DIR=$AEGIS_AGENT_DIR
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
 [ -f "$INSTALL_DIR/.env" ] || { echo "未找到 Agent 安装" >&2; exit 1; }
 # 第三方软件源失效（如 402/GPG 过期）不应中断本脚本：所需软件包通常已安装，
@@ -11,49 +12,24 @@ apt-get update || echo "警告：apt 源索引更新失败（常见于机器上�
 DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
 PUBLIC_IP=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 [ -n "$PUBLIC_IP" ] || { echo "无法检测公网 IP" >&2; exit 1; }
-SITE=/etc/nginx/sites-available/aegis-relay-agent.conf
+SITE=$AEGIS_NGINX_DIR/sites-available/aegis-relay-agent.conf
 BACKUP=""
 if [ -f "$SITE" ]; then BACKUP="$SITE.backup.$(date +%Y%m%d%H%M%S)"; cp "$SITE" "$BACKUP"; fi
-cat > "$SITE" <<EOF
-map \$http_upgrade \$aegis_agent_connection_upgrade { default upgrade; '' ''; }
-upstream aegis_agent_backend {
-    server 127.0.0.1:8080;
-    keepalive 64;
-}
+{
+  data_plane_upstream aegis_agent_backend aegis_agent_connection_upgrade
+  cat <<EOF
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
     access_log off;
     client_max_body_size 0;
-    location / {
-        proxy_pass http://aegis_agent_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$aegis_agent_connection_upgrade;
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-        proxy_max_temp_file_size 0;
-        proxy_buffer_size 256k;
-        proxy_buffers 4 256k;
-        proxy_busy_buffers_size 512k;
-        proxy_ignore_headers X-Accel-Buffering X-Accel-Limit-Rate;
-        proxy_socket_keepalive on;
-        proxy_limit_rate 0;
-        limit_rate 0;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        send_timeout 3600s;
-    }
-}
 EOF
-ln -sfn "$SITE" /etc/nginx/sites-enabled/aegis-relay-agent.conf
-rm -f /etc/nginx/sites-enabled/default
+  data_plane_location aegis_agent_backend aegis_agent_connection_upgrade
+  echo "}"
+} > "$SITE"
+ln -sfn "$SITE" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-agent.conf"
+rm -f "$AEGIS_NGINX_DIR/sites-enabled/default"
 if ! nginx -t; then
   [ -n "$BACKUP" ] && cp "$BACKUP" "$SITE"
   echo "Nginx 配置校验失败，已回滚。" >&2
@@ -61,8 +37,7 @@ if ! nginx -t; then
 fi
 systemctl enable --now nginx
 systemctl reload nginx
-set_env(){ KEY=$1 VALUE=$2 FILE="$INSTALL_DIR/.env" TMP="$INSTALL_DIR/.env.tmp"; awk -v key="$KEY" -v value="$VALUE" 'BEGIN{done=0} $0 ~ "^"key"=" {print key"="value;done=1;next} {print} END{if(!done)print key"="value}' "$FILE" > "$TMP"; chmod 600 "$TMP"; mv "$TMP" "$FILE"; }
-set_env AGENT_DOMAIN ""
-set_env AGENT_PROXY_MODE ip
-set_env AGENT_PROXY_IP "$PUBLIC_IP"
+set_env "$INSTALL_DIR/.env" AGENT_DOMAIN ""
+set_env "$INSTALL_DIR/.env" AGENT_PROXY_MODE ip
+set_env "$INSTALL_DIR/.env" AGENT_PROXY_IP "$PUBLIC_IP"
 echo "Agent IP 反代已就绪: http://$PUBLIC_IP/"

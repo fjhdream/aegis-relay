@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 umask 077
-INSTALL_DIR="/opt/aegis-relay"
+. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
+INSTALL_DIR=$AEGIS_PANEL_DIR
 PROXY_DOMAIN=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
@@ -9,7 +10,7 @@ printf '%s' "$PROXY_DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' 
 printf '%s' "$EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证书邮箱格式无效" >&2; exit 1; }
 [ -f "$INSTALL_DIR/.env" ] || { echo "未找到 AegisRelay 安装" >&2; exit 1; }
 PUBLIC_BASE_URL=$(sed -n 's/^PUBLIC_BASE_URL=//p' "$INSTALL_DIR/.env" | head -n1)
-PANEL_DOMAIN=$(printf '%s' "$PUBLIC_BASE_URL" | sed -n 's#^https://\([^/:]*\)/\?$#\1#p' | tr '[:upper:]' '[:lower:]')
+PANEL_DOMAIN=$(printf '%s' "$PUBLIC_BASE_URL" | sed -n 's#^https://\([^/:]*\)/\{0,1\}$#\1#p' | tr '[:upper:]' '[:lower:]')
 ADMIN_PATH=$(sed -n 's/^ADMIN_PATH=//p' "$INSTALL_DIR/.env" | head -n1 | sed 's#^/##;s#/$##')
 [ -n "$PANEL_DOMAIN" ] || { echo "请先执行 aegis-relay domain 配置 HTTPS 面板域名" >&2; exit 1; }
 printf '%s' "$PANEL_DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' || { echo "PUBLIC_BASE_URL 中的面板域名无效" >&2; exit 1; }
@@ -24,17 +25,14 @@ DNS_IP=$(getent ahostsv4 "$PROXY_DOMAIN" | awk 'NR==1{print $1}')
 if [ -n "$PUBLIC_IP" ] && [ -n "$DNS_IP" ] && [ "$PUBLIC_IP" != "$DNS_IP" ]; then
   echo "提示：$PROXY_DOMAIN 可能启用了 CDN/Cloudflare 代理；将继续使用 HTTP-01 验证。"
 fi
-SITE="/etc/nginx/sites-available/aegis-relay.conf"
+SITE="$AEGIS_NGINX_DIR/sites-available/aegis-relay.conf"
 BACKUP=""
 if [ -f "$SITE" ]; then BACKUP="$SITE.backup.$(date +%Y%m%d%H%M%S)"; cp "$SITE" "$BACKUP"; fi
 restore_site() { if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then cp "$BACKUP" "$SITE"; nginx -t >/dev/null 2>&1 && systemctl reload nginx || true; fi; }
 trap 'restore_site' HUP INT TERM
-cat > "$SITE" <<EOF
-map \$http_upgrade \$aegis_connection_upgrade { default upgrade; '' ''; }
-upstream aegis_relay_backend {
-    server 127.0.0.1:8080;
-    keepalive 64;
-}
+{
+  data_plane_upstream aegis_relay_backend aegis_connection_upgrade
+  cat <<EOF
 upstream aegis_admin_backend {
     server 127.0.0.1:9080;
     keepalive 16;
@@ -83,47 +81,20 @@ server {
     access_log off;
     client_max_body_size 0;
     if (\$host != $PROXY_DOMAIN) { return 421; }
-    location / {
-        proxy_pass http://aegis_relay_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$aegis_connection_upgrade;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-        proxy_max_temp_file_size 0;
-        proxy_buffer_size 256k;
-        proxy_buffers 4 256k;
-        proxy_busy_buffers_size 512k;
-        proxy_ignore_headers X-Accel-Buffering X-Accel-Limit-Rate;
-        proxy_socket_keepalive on;
-        proxy_limit_rate 0;
-        limit_rate 0;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        send_timeout 3600s;
-    }
-}
 EOF
-ln -sfn "$SITE" /etc/nginx/sites-enabled/aegis-relay.conf
-rm -f /etc/nginx/sites-enabled/default
+  data_plane_location aegis_relay_backend aegis_connection_upgrade
+  echo "}"
+} > "$SITE"
+ln -sfn "$SITE" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay.conf"
+rm -f "$AEGIS_NGINX_DIR/sites-enabled/default"
 if ! nginx -t; then restore_site; echo "Nginx 双域名配置校验失败，已回滚。" >&2; exit 1; fi
 systemctl enable --now nginx
 systemctl reload nginx
 if ! certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"; then restore_site; echo "面板域名证书配置失败，已恢复旧配置。" >&2; exit 1; fi
 if ! certbot --nginx -d "$PROXY_DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"; then restore_site; echo "代理域名证书申请失败，已恢复旧配置。请检查 DNS、Cloudflare 和 80/443 端口。" >&2; exit 1; fi
 systemctl enable --now certbot.timer 2>/dev/null || true
-set_env() {
-  KEY=$1 VALUE=$2 FILE="$INSTALL_DIR/.env" TMP="$INSTALL_DIR/.env.tmp"
-  awk -v key="$KEY" -v value="$VALUE" 'BEGIN{done=0} $0 ~ "^"key"=" {print key"="value;done=1;next} {print} END{if(!done)print key"="value}' "$FILE" > "$TMP"
-  chmod 600 "$TMP"; mv "$TMP" "$FILE"
-}
-set_env LOCAL_PROXY_BASE_URL "https://$PROXY_DOMAIN"
-set_env CERTIFICATE_EMAIL "$EMAIL"
+set_env "$INSTALL_DIR/.env" LOCAL_PROXY_BASE_URL "https://$PROXY_DOMAIN"
+set_env "$INSTALL_DIR/.env" CERTIFICATE_EMAIL "$EMAIL"
 cd "$INSTALL_DIR"
 if docker compose version >/dev/null 2>&1; then docker compose up -d --force-recreate; else docker-compose up -d --force-recreate; fi
 nginx -t && systemctl reload nginx

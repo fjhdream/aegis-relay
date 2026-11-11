@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 umask 077
-INSTALL_DIR="/opt/aegis-relay"
+. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
+INSTALL_DIR=$AEGIS_PANEL_DIR
 DOMAIN=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$2
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }
@@ -20,15 +21,12 @@ if [ -n "$PUBLIC_IP" ] && [ -n "$DNS_IP" ] && [ "$PUBLIC_IP" != "$DNS_IP" ]; the
   echo "警告：$DOMAIN 当前解析到 $DNS_IP，本机公网 IP 为 $PUBLIC_IP。"
   echo "请确认 DNS 已生效，否则证书申请会失败。"
 fi
-SITE="/etc/nginx/sites-available/aegis-relay.conf"
+SITE="$AEGIS_NGINX_DIR/sites-available/aegis-relay.conf"
 BACKUP=""
 if [ -f "$SITE" ]; then BACKUP="$SITE.backup.$(date +%Y%m%d%H%M%S)"; cp "$SITE" "$BACKUP"; fi
-cat > "$SITE" <<EOF
-map \$http_upgrade \$aegis_connection_upgrade { default upgrade; '' ''; }
-upstream aegis_relay_backend {
-    server 127.0.0.1:8080;
-    keepalive 64;
-}
+{
+  data_plane_upstream aegis_relay_backend aegis_connection_upgrade
+  cat <<EOF
 upstream aegis_admin_backend {
     server 127.0.0.1:9080;
     keepalive 16;
@@ -53,33 +51,11 @@ server {
         proxy_buffers 4 64k;
         proxy_busy_buffers_size 128k;
     }
-    location / {
-        proxy_pass http://aegis_relay_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$aegis_connection_upgrade;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_set_header Range \$http_range;
-        proxy_set_header If-Range \$http_if_range;
-        proxy_max_temp_file_size 0;
-        proxy_buffer_size 256k;
-        proxy_buffers 4 256k;
-        proxy_busy_buffers_size 512k;
-        proxy_ignore_headers X-Accel-Buffering X-Accel-Limit-Rate;
-        proxy_socket_keepalive on;
-        proxy_limit_rate 0;
-        limit_rate 0;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        send_timeout 3600s;
-    }
-}
 EOF
-ln -sfn "$SITE" /etc/nginx/sites-enabled/aegis-relay.conf
+  data_plane_location aegis_relay_backend aegis_connection_upgrade
+  echo "}"
+} > "$SITE"
+ln -sfn "$SITE" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay.conf"
 if ! nginx -t; then
   [ -n "$BACKUP" ] && cp "$BACKUP" "$SITE"
   echo "Nginx 配置校验失败，已回滚。" >&2
@@ -92,21 +68,16 @@ if ! certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --redirect -m "$
   exit 1
 fi
 systemctl enable --now certbot.timer 2>/dev/null || true
-set_env() {
-  KEY=$1 VALUE=$2 FILE="$INSTALL_DIR/.env" TMP="$INSTALL_DIR/.env.tmp"
-  awk -v key="$KEY" -v value="$VALUE" 'BEGIN{done=0} $0 ~ "^"key"=" {print key"="value;done=1;next} {print} END{if(!done)print key"="value}' "$FILE" > "$TMP"
-  chmod 600 "$TMP"; mv "$TMP" "$FILE"
-}
-set_env SECURE_COOKIES true
-set_env ADMIN_PUBLISH_IP 127.0.0.1
-set_env PROXY_PUBLISH_IP 127.0.0.1
-set_env PUBLIC_BASE_URL "https://$DOMAIN"
+set_env "$INSTALL_DIR/.env" SECURE_COOKIES true
+set_env "$INSTALL_DIR/.env" ADMIN_PUBLISH_IP 127.0.0.1
+set_env "$INSTALL_DIR/.env" PROXY_PUBLISH_IP 127.0.0.1
+set_env "$INSTALL_DIR/.env" PUBLIC_BASE_URL "https://$DOMAIN"
 # This configures a SINGLE-domain panel (admin + Emby on one host). Clear any split reverse-proxy
 # domain from a previous life, or the panel would keep splitDomains=true against a proxy host Nginx no
 # longer serves — node requests on the panel domain would then 404 and client addresses would point at
 # a dead domain. The split wizard re-sets this right after via configure-local-domain.sh.
-set_env LOCAL_PROXY_BASE_URL ""
-set_env CERTIFICATE_EMAIL "$EMAIL"
+set_env "$INSTALL_DIR/.env" LOCAL_PROXY_BASE_URL ""
+set_env "$INSTALL_DIR/.env" CERTIFICATE_EMAIL "$EMAIL"
 cd "$INSTALL_DIR"
 if docker compose version >/dev/null 2>&1; then docker compose up -d --force-recreate; else docker-compose up -d --force-recreate; fi
 nginx -t && systemctl reload nginx
