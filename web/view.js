@@ -372,6 +372,8 @@ export function readResponse({status,ok,type,body,path}){
   if(!ok)return {error:data.error||'请求失败'};
   return {data};
 }
+// The live feed has dropped and is being asked for again.
+export const LIVE_RECONNECTING={'#live-state':{html:'<i></i>重连中'}};
 // The live feed arrives in pieces: the data of each whole event in what has been read so far, and the
 // unfinished rest to keep for the next piece.
 export function feedEvents(buffer){
