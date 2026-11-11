@@ -13,7 +13,8 @@ import { spawnSync } from 'node:child_process';
 const SCRIPTS=new URL('../scripts/',import.meta.url).pathname;
 const STUBS={
   id:'echo 0',
-  'apt-get':'exit 0',
+  // A dead third-party source fails `update`; a package that cannot be had fails `install`.
+  'apt-get':'[ "$1" = update ] && [ "${TEST_APT_SOURCE_DEAD:-0}" = 1 ] && exit 100; [ "$1" = install ] && [ "${TEST_APT_PACKAGE_MISSING:-0}" = 1 ] && exit 100; exit 0',
   hostname:'echo 198.51.100.7',
   systemctl:'exit 0',
   docker:'exit 0',
@@ -178,6 +179,52 @@ test('the panel\'s domain setup leaves its .env saying what Nginx now serves, an
   // The proxy domain must be another name than the panel's.
   const same=h.run('configure-local-domain.sh',['panel.example.com','ops@example.com']);
   assert.deepEqual([same.status,/面板域名与代理域名必须不同/.test(same.output)],[1,true]);
+});
+
+test('setting an agent\'s direct address records it in the agent\'s .env',()=>{
+  const h=host();
+  assert.equal(h.run('agent-configure-domain.sh',['HK.Example.com','ops@example.com']).status,0);
+  assert.deepEqual(h.env('agent'),{PANEL_URL:'https://panel.example.com',AGENT_DOMAIN:'hk.example.com',AGENT_EMAIL:'ops@example.com'});
+  assert.deepEqual(h.calls().filter(call=>call.startsWith('certbot ')),['certbot --nginx -d hk.example.com --non-interactive --agree-tos --redirect -m ops@example.com']);
+  assert.match(h.site('aegis-relay-agent'),/# managed by Certbot: hk\.example\.com/,'the certificate went into the site');
+  assert.ok(h.calls().includes('systemctl enable --now certbot.timer'),'and is renewed by itself');
+  // Then moved to its public IP: plain HTTP, no certificate, and the distribution's default site out of the way.
+  fs.symlinkSync('../sites-available/default',path.join(h.dir('nginx'),'sites-enabled','default'));
+  assert.equal(h.run('agent-configure-ip.sh').status,0);
+  assert.deepEqual(h.env('agent'),{PANEL_URL:'https://panel.example.com',AGENT_DOMAIN:'',AGENT_EMAIL:'ops@example.com',AGENT_PROXY_MODE:'ip',AGENT_PROXY_IP:'203.0.113.9'});
+  assert.equal(h.calls().filter(call=>call.startsWith('certbot ')).length,1);
+  assert.equal(fs.existsSync(path.join(h.dir('nginx'),'sites-enabled','default')),false);
+  assert.equal(fs.statSync(path.join(h.dir('agent'),'.env')).mode&0o777,0o600);
+  // Input that is not a domain and an email is turned away before anything is touched.
+  const fresh=host();
+  for(const args of [['bad_domain!','ops@example.com'],['hk.example.com','not-an-email'],['hk.example.com']]){
+    assert.equal(fresh.run('agent-configure-domain.sh',args).status,1,args.join(' '));
+    assert.deepEqual([fresh.site('aegis-relay-agent'),fresh.calls().filter(call=>!call.startsWith('id '))],[null,[]],args.join(' '));
+  }
+});
+
+test('a dead third-party APT source does not stop a site from being set up; a missing package does',()=>{
+  // These scripts stop at the first failing command, so a plain `apt-get update` would let any broken
+  // source on the machine (a 402 from a third-party repository, say) abort the whole setup.
+  const setups={
+    'agent-configure-domain.sh':[['hk.example.com','ops@example.com'],'aegis-relay-agent',[]],
+    'agent-configure-ip.sh':[[],'aegis-relay-agent',[]],
+    'configure-domain.sh':[['panel.example.com','ops@example.com'],'aegis-relay',[]],
+    'configure-local-domain.sh':[['emby.example.com','ops@example.com'],'aegis-relay',[['configure-domain.sh',['panel.example.com','ops@example.com']]]]
+  };
+  for(const [script,[args,site,before]] of Object.entries(setups)){
+    const dead=host();for(const [earlier,earlierArgs] of before)dead.run(earlier,earlierArgs);
+    const result=dead.run(script,args,{TEST_APT_SOURCE_DEAD:'1'});
+    assert.equal(result.status,0,`${script}: ${result.output}`);
+    assert.match(result.output,/警告：apt 源索引更新失败/,script);
+    assert.ok(dead.site(site)&&dead.calls().some(call=>call.startsWith('apt-get install -y nginx')),script);
+    // The install itself stays fatal: a package that really is missing must not be papered over.
+    const missing=host();for(const [earlier,earlierArgs] of before)missing.run(earlier,earlierArgs);
+    const calls=missing.calls().length,written=missing.site(site);
+    assert.notEqual(missing.run(script,args,{TEST_APT_PACKAGE_MISSING:'1'}).status,0,script);
+    assert.equal(missing.site(site),written,`${script} leaves the site alone`);
+    assert.deepEqual(missing.calls().slice(calls).filter(call=>/^(nginx|certbot|systemctl|docker) /.test(call)),[],script);
+  }
 });
 
 test('the entry domain is refused when it is this machine\'s own direct domain',()=>{
