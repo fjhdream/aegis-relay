@@ -1,123 +1,18 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { b64u, randomToken, timingEqual } from './security.js';
-import { agentRequestInput, panelResponseInput } from './agent-api.js';
-import { openAgentSnapshot } from './agent-config.js';
-import { AtomicRouteSource } from './snapshot-follower.js';
-import { decodeNodes } from './node-wire.js';
-import { verifySnapshot } from './snapshot.js';
-import { coalescedWriter, writeAtomic } from './store.js';
-import { createRelayServer } from './proxy.js';
-import { activeUpstreamLine } from './upstream-exchange.js';
-import { EGRESS_CAPABILITY, SteeringEngine, STEERING_CAPABILITY } from './steering.js';
-import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
-import { cleanEntryRequest, ENTRY_CAPABILITY } from './steering-topology.js';
-// The same host request files as the panel machine: domain status and the steering entry domain.
-import { followDomain, followEntry, forgetDomainSwitch, readDomainStatus, readEntryStatus, servingAddress } from './domain-control.js';
-import { LINE_SYNC_CAPABILITY } from './line-sync.js';
-import { Metrics } from './metrics.js';
-import { telemetryFromMetrics } from './telemetry.js';
+import { enrollAgent, startAgent } from './agent-runtime.js';
 
-const DATA_DIR=process.env.AGENT_DATA_DIR||'/app/agent-data',IDENTITY_FILE=path.join(DATA_DIR,'identity.json'),CURRENT_FILE=path.join(DATA_DIR,'current.snapshot'),PREVIOUS_FILE=path.join(DATA_DIR,'previous.snapshot'),METRICS_FILE=path.join(DATA_DIR,'metrics.enc');
+// The agent image's entry point: read the environment, then enroll (`--enroll`, run once by the
+// installer) or run the agent. Everything the agent does is in agent-runtime.js.
+
 // Read the version from the package.json baked into this image, so the version the agent reports
 // always matches the code it is actually running — an upgrade rebuilds the image, so a bumped version
 // on the panel is proof the new build is live. Fall back to the env/hardcoded value if unreadable.
 function codeVersion(){try{return JSON.parse(fs.readFileSync(new URL('../package.json',import.meta.url),'utf8')).version;}catch{return process.env.AGENT_VERSION||'0.0.0';}}
-const PANEL_URL=cleanPanel(process.env.PANEL_URL),AGENT_DOMAIN=String(process.env.AGENT_DOMAIN||'').trim(),VERSION=codeVersion(),PROXY_PORT=Number(process.env.AGENT_PROXY_PORT||8080);
-const AGENT_PROXY_MODE=String(process.env.AGENT_PROXY_MODE||'').trim().toLowerCase(),AGENT_PROXY_IP=String(process.env.AGENT_PROXY_IP||'').trim();
-// config-longpoll-v1 tells the panel this agent follows config over a long poll, so it can relax the
-// heartbeat it hands back; older agents still learn about changes from the heartbeat alone.
-// steering-v1: this machine runs the steering engine and can be a steering target.
-// entry-v1: it sets up the steering entry domain itself when the panel asks (no command to run by hand).
-// egress-v1: it relays a node's upstream traffic through the node's egress machine (see proxy.js).
-// line-sync-v1: it answers a client's line request for a node with the node's lines (see line-sync.js).
-const CAPABILITIES=['registry-v1','config-v1','proxy-v1','telemetry-v1','config-longpoll-v1',STEERING_CAPABILITY,ENTRY_CAPABILITY,EGRESS_CAPABILITY,PLAYBACK_OBSERVATION_CAPABILITY,LINE_SYNC_CAPABILITY];
-const sha256=value=>b64u(crypto.createHash('sha256').update(value).digest());
-const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
-function cleanPanel(value){const url=new URL(String(value||''));if(url.protocol!=='https:'||url.username||url.password||url.pathname!=='/'||url.search||url.hash)throw new Error('PANEL_URL must be an HTTPS origin');return url.origin;}
-function publicDer(key){return b64u(key.export({format:'der',type:'spki'}));}
-function privateDer(key){return b64u(key.export({format:'der',type:'pkcs8'}));}
-function signPrivateKey(identity){return crypto.createPrivateKey({key:Buffer.from(identity.signPrivateKey,'base64url'),format:'der',type:'pkcs8'});}
-function panelPublicKey(identity){return crypto.createPublicKey({key:Buffer.from(identity.panelSigningPublicKey,'base64url'),format:'der',type:'spki'});}
-function panelIdentity(identity){return{algorithm:'Ed25519',keyId:identity.panelKeyId,publicKey:identity.panelSigningPublicKey};}
-function storageKey(identity){const key=Buffer.from(identity.agentStorageKey||'','base64url');if(key.length!==32)throw new Error('invalid agent storage key');return key;}
-
-function newIdentity(){const sign=crypto.generateKeyPairSync('ed25519'),box=crypto.generateKeyPairSync('x25519');return{signPublicKey:publicDer(sign.publicKey),signPrivateKey:privateDer(sign.privateKey),boxPublicKey:publicDer(box.publicKey),boxPrivateKey:privateDer(box.privateKey),agentStorageKey:randomToken(32)}}
-function loadIdentity(){const identity=JSON.parse(fs.readFileSync(IDENTITY_FILE,'utf8'));if(!identity.agentStorageKey){identity.agentStorageKey=randomToken(32);writeAtomic(IDENTITY_FILE,JSON.stringify(identity));}storageKey(identity);return identity;}
-
-function verifyResponse(response,raw,identity,nonce){const timestamp=Number(response.headers.get('x-aegis-timestamp')),contentHash=response.headers.get('x-aegis-content-sha256')||'',signature=response.headers.get('x-aegis-signature')||'',keyId=response.headers.get('x-aegis-panel-key-id')||'';if(!Number.isSafeInteger(timestamp)||Math.abs(Math.floor(Date.now()/1000)-timestamp)>300||!timingEqual(contentHash,sha256(raw))||!timingEqual(keyId,identity.panelKeyId))throw new Error('panel response identity rejected');const input=panelResponseInput({status:response.status,requestNonce:nonce,timestamp,contentHash});if(!crypto.verify(null,Buffer.from(input),panelPublicKey(identity),Buffer.from(signature,'base64url')))throw new Error('panel response signature rejected');}
-
-async function enroll(){
-  fs.mkdirSync(DATA_DIR,{recursive:true,mode:0o700});
-  const token=String(process.env.ENROLLMENT_TOKEN||''),alreadyEnrolled=fs.existsSync(IDENTITY_FILE);
-  // Enrollment is driven by the token, not merely by whether an identity file exists. A fresh valid
-  // token is explicit intent to (re-)register THIS machine, so it must go through even when a stale
-  // identity is left over from an earlier install — otherwise a reinstall silently keeps the old,
-  // panel-unknown identity and the agent never appears / can't sync (502s). Without a token there is
-  // nothing to do but keep what is already there.
-  if(!token){
-    if(alreadyEnrolled){console.log('AegisRelay Agent 已注册，且未提供注册令牌，保留现有身份。');return;}
-    throw new Error('ENROLLMENT_TOKEN is required');
-  }
-  const identity=newIdentity(),requestNonce=randomToken(16),payload={protocolVersion:1,requestNonce,token,agent:{name:String(process.env.AGENT_NAME||os.hostname()).slice(0,80),signPublicKey:identity.signPublicKey,boxPublicKey:identity.boxPublicKey,agentVersion:VERSION,capabilities:CAPABILITIES},machine:{hostname:os.hostname().slice(0,80),architecture:process.arch,platform:process.platform}};
-  const response=await fetch(`${PANEL_URL}/api/agent/v1/enroll`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)}),raw=Buffer.from(await response.arrayBuffer()),result=JSON.parse(raw.toString('utf8'));
-  if(!response.ok){
-    // A spent/expired token on an already-enrolled machine is just an accidental re-run of the same
-    // install command — keep the working identity instead of aborting the installer with a stack
-    // trace. A failed first-time enrollment is a real error.
-    if(alreadyEnrolled){console.log(`注册令牌无效或已使用（${String(result.error||response.status)}）；本机已注册，保留现有身份。如需重新注册，请在面板重新生成安装命令。`);return;}
-    throw new Error(result.error||`enrollment failed (${response.status})`);
-  }
-  const pinned={...identity,agentId:result.agentId,panelKeyId:result.panelKeyId,panelSigningPublicKey:result.panelSigningPublicKey,panelUrl:PANEL_URL,enrolledAt:new Date().toISOString()};verifyResponse(response,raw,pinned,requestNonce);
-  // A re-enrollment replaces the machine's identity; the cached config/metrics were sealed with the
-  // old storage key and are unreadable now, and a leftover host-domain status would make the agent keep
-  // reporting the previous life's domain — drop them all so the agent re-syncs and reports the freshly
-  // configured domain.
-  if(alreadyEnrolled){for(const file of [CURRENT_FILE,PREVIOUS_FILE,METRICS_FILE]){try{fs.rmSync(file,{force:true});}catch{}}forgetDomainSwitch(DATA_DIR);}
-  writeAtomic(IDENTITY_FILE,JSON.stringify(pinned));console.log(`AegisRelay Agent registered: ${result.agentId}`);
+const env=process.env,machine={dataDir:env.AGENT_DATA_DIR||'/app/agent-data',panelUrl:env.PANEL_URL,version:codeVersion()};
+if(process.argv.includes('--enroll'))await enrollAgent({...machine,token:env.ENROLLMENT_TOKEN,name:env.AGENT_NAME});
+else{
+  const agent=await startAgent({...machine,domain:env.AGENT_DOMAIN,proxyMode:env.AGENT_PROXY_MODE,proxyIp:env.AGENT_PROXY_IP,proxyPort:Number(env.AGENT_PROXY_PORT||8080)});
+  // Playbacks in flight keep the relay open; Docker's stop grace period is not waited out for them.
+  for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{agent.stop().then(()=>process.exit(0));setTimeout(()=>process.exit(0),5_000).unref()});
 }
-
-async function signedRequest(identity,method,pathAndQuery,payload=null,timeoutMs=0){
-  const body=payload===null?Buffer.alloc(0):Buffer.from(JSON.stringify(payload)),timestamp=Math.floor(Date.now()/1000),nonce=randomToken(16),contentHash=sha256(body);
-  const signature=b64u(crypto.sign(null,Buffer.from(agentRequestInput({method,path:pathAndQuery,agentId:identity.agentId,timestamp,nonce,contentHash})),signPrivateKey(identity))),headers={'x-aegis-agent-id':identity.agentId,'x-aegis-timestamp':String(timestamp),'x-aegis-nonce':nonce,'x-aegis-content-sha256':contentHash,'x-aegis-signature':signature};
-  if(payload!==null)headers['content-type']='application/json';const options={method,headers};if(method!=='GET'&&payload!==null)options.body=body;if(timeoutMs)options.signal=AbortSignal.timeout(timeoutMs);
-  const response=await fetch(`${PANEL_URL}${pathAndQuery}`,options),raw=Buffer.from(await response.arrayBuffer());verifyResponse(response,raw,identity,nonce);return{response,raw,data:raw.length?JSON.parse(raw.toString('utf8')):null};
-}
-
-function sealLocal(snapshot,identity){const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',storageKey(identity),iv),data=Buffer.concat([cipher.update(JSON.stringify(snapshot)),cipher.final()]);return JSON.stringify({v:1,iv:b64u(iv),tag:b64u(cipher.getAuthTag()),data:b64u(data)})}
-function openLocal(payload,identity){const env=JSON.parse(payload),decipher=crypto.createDecipheriv('aes-256-gcm',storageKey(identity),Buffer.from(env.iv,'base64url'));decipher.setAuthTag(Buffer.from(env.tag,'base64url'));return JSON.parse(Buffer.concat([decipher.update(Buffer.from(env.data,'base64url')),decipher.final()]).toString('utf8'))}
-function loadMetricStore(identity){let data={};if(fs.existsSync(METRICS_FILE)){try{const loaded=openLocal(fs.readFileSync(METRICS_FILE,'utf8'),identity);if(loaded&&typeof loaded==='object'&&!Array.isArray(loaded))data=loaded}catch(error){console.error(`[aegis-agent] cached metrics rejected: ${error.message}`)}}const writer=coalescedWriter(METRICS_FILE,()=>sealLocal(data,identity));return{data,save:writer.save}}
-
-
-class RemoteConfig {
-  constructor(identity){this.identity=identity;this.routeSource=new AtomicRouteSource([]);this.revision=0;this.hash=null;this.applyState='waiting';this.error='';}
-  load(){if(!fs.existsSync(CURRENT_FILE))return false;const snapshot=openLocal(fs.readFileSync(CURRENT_FILE,'utf8'),this.identity);verifySnapshot(snapshot,panelIdentity(this.identity));this.routeSource.apply(decodeNodes(snapshot.nodes));this.revision=snapshot.revision;this.hash=snapshot.hash;this.applyState='active';return true;}
-  apply(snapshot){const decision=verifySnapshot(snapshot,panelIdentity(this.identity),{currentRevision:this.revision,currentHash:this.hash});if(decision.status==='noop')return decision;const routes=decodeNodes(snapshot.nodes);if(fs.existsSync(CURRENT_FILE))writeAtomic(PREVIOUS_FILE,fs.readFileSync(CURRENT_FILE));writeAtomic(CURRENT_FILE,sealLocal(snapshot,this.identity));this.routeSource.apply(routes);this.revision=snapshot.revision;this.hash=snapshot.hash;this.applyState='active';this.error='';return decision;}
-}
-
-// What this machine was installed with; the host may have switched it since (see domain-control.js).
-const INSTALLED={mode:AGENT_PROXY_MODE,domain:AGENT_DOMAIN,ip:AGENT_PROXY_IP};
-
-async function acknowledge(identity,config,status,error='',proxyHealthy=true){const payload={protocolVersion:1,revision:config.revision,hash:config.hash,status,error:String(error||'').slice(0,240),proxyHealthy};const result=await signedRequest(identity,'POST','/api/agent/v1/ack',payload);if(!result.response.ok)throw new Error(result.data?.error||`ack failed (${result.response.status})`);}
-
-async function pollConfig(identity,config,proxyHealthy,wait=0){const pathAndQuery=`/api/agent/v1/config?after=${config.revision}&wait=${wait}`,result=await signedRequest(identity,'GET',pathAndQuery,null,wait?(wait+20)*1000:0);if(result.response.status===204)return false;if(!result.response.ok)throw new Error(result.data?.error||`config poll failed (${result.response.status})`);let snapshot;try{snapshot=openAgentSnapshot({envelope:result.data,identity});config.apply(snapshot);await acknowledge(identity,config,'applied','',proxyHealthy);return true;}catch(error){if(snapshot)try{await acknowledge(identity,{revision:snapshot.revision,hash:snapshot.hash},'rejected',error.message,proxyHealthy)}catch{}throw error;}}
-
-// Config follows a long poll that the panel releases the moment this machine's node set changes, so a
-// change lands within about a second instead of on the next heartbeat. A panel that predates long
-// polling answers 204 at once; the floor keeps that, and wake-ups for other machines' changes, from
-// turning into a busy loop.
-const CONFIG_WAIT_SECONDS=25,CONFIG_POLL_FLOOR_MS=5_000;
-async function followConfig(identity,config,healthy){let backoff=0;for(;;){const started=Date.now();let pause;try{const applied=await pollConfig(identity,config,healthy(),CONFIG_WAIT_SECONDS);backoff=0;pause=applied?0:CONFIG_POLL_FLOOR_MS-(Date.now()-started)}catch(error){config.error=String(error.message||error).slice(0,160);console.error(`[aegis-agent] ${config.error}`);backoff=Math.min(60_000,Math.max(2_000,backoff*2));pause=backoff}if(pause>0)await sleep(pause)}}
-
-async function steeringExchange(identity,payload){const result=await signedRequest(identity,'POST','/api/agent/v1/steering',payload,20_000);if(!result.response.ok)throw new Error(result.data?.error||`steering sync failed (${result.response.status})`);return result.data;}
-
-function startProxy(config,identity,metricStore,health,steering){const metrics=new Metrics(metricStore);steering.canServe=route=>metrics.canServe(route);const server=createRelayServer({routeSource:config.routeSource,key:storageKey(identity),metrics,steering,label:'aegis-agent'});return new Promise((resolve,reject)=>{let started=false;server.on('error',error=>{if(!started)return reject(error);health.proxyHealthy=false;console.error(`[aegis-agent] proxy server error: ${error?.message||error}`)});server.on('close',()=>{health.proxyHealthy=false});server.listen(PROXY_PORT,'0.0.0.0',()=>{started=true;resolve({server,metrics})})})}
-
-async function checkIn(identity,config,startedAt,bootId,proxyHealthy,telemetry){const serving=servingAddress({dir:DATA_DIR,installed:INSTALLED}),payload={protocolVersion:1,agentVersion:VERSION,bootId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),currentRevision:config.revision,currentConfigId:config.hash,applyState:config.applyState,proxyHealthy,domain:serving.domain,proxyMode:serving.mode,domainStatus:readDomainStatus(DATA_DIR),entryStatus:readEntryStatus(DATA_DIR),certificateNotAfter:null,capabilities:CAPABILITIES,telemetry},result=await signedRequest(identity,'POST','/api/agent/v1/check-in',payload);if(!result.response.ok)throw new Error(result.data?.error||`check-in failed (${result.response.status})`);return result.data;}
-
-async function run(){const identity=loadIdentity();if(identity.panelUrl!==PANEL_URL)throw new Error('pinned panel URL mismatch');const config=new RemoteConfig(identity);try{config.load()}catch(error){config.error=`cached config rejected: ${error.message}`;config.applyState='error';}const health={proxyHealthy:true},steering=new SteeringEngine({selfId:identity.agentId,lineOf:activeUpstreamLine});const metricStore=loadMetricStore(identity),runtime=await startProxy(config,identity,metricStore,health,steering),server=runtime.server,metrics=runtime.metrics,startedAt=Date.now(),bootId=randomToken(16),healthy=()=>health.proxyHealthy&&server.listening;let delay=2_000,lastMetricSave=0;for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{steering.stop();const saved=metricStore.save();server.close(()=>saved.then(()=>process.exit(0)));server.closeIdleConnections?.();setTimeout(()=>process.exit(0),5_000).unref()});steering.start(payload=>steeringExchange(identity,payload),()=>config.routeSource.getRoutes());followConfig(identity,config,healthy);for(;;){try{const telemetry=telemetryFromMetrics(metrics.snapshot(config.routeSource.getRoutes()));if(Date.now()-lastMetricSave>=60_000){metricStore.save();lastMetricSave=Date.now()}const status=await checkIn(identity,config,startedAt,bootId,healthy(),telemetry);followDomain({dir:DATA_DIR,desired:{mode:status.desiredMode,domain:status.desiredDomain,email:status.certificateEmail},installed:INSTALLED});if(status.entry)followEntry({dir:DATA_DIR,entry:cleanEntryRequest(status.entry)});delay=Math.max(5_000,Number(status.heartbeatSeconds||15)*1000)}catch(error){config.error=String(error.message||error).slice(0,160);console.error(`[aegis-agent] ${config.error}`);delay=Math.min(300_000,Math.max(2_000,delay*2))}await sleep(delay)}}
-
-if(process.argv.includes('--enroll'))await enroll();else await run();

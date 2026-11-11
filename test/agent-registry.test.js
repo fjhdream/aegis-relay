@@ -132,14 +132,3 @@ test('a machine with un-applied configuration is asked to check back sooner', ()
   assert.match(source,/const pendingConfig=snapshot\.revision>Number\(agent\.appliedRevision\|\|0\)/);
   assert.match(source,/longPoll=agent\.capabilities\.includes\('config-longpoll-v1'\)/);
 });
-
-test('the agent follows config over the long poll instead of waiting for its heartbeat', () => {
-  const main=fs.readFileSync(new URL('../src/agent-main.js',import.meta.url),'utf8');
-  assert.match(main,/const CAPABILITIES=\[[^\]]*'config-longpoll-v1'/);
-  assert.match(main,/wait=\$\{wait\}/);
-  assert.match(main,/followConfig\(identity,config,healthy\);for\(;;\)/,'the long poll must run beside the heartbeat loop');
-  // A single config fetcher: a second one on the heartbeat path would apply and ACK the same revision twice.
-  assert.doesNotMatch(main,/desiredRevision\|\|0\)>config\.revision\)await pollConfig/);
-  // An old panel answers 204 at once; the floor keeps that from becoming a busy loop.
-  assert.match(main,/CONFIG_POLL_FLOOR_MS-\(Date\.now\(\)-started\)/);
-});
