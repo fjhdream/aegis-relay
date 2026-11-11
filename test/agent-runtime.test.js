@@ -172,6 +172,11 @@ test('the heartbeat brings down the domain the panel wants, and reports how the 
   record.desiredMode='ip';
   await beat();
   assert.deepEqual([request().mode,request().desiredDomain],['ip',undefined]);
+  // A switch made on the machine itself (its command, an upgrade) has no request behind it: the host's
+  // status carries no id, and the panel takes it all the same.
+  fs.rmSync(requestFile);fs.writeFileSync(statusFile,JSON.stringify({requestId:'',state:'active',mode:'ip',desiredDomain:'',currentDomain:'203.0.113.9',message:'已切换为 IP 反代（HTTP）',updatedAt:new Date().toISOString().replace(/\.\d+Z$/,'Z')}));
+  await beat();
+  assert.deepEqual([record.domainStatus.requestId,record.domainStatus.state,record.proxyMode,record.domain,record.desiredMode],['','active','ip','203.0.113.9',undefined]);
 });
 
 test('a snapshot the agent cannot apply is reported; it keeps serving the last one and recovers',async t=>{

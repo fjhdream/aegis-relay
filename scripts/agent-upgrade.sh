@@ -15,8 +15,6 @@ tar -xzf "$TMP_DIR/source.tar.gz" -C "$TMP_DIR/source" --strip-components=1
 cp "$TMP_DIR/source/Dockerfile.agent" "$TMP_DIR/source/compose.agent.yml" "$TMP_DIR/source/package.json" "$INSTALL_DIR/"
 rm -rf "$INSTALL_DIR/src"; cp -a "$TMP_DIR/source/src" "$INSTALL_DIR/src"
 install -m 0755 "$TMP_DIR/source/scripts/aegis-relay-agent" /usr/local/bin/aegis-relay-agent
-# The configure scripts source this one; it goes in first so they never run without it.
-install -m 0644 "$TMP_DIR/source/scripts/host-site.sh" "$INSTALL_DIR/host-site.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-domain.sh" "$INSTALL_DIR/agent-configure-domain.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-ip.sh" "$INSTALL_DIR/agent-configure-ip.sh"
 install -m 0755 "$TMP_DIR/source/scripts/configure-entry-domain.sh" "$INSTALL_DIR/configure-entry-domain.sh"
@@ -148,8 +146,12 @@ echo "Agent 已升级到 $SOURCE_VERSION，原注册身份、本地快照和流�
 # keeps its address instead of being switched. Never fail the upgrade over this (the new agent is
 # already running), but do not hide it either: a silently skipped re-config means the machine keeps
 # the OLD Nginx tuning after an update.
-. "$INSTALL_DIR/host-site.sh"
+if [ -f "$INSTALL_DIR/src/host-site.sh" ]; then
+. "$INSTALL_DIR/src/host-site.sh"
 agent_serve_current || case $? in
   3) echo "若尚未配置直连地址，请执行 HTTPS: sudo aegis-relay-agent domain 域名 邮箱，或 IP 反代: sudo aegis-relay-agent ip" ;;
   *) echo "警告：直连地址重新配置失败，Nginx 仍沿用旧配置（本次更新的 Nginx 调优未应用）。修复后执行: sudo aegis-relay-agent domain 域名 邮箱，或: sudo aegis-relay-agent ip" >&2 ;;
 esac
+else
+  echo "警告：本次下载的代码里没有 src/host-site.sh，Nginx 仍沿用旧配置。稍后重新执行: sudo aegis-relay-agent update" >&2
+fi

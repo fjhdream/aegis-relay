@@ -12,7 +12,8 @@
 # certificate; no DNS API token is needed and no private key ever leaves a machine.
 set -eu
 umask 022
-. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
+AEGIS_HERE=$(dirname "$0")
+if [ -f "$AEGIS_HERE/src/host-site.sh" ]; then . "$AEGIS_HERE/src/host-site.sh"; else . "$AEGIS_HERE/../src/host-site.sh"; fi
 usage(){ echo "用法: configure-entry-domain.sh 入口域名 证书邮箱 [其他机器的直连域名 ...]" >&2; }
 [ "$#" -ge 2 ] || { usage; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; exit 1; }

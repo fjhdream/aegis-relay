@@ -67,13 +67,26 @@ function requestIpSwitch({dir,currentDomain='',nowMs=Date.now()}){
   writeJson(path.join(dir,REQUEST_FILE),{version:1,requestId,mode:'ip',requestedAt});
 }
 
-// Where an agent serves right now: what the host last switched it to, else what it was installed with
-// (`installed` is {mode,domain,ip} from the install command; mode 'ip' or a missing domain means its
-// public IP over plain HTTP). `domain` is the IP in IP mode.
+// An address that is not a domain: IPv4, or IPv6.
+const isIpAddress=value=>/^\d{1,3}(\.\d{1,3}){3}$/.test(value)||value.includes(':');
+
+// Where an agent serves right now. The status file says: every status names the address served at the
+// moment it was written (currentDomain), whether the host wrote it after a switch that worked, one
+// that failed or one under way, or the agent itself when it filed a request. Only without one does it
+// come down to what the agent was installed with (`installed` is {mode,domain,ip} from the container's
+// environment; mode 'ip' or a missing domain means its public IP over plain HTTP). That environment is
+// the one the container was started with, and the host no longer restarts the container after a
+// switch, so it must not be preferred to a status. `domain` is the IP in IP mode.
 export function servingAddress({dir,installed={}}){
-  const status=readDomainStatus(dir),switched=status?.state==='active';
-  const mode=switched?status.mode:installed.mode==='ip'?'ip':installed.domain?'domain':installed.ip?'ip':'domain';
-  return {mode,domain:switched&&status.currentDomain?status.currentDomain:(mode==='ip'?installed.ip:installed.domain)||''};
+  const status=readDomainStatus(dir);
+  if(status?.state==='active'){
+    const mode=status.mode;
+    return {mode,domain:status.currentDomain||(mode==='ip'?installed.ip:installed.domain)||''};
+  }
+  // Not finished or failed: `mode` there is the one asked for, so the address tells which it is.
+  if(status?.currentDomain)return {mode:isIpAddress(status.currentDomain)?'ip':'domain',domain:status.currentDomain};
+  const mode=installed.mode==='ip'?'ip':installed.domain?'domain':installed.ip?'ip':'domain';
+  return {mode,domain:(mode==='ip'?installed.ip:installed.domain)||''};
 }
 
 // A switch the host failed to make is asked for again after this long.

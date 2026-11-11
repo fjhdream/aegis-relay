@@ -70,6 +70,16 @@ test('an agent serves where it was installed until the host has switched it',t=>
   assert.deepEqual(host.serving(),{mode:'domain',domain:'jp.example.com'});
   host.hostAnswers('active',{mode:'ip',currentDomain:'203.0.113.9'});
   assert.deepEqual(host.serving(),{mode:'ip',domain:'203.0.113.9'});
+  // The container keeps the environment it was started with, and the host does not restart it after a
+  // switch. So a status that is not `active` still decides: it names the address served when it was
+  // written, which a later failed or pending switch must not replace with what the container started with.
+  const moved=agentHost(t,{mode:'',domain:'hk.example.com',ip:''}),statusFile=path.join(moved.dir,'host-domain-status.json');
+  for(const [status,expected] of [
+    [{state:'failed',mode:'domain',desiredDomain:'jp.example.com',currentDomain:'203.0.113.9'},{mode:'ip',domain:'203.0.113.9'}],
+    [{state:'applying',mode:'ip',desiredDomain:'',currentDomain:'sg.example.com'},{mode:'domain',domain:'sg.example.com'}],
+    [{state:'pending',mode:'domain',desiredDomain:'jp.example.com',currentDomain:'2001:db8::7'},{mode:'ip',domain:'2001:db8::7'}],
+    [{state:'failed',mode:'ip',desiredDomain:'',currentDomain:''},{mode:'domain',domain:'hk.example.com'}]
+  ]){fs.writeFileSync(statusFile,JSON.stringify(status));assert.deepEqual(moved.serving(),expected,JSON.stringify(status))}
   // The host switched to IP mode without naming the address: the install-time one stands in.
   const bare=agentHost(t,{mode:'',domain:'hk.example.com',ip:'198.51.100.7'});
   bare.follow({mode:'ip'},T0);bare.hostAnswers('active',{currentDomain:''});
