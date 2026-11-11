@@ -41,7 +41,6 @@ async function call(path,options={}){
 const value=id=>$(id).value, bool=id=>value(id)==='true', escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.classList.remove('hidden');el.classList.toggle('error',error);clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.add('hidden'),3200)}
 function bytes(n=0){const units=['B','KB','MB','GB','TB'];let i=0;n=Number(n)||0;while(n>=1024&&i<units.length-1){n/=1024;i++}return`${n>=10||i===0?n.toFixed(0):n.toFixed(1)} ${units[i]}`}
-function uptime(start){if(!start)return'—';let s=Math.max(0,(Date.now()-new Date(start))/1000),d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}天 ${h}时`:`${h}时 ${m}分`}
 function recentDays(daily,count=14){const rows=[];for(let ago=count-1;ago>=0;ago--){const day=new Date();day.setUTCHours(0,0,0,0);day.setUTCDate(day.getUTCDate()-ago);const key=day.toISOString().slice(0,10);rows.push({key,label:`${day.getUTCMonth()+1}/${day.getUTCDate()}`,bytes:Number(daily?.[key]||0)})}return rows}
 function showSecret(content,{eyebrow='连接信息',title='节点连接信息',description='完整节点地址和连接密码可由管理员随时再次查看。'}={}){$('#modal-eyebrow').textContent=eyebrow;$('#modal-title').textContent=title;$('#modal-description').textContent=description;$('#secret').textContent=content;$('#modal').classList.remove('hidden')}
 

@@ -10,7 +10,7 @@ import { routeUpstreams } from './upstream-exchange.js';
 // can opt into sharing its configured primary and the upstream's own lines.
 
 export const LINE_SYNC_CAPABILITY='line-sync-v1';
-export const LINE_SYNC_MAX=32;
+const LINE_SYNC_MAX=32;
 const LINE_NAME_MAX=64;
 const LINE_PATH=/^(\/emby)?\/system\/ext\/serverdomains\/?$/i;
 const UPSTREAM_LINE_PREFIX='上游·';
@@ -21,7 +21,7 @@ const UPSTREAM_LINES_MAX_BYTES=64*1024;
 // The query parameters that carry the client's Emby token; the token check passes on only these.
 const TOKEN_PARAMS=['api_key','x-emby-token','x-mediabrowser-token'];
 
-export function lineSyncEnabled(route) {
+function lineSyncEnabled(route) {
   return route?.lineSync!==false;
 }
 

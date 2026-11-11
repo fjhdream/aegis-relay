@@ -7,15 +7,15 @@
 // The transport is `send(payload) -> response`: a signed HTTPS call on agents (agent-main.js) and
 // localTransport() on the panel machine and in tests.
 
-export const VERDICTS=Object.freeze(['ok','starved_down','starved_up','unknown']);
+const VERDICTS=Object.freeze(['ok','starved_down','starved_up','unknown']);
 export const SESSION_KEY_RE=/^[A-Za-z0-9_-]{22}$/;
-export const PREFIX_KEY_RE=/^[A-Za-z0-9_-]{16}$/;
+const PREFIX_KEY_RE=/^[A-Za-z0-9_-]{16}$/;
 const PROTOCOL_VERSION=1;
 const BATCH=200;
 const QUEUE_MAX=1000;
 // The event lists a machine reports, each in the order it happened. A sync that fails puts them back
 // in front; speed reports are not put back, a fresher one supersedes them.
-export const EVENT_LISTS=Object.freeze(['decisions','landings','failures','shadow','rangeEvents','playbackEvents']);
+const EVENT_LISTS=Object.freeze(['decisions','landings','failures','shadow','rangeEvents','playbackEvents']);
 
 const list=value=>Array.isArray(value)?value.slice(0,BATCH):[];
 const text=(value,max=80)=>String(value||'').replace(/[\r\n\0]/g,'').trim().slice(0,max);
@@ -74,7 +74,7 @@ export function syncResponse({serverTime,cursor,sessions,peers,excludedClients,b
 }
 
 // A session update as a machine reads it; null when the key is not a session key.
-export function readSessionUpdate(remote) {
+function readSessionUpdate(remote) {
   const key=String(remote?.s||'');
   if(!SESSION_KEY_RE.test(key))return null;
   const scores={},tried={};

@@ -45,6 +45,13 @@ test('every generated Nginx data plane has the same directives as the others',()
   assert.deepEqual(drift,[]);
 });
 
+// deploy/nginx.example.conf is the configure-domain.sh output written out for people configuring Nginx
+// by hand. The scripts write theirs through an unquoted heredoc, so every Nginx variable there is \$.
+test('the hand-written Nginx example has the same data-plane directives as the generated ones',()=>{
+  const example=dataPlaneDirectives('deploy/nginx.example.conf');
+  for(const file of dataPlaneScripts)assert.deepEqual(example,dataPlaneDirectives(file).map(line=>line.replaceAll('\\$','$')),`deploy/nginx.example.conf differs from ${file}`);
+});
+
 test('every generated Nginx data plane overwrites the forwarded headers the relay trusts',()=>{
   // The relay reads the viewer address (viewer list, steering history) from X-Real-IP and the scheme
   // from X-Forwarded-Proto; Nginx passes a client's own copies through unless it sets them itself.

@@ -19,7 +19,6 @@ const HISTORY_MAX=5000,HISTORY_TTL_MS=7*24*3600_000,HISTORY_EVERY_MS=60_000;
 const EFFECT_RING=200,EFFECT_TIMEOUT_MS=10*60_000,RECOVER_MS=180_000,PERSIST_MS=120_000;
 // Silence also means pause/stop/cache; only a matched next-byte request proves compatibility.
 const BOUND_SAMPLE=10,BOUND_PENDING=32,TRIAL_SUCCESSES=3,TRIAL_MIN_LANDINGS=5,TRIAL_MIN_LANDED=0.9;
-const list=value=>Array.isArray(value)?value.slice(0,BATCH):[];
 const text=(value,max=80)=>String(value||'').replace(/[\r\n\0]/g,'').trim().slice(0,max);
 const number=(value,min=0,max=Number.MAX_SAFE_INTEGER)=>{const n=Number(value);return Number.isFinite(n)?Math.min(max,Math.max(min,n)):min};
 const median=values=>{const sorted=[...values].sort((left,right)=>left-right);return sorted.length?Math.round(sorted[Math.floor(sorted.length/2)]*10)/10:0};

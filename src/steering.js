@@ -10,7 +10,7 @@ import { readSyncResponse, requeueReport, takeReport } from './steering-sync.js'
 // plane: it measures how well each playback session is being served here, and at request boundaries
 // either serves the request or 302s it to a peer machine's direct domain. Machines share per-session
 // state through the panel (SteeringHub); none of it is ever needed for correctness, only for quality.
-export const STEER_PARAM='aegis_steer';
+const STEER_PARAM='aegis_steer';
 export const STEERING_CAPABILITY='steering-v1';
 export const STEERING_MODES=Object.freeze(['off','shadow','on']);
 // egress-v1: this machine relays a node's upstream traffic through the node's egress machine, and
@@ -46,7 +46,7 @@ const targetTag=id=>crypto.createHash('sha256').update(`AegisRelay:steer-target:
 // A per-node key derived from the node's routeAuthKey, which every machine serving the node already
 // holds. Kept separate from the AES key of the .aegis-relay continuation tokens.
 const steerKeys=new WeakMap();
-export function steerKey(route) {
+function steerKey(route) {
   if(!route||!isRouteAuthKey(route.routeAuthKey))return null;
   const cached=steerKeys.get(route);
   if(cached&&cached.source===route.routeAuthKey)return cached.key;
@@ -115,7 +115,7 @@ export function clientPrefix(ip) {
 }
 
 // The same X-Real-IP the relay's viewer list trusts: set by the fronting Nginx, never by the client.
-export function clientIpOf(req) {
+function clientIpOf(req) {
   const first=value=>String(value||'').split(',')[0].trim();
   return first(req.headers['x-real-ip'])||first(req.headers['x-forwarded-for'])||String(req.socket?.remoteAddress||'');
 }

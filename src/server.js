@@ -22,7 +22,7 @@ import { fetchPanelIcon, MAX_ICON_BYTES, normalizePanelIcon } from './panel-icon
 import { SteeringEngine } from './steering.js';
 import { SteeringHub } from './steering-hub.js';
 import { localTransport } from './steering-sync.js';
-import { readEntryDomain, steeringSettings } from './steering-topology.js';
+import { readEntryDomain, readSteeringSettings, steeringSettings } from './steering-topology.js';
 import { channelList, Panel } from './panel.js';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -47,14 +47,15 @@ const localRecord=store.data.agents.find(agent=>agent.id===LOCAL_AGENT_ID);
 if(localRecord&&configuredLocalDomain&&localRecord.domain!==configuredLocalDomain){localRecord.domain=configuredLocalDomain;localRecord.updatedAt=new Date().toISOString();store.save();snapshots.refresh();}
 // Automatic steering: the hub arbitrates sessions across machines; a client type that keeps failing to
 // follow steering redirects is excluded for good (until the operator clears it).
-// Capped ranges (direct play cut into requests): a client type that continued on trial is switched on,
-// one that failed to continue is switched off, until the operator clears the automatic results.
+// Capped ranges (direct play cut into requests): a client type that continued on trial is switched on
+// until the operator clears the automatic results. None is switched off automatically; one an older
+// version switched off (autoUnbounded) stays off until the operator clears it. The check only reads:
+// steeringSettings() replaces the stored settings, so it is taken only when there is something to add.
 function rangeVerdict(client,works){
-  const settings=steeringSettings(store.data),lower=client.toLowerCase(),has=map=>Object.keys(map).some(item=>item.toLowerCase()===lower);
-  if(has(settings.autoUnbounded)||(works&&has(settings.autoBounded)))return;
-  if(works)settings.autoBounded[client]=new Date().toISOString();
-  else{settings.autoUnbounded[client]=new Date().toISOString();for(const item of Object.keys(settings.autoBounded))if(item.toLowerCase()===lower)delete settings.autoBounded[item];}
-  store.audit(works?'steering.client_range_enabled':'steering.client_range_disabled','system',client);store.save();
+  const stored=readSteeringSettings(store.data),lower=client.toLowerCase(),has=map=>Object.keys(map).some(item=>item.toLowerCase()===lower);
+  if(!works||has(stored.autoUnbounded)||has(stored.autoBounded))return;
+  steeringSettings(store.data).autoBounded[client]=new Date().toISOString();
+  store.audit('steering.client_range_enabled','system',client);store.save();
 }
 const steeringHub = new SteeringHub({store,onBoundVerdict:rangeVerdict,onAutoExclude:client=>{const settings=steeringSettings(store.data);if(Object.keys(settings.autoExcluded).some(item=>item.toLowerCase()===client.toLowerCase()))return;settings.autoExcluded[client]=new Date().toISOString();store.audit('steering.client_auto_excluded','system',client);store.save();}});
 const agentApi = new AgentApi({store,version:APP_VERSION,steering:steeringHub,snapshots});

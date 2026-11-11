@@ -85,7 +85,7 @@ export function agentSteeringIssues(agent, settings) {
   return issues;
 }
 
-export function steerableAgent(agent, settings) {
+function steerableAgent(agent, settings) {
   return agentSteeringIssues(agent,settings).length===0;
 }
 

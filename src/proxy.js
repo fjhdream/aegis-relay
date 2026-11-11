@@ -67,7 +67,7 @@ export function stripAdminSetCookies(headers) {
   return headers;
 }
 
-export function parseUpstreamList(value) {
+function parseUpstreamList(value) {
   const values = (Array.isArray(value) ? value : String(value || '').split(/[;\n]+/)).map(v => String(v).trim()).filter(Boolean);
   if (!values.length) throw new Error('at least one upstream is required');
   if (values.length > 8) throw new Error('a node supports at most 8 upstreams');

@@ -43,7 +43,7 @@ export function writeAtomic(file, payload) {
   }
 }
 
-export async function writeAtomicAsync(file, payload) {
+async function writeAtomicAsync(file, payload) {
   const dir = path.dirname(file);
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
@@ -92,7 +92,7 @@ function decryptStore(payload, key) {
   return JSON.parse(Buffer.concat([decipher.update(Buffer.from(env.data, 'base64url')), decipher.final()]));
 }
 
-export function migrateRouteAuthData(input) {
+function migrateRouteAuthData(input) {
   const sourceVersion = Number(input?.schemaVersion || 1);
   if (!Number.isInteger(sourceVersion) || sourceVersion < 1) throw new Error('invalid store schemaVersion');
   if (sourceVersion > STORE_SCHEMA_VERSION) throw new Error(`store schemaVersion ${sourceVersion} is newer than supported ${STORE_SCHEMA_VERSION}`);

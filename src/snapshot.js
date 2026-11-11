@@ -4,7 +4,7 @@ import { b64u, timingEqual } from './security.js';
 import { agentSnapshotNodes } from './steering-topology.js';
 import { encodeNodes } from './node-wire.js';
 
-export const SNAPSHOT_SCHEMA_VERSION=1;
+const SNAPSHOT_SCHEMA_VERSION=1;
 
 const sha256=value=>b64u(crypto.createHash('sha256').update(value).digest());
 const deepFreeze=value=>{
