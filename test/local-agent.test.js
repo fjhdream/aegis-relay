@@ -61,6 +61,32 @@ test('local agent completes register, pull, verify, atomic apply and ACK', async
   } finally { fs.rmSync(dir,{recursive:true}); }
 });
 
+test('a snapshot the panel machine cannot store is recorded as rejected; it keeps serving and recovers', () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-local-refusal-')),file=path.join(dir,'aegis.enc.json'),cache=path.join(dir,'local.snapshot');
+  try {
+    const key=deriveKey('c'.repeat(32)),store=new Store(file,key);store.data.routes=[route()];store.save();
+    const agent=new LocalAgent({store,cacheFile:cache});
+    assert.equal(agent.start().ok,true);
+    const local=store.data.controlPlane.localAgent,record=store.data.agents.find(item=>item.id==='local'),served=agent.routeSource.getRoutes();
+    // The disk refuses the next snapshot: the copy of the current one cannot be put in place.
+    fs.mkdirSync(`${cache}.previous`);
+    store.data.routes[0].name='Changed';
+    assert.deepEqual(agent.snapshots.refresh(),['local']);
+    const status=agent.status();
+    assert.deepEqual([status.applyState,status.inSync,status.desiredRevision,status.appliedRevision,status.lastAck.status,status.lastAck.revision],['error',false,2,1,'rejected',2]);
+    assert.ok(status.error&&status.error===status.lastAck.error,'the reason is kept for the card');
+    assert.deepEqual([local.appliedRevision,record.applyState,record.appliedRevision,record.desiredRevision,record.proxyHealthy],[1,'error',1,2,false]);
+    assert.equal(agent.routeSource.getRoutes(),served,'the last good snapshot is still served');
+    assert.equal(agent.reconcile().ok,false,'and it stays refused while the disk does');
+    // The disk is fine again.
+    fs.rmdirSync(`${cache}.previous`);
+    assert.deepEqual(agent.reconcile(),{ok:true,decision:'apply',revision:2,hash:local.appliedHash});
+    const after=agent.status();
+    assert.deepEqual([after.applyState,after.inSync,after.appliedRevision,after.error,after.lastAck.status,record.applyState,record.appliedRevision],['active',true,2,null,'applied','active',2]);
+    assert.equal(agent.routeSource.getRoutes()[0].name,'Changed');
+  } finally { fs.rmSync(dir,{recursive:true}); }
+});
+
 test('legacy digest-only routes remain on the compatibility data source until rotated', () => {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-local-legacy-')),file=path.join(dir,'aegis.enc.json');
   try {
