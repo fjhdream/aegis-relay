@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 umask 077
-. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
+AEGIS_HERE=$(dirname "$0")
+if [ -f "$AEGIS_HERE/src/host-site.sh" ]; then . "$AEGIS_HERE/src/host-site.sh"; else . "$AEGIS_HERE/../src/host-site.sh"; fi
 INSTALL_DIR=$AEGIS_PANEL_DIR
 PROXY_DOMAIN=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')

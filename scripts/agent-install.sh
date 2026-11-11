@@ -133,8 +133,6 @@ agent_up(){
 }
 agent_up --remove-orphans
 install -m 0755 "$TMP_DIR/source/scripts/aegis-relay-agent" /usr/local/bin/aegis-relay-agent
-# The configure scripts source this one; it goes in first so they never run without it.
-install -m 0644 "$TMP_DIR/source/scripts/host-site.sh" "$INSTALL_DIR/host-site.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-domain.sh" "$INSTALL_DIR/agent-configure-domain.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-configure-ip.sh" "$INSTALL_DIR/agent-configure-ip.sh"
 install -m 0755 "$TMP_DIR/source/scripts/agent-host-domain-apply.sh" "$INSTALL_DIR/agent-host-domain-apply.sh"

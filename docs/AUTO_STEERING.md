@@ -509,7 +509,7 @@ mac   = HMAC-SHA256(steerKey, "token\n" ‖ 前面各字段)[0:16]
 | `scripts/configure-entry-domain.sh` | 入口域名的 Nginx 站点、webroot 证书与 ACME 验证转发；由 `aegis-relay entry` / `aegis-relay-agent entry` 调用 |
 | `web/` | 「自动切流」页、节点编辑里的自动切流开关 |
 
-测试：`test/steering.test.js`（判定、决策、令牌、网段、分段接续、引擎）、`test/steering-hub.test.js`（hub、切换效果、网段历史、拓扑、快照、统一出口、入口配置）、`test/steering-proxy.test.js`（经真实 HTTP 中继的跳转与落地）、`test/egress.test.js`（经真实 HTTP 的统一出口转发）、`test/entry-control.test.js`（面板本机入口请求）、`test/agent-api.test.js`（签名同步端点、入口配置下发）、`test/nginx-template.test.js`（入口域名配置）。
+测试：`test/steering.test.js`（判定、决策、令牌、网段、分段接续、引擎）、`test/steering-hub.test.js`（hub、切换效果、网段历史、拓扑、快照、统一出口、入口配置）、`test/steering-proxy.test.js`（经真实 HTTP 中继的跳转与落地）、`test/egress.test.js`（经真实 HTTP 的统一出口转发）、`test/entry-control.test.js`（面板本机入口请求）、`test/agent-api.test.js`（签名同步端点、入口配置下发）、`test/host-site.test.js`（入口域名配置）。
 
 ## 15. 上线步骤
 

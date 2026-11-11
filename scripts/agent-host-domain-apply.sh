@@ -1,7 +1,13 @@
 #!/bin/sh
 set -eu
 umask 077
-. "${AEGIS_HOST_SITE_LIB:-$(dirname "$0")/host-site.sh}"
+AEGIS_HERE=$(dirname "$0")
+# Without the library nothing can be done about a request (every installer copies src/, so this takes
+# a damaged install, or the instant an upgrade replaces src/). The request must not sit there
+# re-triggering this unit, and the agent must not wait for an answer that never comes: its `pending`
+# status goes too, so it files the request again on its next heartbeat.
+[ -f "$AEGIS_HERE/src/host-site.sh" ] || { rm -f "$AEGIS_HERE/data/host-domain-request.json" "$AEGIS_HERE/data/host-domain-status.json"; echo "src/host-site.sh is missing; run: sudo aegis-relay-agent update" >&2; exit 1; }
+. "$AEGIS_HERE/src/host-site.sh"
 DATA_DIR="$AEGIS_AGENT_DIR/data"
 REQUEST="$DATA_DIR/host-domain-request.json"
 
