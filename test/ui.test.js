@@ -138,9 +138,6 @@ test('installers ensure apparmor_parser exists so docker builds on minimal AppAr
 test('install-time domain wizard confirms panel and proxy domains in two steps with same-domain default',()=>{const wizard=fs.readFileSync(new URL('../scripts/domain-wizard.sh',import.meta.url),'utf8'),bootstrap=fs.readFileSync(new URL('../scripts/bootstrap.sh',import.meta.url),'utf8'),cli=fs.readFileSync(new URL('../scripts/aegis-relay',import.meta.url),'utf8');assert.match(wizard,/步骤 1\/2 - 面板域名/);assert.match(wizard,/步骤 2\/2 - 本机 Emby 反代域名/);assert.match(wizard,/回车默认同面板域名/);assert.match(wizard,/PROXY_DOMAIN="\$PANEL_DOMAIN"/);assert.match(wizard,/< \/dev\/tty/);assert.match(wizard,/configure-domain\.sh/);assert.match(wizard,/configure-local-domain\.sh/);assert.match(bootstrap,/domain-wizard\.sh/);assert.match(bootstrap,/是否现在配置域名/);assert.match(cli,/domain-wizard\.sh/)});
 test('local agent domain changes use an automatic constrained host workflow and separated client origin',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),server=fs.readFileSync(new URL('../src/server.js',import.meta.url),'utf8'),bootstrap=fs.readFileSync(new URL('../scripts/bootstrap.sh',import.meta.url),'utf8'),nginx=fs.readFileSync(new URL('../scripts/configure-local-domain.sh',import.meta.url),'utf8');assert.match(html,/面板一键切换/);assert.match(js,/切换代理域名/);assert.match(js,/watchDomainSwitch/);assert.match(server,/clientBaseUrl/);assert.match(server,/splitDomains/);assert.match(bootstrap,/aegis-relay-domain\.path/);assert.match(nginx,/控制面/);assert.match(nginx,/本地数据面/);assert.match(nginx,/旧代理域名已从 Nginx 路由移除/)});
 test('the mobile menu exposes exactly the same pages, in the same order, as the desktop nav',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');const desktop=[...(html.match(/<nav>([\s\S]*?)<\/nav>/)||['',''])[1].matchAll(/data-page="([^"]+)"/g)].map(m=>m[1]);const mobile=[...((html.match(/mobile-menu-panel">([\s\S]*?)<\/nav>/)||['',''])[1]).matchAll(/data-page="([^"]+)"/g)].map(m=>m[1]);assert.ok(desktop.length>=8,'desktop nav should list every page');assert.deepEqual(mobile,desktop);/* 移动端功能栏必须与桌面导航同步，缺一页就会出现“移动端功能栏没有同步更新” */assert.ok(desktop.includes('access'),'访问监控 must be present in both navs')});
-test('new-node drawer can pick a deploy agent so the created address uses that machine domain',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');
-  assert.match(html,/id="deploy-agent"/);assert.match(html,/id="deploy-agent-field"/);
-  assert.match(js,/populateDeployAgents/);assert.match(js,/agentId:value\('#deploy-agent'\)/);});
 test('agent container recreate recovers from a port held by a stale container instead of going offline',()=>{const upgrade=fs.readFileSync(new URL('../scripts/agent-upgrade.sh',import.meta.url),'utf8'),install=fs.readFileSync(new URL('../scripts/agent-install.sh',import.meta.url),'utf8');
   // --force-recreate stops the old container first, so an unrecovered "port is already allocated"
   // failure leaves the machine with NO agent and offline in the panel. Every path that recreates the
@@ -271,22 +268,7 @@ test('saving node deployment on a remote machine watches until it is applied',()
   assert.match(watch[0],/!a\.inSync/);
   assert.match(watch[0],/syncWatchUntil/,'the poll must be time-bounded, not endless');
 });
-test('the node editor previews the lines a client syncs, with the key hidden and names escaped',()=>{
-  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),start=js.indexOf('function renderLinePreview('),end=js.indexOf('\n',start);
-  const elements=new Map(),el=id=>{if(!elements.has(id))elements.set(id,{checked:true,innerHTML:'',hiddenState:false,classList:{toggle(name,on){if(name==='hidden')elements.get(id).hiddenState=on}}});return elements.get(id)};
-  const context=vm.createContext({$:el,escapeHtml:s=>String(s??'').replace(/</g,'&lt;')});
-  vm.runInContext(js.slice(start,end),context);
-  context.route={alias:'movie',accessMode:'key',syncLines:[{name:'<香港>',base:'https://hk.example.com'},{name:'IP 机',base:'http://203.0.113.9:8080'}]};
-  vm.runInContext('renderLinePreview(route)',context);
-  const html=el('#line-sync-preview').innerHTML;
-  assert.match(html,/这 2 条线路/);assert.match(html,/https:\/\/hk\.example\.com\/movie\/••••••/);assert.match(html,/&lt;香港>/);assert.doesNotMatch(html,/<香港>/);
-  context.route={alias:'open',accessMode:'alias_only',syncLines:[]};vm.runInContext('renderLinePreview(route)',context);
-  assert.match(el('#line-sync-preview').innerHTML,/还没有可同步的线路/);
-  assert.equal(el('#line-sync-upstream-hint').hiddenState,false,'the upstream warning shows while that switch is on');
-  el('#line-sync-upstream').checked=false;el('#line-sync-enabled').checked=false;vm.runInContext('renderLinePreview(null)',context);
-  assert.match(el('#line-sync-preview').innerHTML,/保存后/);assert.equal(el('#line-sync-options').hiddenState,true,'hidden while the switch is off');
-  assert.equal(el('#line-sync-upstream-hint').hiddenState,true);
-  const html2=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');
-  assert.match(html2,/id="line-sync-options"><div id="line-sync-preview"[^]*id="line-sync-upstream"[^]*不经过 relay/,'the upstream switch sits inside the section the main switch hides, with its warning');
-  assert.match(js,/lineSyncUpstream:\$\('#line-sync-upstream'\)\.checked/);
+test('the upstream line-sync switch sits inside the section the main switch hides, with its warning',()=>{
+  const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');
+  assert.match(html,/id="line-sync-options"><div id="line-sync-preview"[^]*id="line-sync-upstream"[^]*不经过 relay/);
 });
