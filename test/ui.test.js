@@ -123,8 +123,8 @@ test('dashboard shows daily values and per-machine proxy telemetry',()=>{const h
 test('panel icon is customizable from account settings via upload or server-side URL fetch',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),css=fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8'),server=fs.readFileSync(new URL('../src/server.js',import.meta.url),'utf8'),icon=fs.readFileSync(new URL('../src/panel-icon.js',import.meta.url),'utf8');assert.match(html,/id="icon-file"/);assert.match(html,/id="icon-url"/);assert.match(html,/id="icon-preview"/);assert.match(js,/applyPanelIcon/);assert.match(js,/\/account\/icon/);assert.match(js,/\/branding/);assert.match(css,/\.brand-mark img/);assert.match(server,/'GET \/branding'/);assert.match(server,/panelIcon/);assert.match(server,/fetchPanelIcon/);assert.match(icon,/guardedLookup\(false\)/);assert.match(icon,/MAX_ICON_BYTES = 256 \* 1024/);
   // The branding response must not be browser-cached, or a freshly saved icon reverts on refresh.
   const branding=server.match(/'GET \/branding':[^\n]*/);assert.ok(branding);assert.doesNotMatch(branding[0],/max-age/)});
-test('agents support IP reverse-proxy mode with panel-driven switching between domain and IP',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),api=fs.readFileSync(new URL('../src/agent-api.js',import.meta.url),'utf8'),install=fs.readFileSync(new URL('../scripts/agent-install.sh',import.meta.url),'utf8');assert.match(html,/留空＝用本机 IP 反代/);assert.match(js,/proxyMode/);assert.match(js,/IP 反代/);assert.match(api,/--mode ip/);assert.match(api,/desiredMode:agent\.desiredMode/);assert.match(install,/--mode\) MODE=/);assert.match(install,/agent-configure-ip\.sh/);const upgrade=fs.readFileSync(new URL('../scripts/agent-upgrade.sh',import.meta.url),'utf8');assert.match(upgrade,/install -m 0755 "\$TMP_DIR\/source\/scripts\/agent-configure-ip\.sh"/);assert.match(upgrade,/agent_serve_current/)});
-test('node table becomes cards on phones and the deploy picker is a selectable chip grid',()=>{const css=fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');assert.match(css,/@media\(max-width:760px\)\{[^]*\.data-table tr\{display:block/);assert.match(css,/\.agent-route-list\{[^}]*grid-template-columns:repeat\(auto-fill/);assert.match(css,/\.agent-route-list label\.checked\{/);assert.match(js,/route-bulk route-all/);assert.match(js,/route-bulk route-none/);assert.match(js,/classList\.toggle\('checked'/)});
+test('agents support IP reverse-proxy mode with panel-driven switching between domain and IP',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),api=fs.readFileSync(new URL('../src/agent-api.js',import.meta.url),'utf8'),install=fs.readFileSync(new URL('../scripts/agent-install.sh',import.meta.url),'utf8');assert.match(html,/留空＝用本机 IP 反代/);assert.match(api,/--mode ip/);assert.match(api,/desiredMode:agent\.desiredMode/);assert.match(install,/--mode\) MODE=/);assert.match(install,/agent-configure-ip\.sh/);const upgrade=fs.readFileSync(new URL('../scripts/agent-upgrade.sh',import.meta.url),'utf8');assert.match(upgrade,/install -m 0755 "\$TMP_DIR\/source\/scripts\/agent-configure-ip\.sh"/);assert.match(upgrade,/agent_serve_current/)});
+test('node table becomes cards on phones and the deploy picker is a selectable chip grid',()=>{const css=fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8');assert.match(css,/@media\(max-width:760px\)\{[^]*\.data-table tr\{display:block/);assert.match(css,/\.agent-route-list\{[^}]*grid-template-columns:repeat\(auto-fill/);assert.match(css,/\.agent-route-list label\.checked\{/)});
 test('the top-right mobile menu can reach every page including account, audit and deployment',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),css=fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');const menu=html.match(/<nav class="mobile-menu-panel">[\s\S]*?<\/nav>/);assert.ok(menu,'mobile menu exists');const pages=[...menu[0].matchAll(/data-page="([^"]+)"/g)].map(m=>m[1]);for(const page of ['dashboard','nodes','agents','traffic','diagnostics','notifications','audit','account','deployment'])assert.ok(pages.includes(page),`mobile menu missing ${page}`);assert.match(html,/id="nav-toggle"/);assert.match(css,/\.mobile-menu-panel\{/);assert.match(js,/nav-toggle'\)\.onclick/);assert.match(js,/function closeMenu/)});
 test('the panel and agent CLIs offer an interactive console and a confirmed one-click uninstall',()=>{const panel=fs.readFileSync(new URL('../scripts/aegis-relay',import.meta.url),'utf8'),agent=fs.readFileSync(new URL('../scripts/aegis-relay-agent',import.meta.url),'utf8');for(const c of [panel,agent]){assert.match(c,/ACTION=\$\{1:-menu\}/);assert.match(c,/AegisRelay .*控制台/);assert.match(c,/do_uninstall\(\)\{/);assert.match(c,/确认卸载请输入 yes/);assert.match(c,/rm -rf -- "\$INSTALL_DIR"/);assert.match(c,/uninstall\) do_uninstall/)}assert.match(panel,/aegis-relay-domain\.path/);assert.match(agent,/aegis-relay-agent-domain\.path/)});
 test('help.css no longer hardcodes a dark advanced-settings panel over the theme',()=>{const help=fs.readFileSync(new URL('../web/help.css',import.meta.url),'utf8');assert.doesNotMatch(help,/#0a1018/);assert.doesNotMatch(help,/\.advanced-settings\s*\{[^}]*background:[^};]*#[0-9a-fA-F]/)});
@@ -136,7 +136,7 @@ test('the panel installer confirms via a menu on /dev/tty before making any chan
   assert.ok(bootstrap.indexOf('AegisRelay 面板安装')<bootstrap.indexOf('apt-get update'),'confirmation runs before apt')});
 test('installers ensure apparmor_parser exists so docker builds on minimal AppArmor kernels',()=>{const bootstrap=fs.readFileSync(new URL('../scripts/bootstrap.sh',import.meta.url),'utf8'),agent=fs.readFileSync(new URL('../scripts/agent-install.sh',import.meta.url),'utf8');for(const s of [bootstrap,agent]){assert.match(s,/command -v apparmor_parser/);assert.match(s,/apt-get install -y apparmor/)}});
 test('install-time domain wizard confirms panel and proxy domains in two steps with same-domain default',()=>{const wizard=fs.readFileSync(new URL('../scripts/domain-wizard.sh',import.meta.url),'utf8'),bootstrap=fs.readFileSync(new URL('../scripts/bootstrap.sh',import.meta.url),'utf8'),cli=fs.readFileSync(new URL('../scripts/aegis-relay',import.meta.url),'utf8');assert.match(wizard,/步骤 1\/2 - 面板域名/);assert.match(wizard,/步骤 2\/2 - 本机 Emby 反代域名/);assert.match(wizard,/回车默认同面板域名/);assert.match(wizard,/PROXY_DOMAIN="\$PANEL_DOMAIN"/);assert.match(wizard,/< \/dev\/tty/);assert.match(wizard,/configure-domain\.sh/);assert.match(wizard,/configure-local-domain\.sh/);assert.match(bootstrap,/domain-wizard\.sh/);assert.match(bootstrap,/是否现在配置域名/);assert.match(cli,/domain-wizard\.sh/)});
-test('local agent domain changes use an automatic constrained host workflow and separated client origin',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),server=fs.readFileSync(new URL('../src/server.js',import.meta.url),'utf8'),bootstrap=fs.readFileSync(new URL('../scripts/bootstrap.sh',import.meta.url),'utf8'),nginx=fs.readFileSync(new URL('../scripts/configure-local-domain.sh',import.meta.url),'utf8');assert.match(html,/面板一键切换/);assert.match(js,/切换代理域名/);assert.match(js,/watchDomainSwitch/);assert.match(server,/clientBaseUrl/);assert.match(server,/splitDomains/);assert.match(bootstrap,/aegis-relay-domain\.path/);assert.match(nginx,/控制面/);assert.match(nginx,/本地数据面/);assert.match(nginx,/旧代理域名已从 Nginx 路由移除/)});
+test('local agent domain changes use an automatic constrained host workflow and separated client origin',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),server=fs.readFileSync(new URL('../src/server.js',import.meta.url),'utf8'),bootstrap=fs.readFileSync(new URL('../scripts/bootstrap.sh',import.meta.url),'utf8'),nginx=fs.readFileSync(new URL('../scripts/configure-local-domain.sh',import.meta.url),'utf8');assert.match(html,/面板一键切换/);assert.match(server,/clientBaseUrl/);assert.match(server,/splitDomains/);assert.match(bootstrap,/aegis-relay-domain\.path/);assert.match(nginx,/控制面/);assert.match(nginx,/本地数据面/);assert.match(nginx,/旧代理域名已从 Nginx 路由移除/)});
 test('the mobile menu exposes exactly the same pages, in the same order, as the desktop nav',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');const desktop=[...(html.match(/<nav>([\s\S]*?)<\/nav>/)||['',''])[1].matchAll(/data-page="([^"]+)"/g)].map(m=>m[1]);const mobile=[...((html.match(/mobile-menu-panel">([\s\S]*?)<\/nav>/)||['',''])[1]).matchAll(/data-page="([^"]+)"/g)].map(m=>m[1]);assert.ok(desktop.length>=8,'desktop nav should list every page');assert.deepEqual(mobile,desktop);/* 移动端功能栏必须与桌面导航同步，缺一页就会出现“移动端功能栏没有同步更新” */assert.ok(desktop.includes('access'),'访问监控 must be present in both navs')});
 test('agent container recreate recovers from a port held by a stale container instead of going offline',()=>{const upgrade=fs.readFileSync(new URL('../scripts/agent-upgrade.sh',import.meta.url),'utf8'),install=fs.readFileSync(new URL('../scripts/agent-install.sh',import.meta.url),'utf8');
   // --force-recreate stops the old container first, so an unrecovered "port is already allocated"
@@ -171,18 +171,7 @@ test('a broken third-party APT repo cannot abort installers or entry reconfigura
   const upgrade=fs.readFileSync(new URL('../scripts/agent-upgrade.sh',import.meta.url),'utf8');
   assert.doesNotMatch(upgrade,/agent_serve_current[^\n]*\|\| true/,'upgrade must not silently swallow a failed entry reconfigure');
   assert.match(upgrade,/Nginx 仍沿用旧配置/,'upgrade should warn that the new Nginx tuning was not applied');});
-test('agent cards can be renamed and reordered from the panel',()=>{const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),css=fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8');
-  // rename: the PATCH endpoint already accepted a name, the card just had no field for it
-  assert.match(js,/class="agent-name"/);
-  assert.match(js,/JSON\.stringify\(\{name,routeIds\}\)/);
-  assert.match(js,/机器名称不能为空/);
-  // the name is edited in place on the card title, not in a separate labelled row
-  assert.match(js,/<h3><input class="agent-name"/);
-  assert.doesNotMatch(js,/<label>机器名称/);
-  // reorder: drag the card by a handle, same interaction as the node table
-  assert.match(js,/bindAgentDrag/);assert.match(js,/persistAgentOrder/);
-  assert.match(js,/dragAgentId/);
-  assert.doesNotMatch(js,/move-up|move-down/);
+test('a machine card can be dragged, and its title holds the name field without losing its status dot',()=>{const css=fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8');
   assert.match(css,/\.agent-card\.dragging/);
   assert.match(css,/\.agent-card\.drop-above/);
   // the status dot is drawn with h3:before, so the h3 must survive the inline input
@@ -226,22 +215,8 @@ test('compose files avoid default-value interpolation that older docker-compose 
 // deployed nodes must not carry `domain` — otherwise the server's local-agent domain validation
 // ("代理域名不能与面板域名相同" / "本机代理域名不能为空") rejects the whole PATCH and the node
 // selection is silently discarded, leaving the panel machine permanently serving every node.
-test('deploying nodes and switching the proxy domain are separate agent-card actions',()=>{
-  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),
-        css=fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8');
-  const save=js.match(/\.save-agent'\)\.onclick=async\(\)=>\{[\s\S]*?\};\n/);
-  assert.ok(save,'the agent card must keep a .save-agent handler');
-  assert.match(save[0],/routeIds/);
-  assert.doesNotMatch(save[0],/domain/,'saving nodes must not submit the proxy domain');
-  assert.doesNotMatch(save[0],/watchDomainSwitch/);
-  const swap=js.match(/\.switch-domain'\);if\(switchDomain\)switchDomain\.onclick=async\(\)=>\{[\s\S]*?\};\n/);
-  assert.ok(swap,'the proxy domain must have its own button');
-  assert.match(swap[0],/JSON\.stringify\(\{domain\}\)/,'the domain button submits only the domain');
-  assert.doesNotMatch(swap[0],/routeIds/);
-  assert.match(swap[0],/watchDomainSwitch/);
-  assert.match(js,/class="btn ghost switch-domain"/);
-  assert.doesNotMatch(js,/save-agent" \$\{working\?'disabled':''\}/,'a pending domain switch must not block node deployment');
-  assert.match(css,/\.agent-domain-row/);
+test('the proxy domain has a row of its own on the machine card',()=>{
+  assert.match(fs.readFileSync(new URL('../web/style.css',import.meta.url),'utf8'),/\.agent-domain-row/);
 });
 
 // The deploy-target selector must be exclusive: if every new node were also deployed to the panel
@@ -256,18 +231,6 @@ test('the new-node drawer tells the operator the panel machine no longer serves 
 // Saving a node selection on a remote machine takes effect on that machine's next heartbeat, so the
 // card is briefly 「等待同步」. Without a follow-up poll the operator is left staring at a stale card
 // and concludes the de-selection did nothing.
-test('saving node deployment on a remote machine watches until it is applied',()=>{
-  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');
-  assert.match(js,/function watchAgentSync\(\)/);
-  const save=js.match(/\.save-agent'\)\.onclick=async\(\)=>\{[\s\S]*?\};\n/);
-  assert.ok(save);
-  assert.match(save[0],/watchAgentSync\(\)/,'a remote save must poll until the machine reports in sync');
-  assert.match(save[0],/正在下发到该机器/,'the toast must say the change is still being pushed');
-  const watch=js.match(/function watchAgentSync\(\)\{[\s\S]*?\n\}/);
-  assert.ok(watch);
-  assert.match(watch[0],/!a\.inSync/);
-  assert.match(watch[0],/syncWatchUntil/,'the poll must be time-bounded, not endless');
-});
 test('the upstream line-sync switch sits inside the section the main switch hides, with its warning',()=>{
   const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');
   assert.match(html,/id="line-sync-options"><div id="line-sync-preview"[^]*id="line-sync-upstream"[^]*不经过 relay/);

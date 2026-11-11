@@ -235,3 +235,104 @@ test('every element view.js writes to is in the page',()=>{
   assert.ok(named.length>30);
   assert.deepEqual(named.filter(id=>!ids.has(id)),[]);
 });
+
+// ---------------------------------------------------------------------------------------------------
+// Machines.
+const machine=(extra={})=>({id:'hk',name:'HK',transport:'poll',domain:'hk.example.com',proxyMode:'domain',status:'online',routeIds:['r1'],lastSeen:'2026-11-11T08:00:00Z',applyState:'active',inSync:true,error:'',canDelete:true,agentVersion:'1.2.0',domainChange:null,...extra});
+const cardsOf=(agents,routes=[node()],panelVersion='1.2.0')=>view.agentsView({agents,routes,panelVersion})['#agent-grid'].html.split('<article class="node-card agent-card"').slice(1);
+const cardOf=(agent,routes,panelVersion)=>cardsOf([agent],routes,panelVersion)[0];
+
+test('a machine card says how the machine is doing, and escapes everything it was told',()=>{
+  const card=cardOf(machine({id:'a"b',name:'<HK>',domain:'h<k.example.com',error:'EISDIR <x>'}));
+  assert.ok(card.startsWith(' data-id="a&quot;b" data-status="online">'));
+  for(const text of ['<h3><input class="agent-name" value="&lt;HK&gt;" maxlength="80"','<span class="node-path">安全轮询</span>','<span class="pill on">配置已同步</span>','<span class="pill on">在线</span>','<span class="pill info">HTTPS 域名</span>','<span class="pill info">代理运行中</span>',
+    '<small>当前生效域名</small><strong>h&lt;k.example.com</strong>','<small>已选节点</small><strong>1 个</strong>','v1.2.0 <span style="color:var(--green)">· 最新</span>',`<small>最近回执</small><strong>${view.localTime('2026-11-11T08:00:00Z')}</strong>`,
+    '<input class="agent-domain" value="h&lt;k.example.com" placeholder="留空＝用本机 IP 反代" >','<button type="button" class="btn ghost switch-domain" >切换代理域名</button>','<button class="btn primary save-agent">保存名称与节点</button>','delete-agent','draggable="true"',
+    '<div class="node-test show"><span class="bad">●</span>&nbsp;EISDIR &lt;x&gt;</div>'])assert.ok(card.includes(text),text);
+  assert.doesNotMatch(card,/<HK>|h<k|<x>|<label>机器名称|move-up|move-down|待升级/);
+  // What the panel does not know it does not make up.
+  const fresh=cardOf(machine({status:'stale',applyState:'waiting',inSync:false,lastSeen:null,domain:'',agentVersion:'',canDelete:false}),[node()],'');
+  for(const text of ['<span class="pill warn">等待同步</span>','<span class="pill warn">连接延迟</span>','<span class="pill warn">已注册 · 等待配置</span>','<strong>尚未设置</strong>','<strong>未知</strong>','<strong>尚未连接</strong>'])assert.ok(fresh.includes(text),text);
+  assert.doesNotMatch(fresh,/delete-agent|node-test/);
+  assert.deepEqual(['offline','revoked','something new'].map(status=>/<div class="tag-row"><span class="pill warn">([^<]+)</.exec(cardOf(machine({status})))[1]),['失联','已撤销','失联']);
+  assert.ok(cardOf(machine({applyState:'error'})).includes('<span class="pill warn">新配置未生效</span>'));
+});
+
+test('the panel machine and a machine on its IP are shown for what they are',()=>{
+  const local=cardOf(machine({id:'local',transport:'loopback',agentVersion:'',canDelete:false,domain:'emby.example.com'}));
+  for(const text of ['<span class="node-path">本机环回</span>','placeholder="emby.example.com"','必须与面板域名不同','v1.2.0 <span style="color:var(--green)">· 最新</span>'])assert.ok(local.includes(text),text);
+  assert.doesNotMatch(local,/HTTPS 域名|IP 反代<\/span>|delete-agent/);
+  const ip=cardOf(machine({proxyMode:'ip',domain:'203.0.113.9'}));
+  for(const text of ['<span class="pill ">IP 反代</span>','<strong>IP 反代 · 203.0.113.9</strong>','<input class="agent-domain" value="" placeholder="留空＝用本机 IP 反代" >','留空则以本机公网 IP 明文 HTTP 反代'])assert.ok(ip.includes(text),text);
+  assert.ok(cardOf(machine({proxyMode:'ip',domain:''})).includes('<strong>IP 反代</strong>'));
+});
+
+test('a change of address under way locks the address field, never the node selection; one that failed says why',()=>{
+  const working=cardOf(machine({domainChange:{state:'applying',mode:'domain',desiredDomain:'new.example.com',message:'正在申请证书 <1>'}}));
+  for(const text of ['<span class="pill warn">正在配置域名</span>','<input class="agent-domain" value="new.example.com" placeholder="留空＝用本机 IP 反代" disabled>','<button type="button" class="btn ghost switch-domain" disabled>','<button class="btn primary save-agent">',
+    '<div class="node-test show"><span class="warn">●</span>&nbsp;正在申请证书 &lt;1&gt; · 目标 new.example.com</div>'])assert.ok(working.includes(text),text);
+  const toIp=cardOf(machine({domainChange:{state:'pending',mode:'ip',desiredDomain:'',message:'等待机器切换'}}));
+  for(const text of ['<span class="pill warn">正在切换 IP 反代</span>','<input class="agent-domain" value="" placeholder="留空＝用本机 IP 反代" disabled>','等待机器切换 · 目标 IP 反代</div>'])assert.ok(toIp.includes(text),text);
+  const failed=cardOf(machine({error:'not shown beside a change',domainChange:{state:'failed',mode:'domain',desiredDomain:'bad.example.com',message:'certbot: "bad"'}}));
+  for(const text of ['<input class="agent-domain" value="bad.example.com" placeholder="留空＝用本机 IP 反代" >','<span class="bad">●</span>&nbsp;certbot: &quot;bad&quot; · 目标 bad.example.com</div>','<span class="pill info">代理运行中</span>'])assert.ok(failed.includes(text),text);
+  assert.doesNotMatch(failed,/not shown beside a change|disabled/);
+  // A change that named the address already served has no target worth repeating.
+  assert.ok(cardOf(machine({domainChange:{state:'active',mode:'domain',desiredDomain:'hk.example.com',message:'已切换'}})).includes('<span class="good">●</span>&nbsp;已切换</div>'));
+});
+
+test('a machine behind the panel\'s version is told how to catch up',()=>{
+  const old=cardOf(machine({agentVersion:'1.1.0<'}));
+  for(const text of ['<span class="pill warn" title="该机器仍在运行旧版本代理程序">待升级 1.1.0&lt;</span>','v1.1.0&lt; <span style="color:var(--amber)">· 待升级</span>','代理程序 1.1.0&lt; 落后于面板 1.2.0，在该机器执行：<code>sudo aegis-relay-agent update</code>'])assert.ok(old.includes(text),text);
+  assert.doesNotMatch(cardOf(machine()),/待升级|aegis-relay-agent update/);
+  // A panel that does not say its version cannot call anything old.
+  assert.doesNotMatch(cardOf(machine({agentVersion:'1.1.0'}),[node()],''),/待升级|最新|aegis-relay-agent update/);
+});
+
+test('a card lists every node, ticks the ones the machine carries, and offers a search only for a long list',()=>{
+  const routes=Array.from({length:9},(_,i)=>node({id:`r${i+1}`,name:i?`Node ${i+1}`:'A<B',alias:`n${i+1}`})),card=cardOf(machine({routeIds:['r1','r3']}),routes);
+  for(const text of ['<span class="routes-count">已选 2 / 9</span>','<button type="button" class="route-bulk route-all">全选</button><button type="button" class="route-bulk route-none">全不选</button><input class="agent-route-search" placeholder="搜索节点">',
+    '<label class="checked" data-search="a&lt;b n1"><input type="checkbox" data-route-id="r1" checked><span><b>A&lt;B</b><small>/n1/</small></span></label>','<label class="" data-search="node 2 n2"><input type="checkbox" data-route-id="r2" ><span>'])assert.ok(card.includes(text),text);
+  assert.equal(card.split('data-route-id=').length-1,9);
+  const few=cardOf(machine(),routes.slice(0,8));
+  assert.ok(few.includes('route-bulk route-all')&&!few.includes('agent-route-search'));
+  const none=cardOf(machine({routeIds:[]}),[]);
+  assert.ok(none.includes('<div class="agent-route-list"><small>请先创建 Emby 节点</small></div>')&&none.includes('已选 0 / 0')&&!none.includes('route-bulk'));
+  assert.equal(view.routesChosen(3,9),'已选 3 / 9');
+});
+
+test('with no machine yet the page offers to add the first one',()=>{
+  const html=view.agentsView({agents:[],routes:[],panelVersion:'1.2.0'})['#agent-grid'].html;
+  assert.ok(html.startsWith('<article class="panel empty-state">')&&html.includes('<h3>添加第一台代理机器</h3>')&&html.includes('<button class="btn primary open-agent">添加机器</button>'));
+  assert.equal(cardsOf([machine({id:'a'}),machine({id:'b'})]).length,2);
+});
+
+test('saving a card sends its name and nodes and never its address; a remote machine is then watched',()=>{
+  const remote=view.agentSave(machine(),{name:'  HK 2 ',routeIds:['r1','r2']});
+  assert.deepEqual(remote,{body:{name:'HK 2',routeIds:['r1','r2']},message:'已保存，正在下发到该机器…',watch:true});
+  assert.deepEqual(Object.keys(remote.body),['name','routeIds'],'the address is not part of a save');
+  assert.deepEqual(view.agentSave(machine({id:'local'}),{name:'本机',routeIds:[]}),{body:{name:'本机',routeIds:[]},message:'代理机器配置已保存',watch:false});
+  assert.deepEqual([view.agentSave(machine(),{name:'   ',routeIds:['r1']}),view.agentSave(machine(),{name:'',routeIds:[]})],[{error:'机器名称不能为空'},{error:'机器名称不能为空'}]);
+  // Watched for: a machine that is there and has not applied its configuration. The panel machine applies at once.
+  assert.deepEqual([[machine({inSync:false})],[machine({inSync:false,status:'offline'})],[machine({id:'local',inSync:false})],[machine()],[],[machine(),machine({id:'b',inSync:false,status:'stale'})]].map(view.awaitingSync),[true,false,false,false,false,true]);
+});
+
+test('the address button sends only the address, and nothing when it is the one already served',()=>{
+  assert.deepEqual(view.domainSwitch(machine(),' new.example.com '),{unchanged:false,body:{domain:'new.example.com'},message:'域名切换已提交，正在申请证书'});
+  assert.deepEqual(view.domainSwitch(machine(),''),{unchanged:false,body:{domain:''},message:'已提交：切换为 IP 反代（HTTP）'});
+  assert.deepEqual(view.domainSwitch(machine(),'hk.example.com'),{unchanged:true,message:'代理域名没有变化，无需切换'});
+  // A machine on its IP serves on no domain: leaving the field empty changes nothing, a name does.
+  const ip=machine({proxyMode:'ip',domain:'203.0.113.9'});
+  assert.deepEqual([view.domainSwitch(ip,'  ').unchanged,view.domainSwitch(ip,'203.0.113.9').body,view.domainSwitch(machine({domain:''}),'').unchanged],[true,{domain:'203.0.113.9'},true]);
+  const changing=state=>machine({domainChange:{state,message:state==='failed'?'certbot said no':''}});
+  assert.deepEqual([view.switchProgress([machine(),changing('pending')]),view.switchProgress([changing('applying'),changing('failed')]),view.switchProgress([changing('failed')]),view.switchProgress([machine({domainChange:{state:'failed'}})]),view.switchProgress([changing('active')]),view.switchProgress([])],
+    [{working:true,failure:''},{working:true,failure:'certbot said no'},{working:false,failure:'certbot said no'},{working:false,failure:'切换失败'},{working:false,failure:''},{working:false,failure:''}]);
+});
+
+test('adding a machine starts from an empty form listing the nodes, and ends with a command that expires',()=>{
+  const form=view.enrollFormView([node({id:'r1',name:'A<B',alias:'ab'}),node({id:'r2',name:'Shows',alias:'shows'})]);
+  assert.deepEqual([form['#agent-name'],form['#agent-domain-new'],form['#agent-command-wrap'],form['#agent-enroll-form']],[{value:''},{value:''},{hidden:true},{hidden:false}]);
+  assert.equal(form['#agent-enroll-routes'].html,'<label><input type="checkbox" data-enroll-route="r1"><span><b>A&lt;B</b><small>/ab/</small></span></label><label><input type="checkbox" data-enroll-route="r2"><span><b>Shows</b><small>/shows/</small></span></label>');
+  assert.equal(view.enrollFormView([])['#agent-enroll-routes'].html,'<small>暂时不部署节点，注册后仍可选择。</small>');
+  const made=view.enrollmentView({command:'curl … | sudo sh -s -- --name \'HK <2>\'',expiresAt:'2026-11-11T08:10:00Z'});
+  assert.deepEqual(made,{'#agent-command':{text:'curl … | sudo sh -s -- --name \'HK <2>\''},'#agent-command-expiry':{text:`有效期至 ${new Date('2026-11-11T08:10:00Z').toLocaleTimeString()}`},'#agent-enroll-form':{hidden:true},'#agent-command-wrap':{hidden:false}});
+});
