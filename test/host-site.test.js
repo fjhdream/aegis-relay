@@ -651,13 +651,16 @@ const APPLIERS={
     prepare:()=>agentOnItsIp(),run:(h,extra)=>h.run('host-entry-apply.sh',[h.dir('agent')],extra),acted:h=>h.enabled('aegis-relay-entry')}
 };
 const readJson=file=>{try{return JSON.parse(fs.readFileSync(file,'utf8'))}catch{return null}};
+// The logs two of the scripts keep in /tmp while they work.
+const hostLogs=()=>fs.readdirSync('/tmp').filter(name=>/^aegis-(entry-)?domain\./.test(name)).sort();
 
 test('a request is acted on only if it is a small regular file; anything else at its name is taken away unread',{skip:!PYTHON&&'python3 is not installed'},()=>{
   for(const [script,applier] of Object.entries(APPLIERS)){
     // What a container files, handled.
     const fine=applier.prepare(),at=h=>path.join(h.dir(applier.data),applier.request),statusOf=h=>path.join(h.dir(applier.data),applier.status);
     fs.writeFileSync(at(fine),JSON.stringify(applier.good));
-    const handled=applier.run(fine);
+    const logsBefore=hostLogs(),handled=applier.run(fine);
+    assert.deepEqual(hostLogs().filter(name=>!logsBefore.includes(name)),[],`${script}: no log is left in /tmp`);
     assert.deepEqual([handled.status,fs.existsSync(at(fine)),applier.acted(fine),readJson(statusOf(fine)).state,readJson(statusOf(fine)).requestId,fs.statSync(statusOf(fine)).mode&0o777],[0,false,true,'active',applier.good.requestId,0o644],`${script}: ${handled.output}`);
     assert.deepEqual(fine.leftovers(),[],script);
     // The data directory belongs to the container's user, so anything can be at the request's name.
@@ -670,7 +673,13 @@ test('a request is acted on only if it is a small regular file; anything else at
       'a request far larger than any real one':(h,file)=>fs.writeFileSync(file,text+' '.repeat(70_000)),
       'a file that pretends to be huge':(h,file)=>{fs.writeFileSync(file,text);fs.truncateSync(file,512*1024*1024)},
       'a list instead of an object':(h,file)=>fs.writeFileSync(file,JSON.stringify([applier.good])),
-      'bytes that are not text':(h,file)=>fs.writeFileSync(file,Buffer.from([0xff,0xfe,0x00,0x7b]))
+      'bytes that are not text':(h,file)=>fs.writeFileSync(file,Buffer.from([0xff,0xfe,0x00,0x7b])),
+      // Valid but for one byte in a field no script reads. The shell drops a NUL from what it captures
+      // and python lets a stray byte through where the locale is C, as it is under systemd: the request
+      // must be judged as the bytes it is.
+      'a NUL byte in a field nobody reads':(h,file)=>fs.writeFileSync(file,Buffer.concat([Buffer.from(`${text.slice(0,-1)},"note":"a`),Buffer.from([0]),Buffer.from('b"}')])),
+      'a byte that is not UTF-8 in a field nobody reads':(h,file)=>fs.writeFileSync(file,Buffer.concat([Buffer.from(`${text.slice(0,-1)},"note":"a`),Buffer.from([0xff]),Buffer.from('b"}')])),
+      'the request in UTF-16':(h,file)=>fs.writeFileSync(file,Buffer.from(`\ufeff${text}`,'utf16le'))
     };
     for(const [what,plant] of Object.entries(planted)){
       const h=applier.prepare(),file=at(h),status=readJson(statusOf(h)),calls=h.calls().length,started=Date.now();
@@ -700,6 +709,7 @@ def mkstemp(*args, **kwargs):
     if '-status.' in os.path.basename(name):
         os.unlink(name)
         os.symlink(os.environ['TEST_VICTIM'], name)
+        open(os.environ['TEST_VICTIM'] + '.swapped', 'w').close()
     return descriptor, name
 tempfile.mkstemp = mkstemp
 `);
@@ -708,22 +718,131 @@ tempfile.mkstemp = mkstemp
     fs.writeFileSync(victim,'root only\n');fs.chmodSync(victim,0o600);
     fs.writeFileSync(path.join(h.dir(applier.data),applier.request),JSON.stringify(applier.good));
     applier.run(h,{PYTHONPATH:wrap,TEST_VICTIM:victim});
+    assert.ok(fs.existsSync(`${victim}.swapped`),`${script}: the temporary file was swapped for a link (otherwise this test shows nothing)`);
     assert.deepEqual([fs.readFileSync(victim,'utf8'),fs.statSync(victim).mode&0o777,applier.acted(h)],['root only\n',0o600,true],script);
   }
 });
 
-test('an apply script that has lost the library drops the request instead of spinning on it',()=>{
+test('a request is handed on as one line of ASCII JSON, whatever it looked like in the file',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  const h=host(),file=path.join(h.dir('agent/data'),'request.json'),read=()=>spawnSync('/bin/sh',['-c','. "$1"; host_request_json "$2"','sh',LIBRARY,file],{env:{PATH:process.env.PATH}});
+  // Spread over lines, with text outside ASCII, a control character and a lone surrogate as JSON may write them.
+  const request={requestId:'request-0001',note:'域名 – é\u0001',list:['a',1,null,true],nested:{'键':'\ud83d\ude00'},lone:'\ud800'};
+  fs.writeFileSync(file,JSON.stringify(request,null,2).replace('é','\\u00e9'));
+  const out=read();
+  assert.equal(out.status,0);
+  assert.ok(out.stdout.every(byte=>byte===0x0a||(byte>=0x20&&byte<0x7f)),'nothing but printable ASCII');
+  assert.deepEqual([out.stdout.toString().match(/\n/g).length,out.stdout.toString().endsWith('\n'),JSON.parse(out.stdout.toString())],[1,true,request]);
+  // Only an object is a request.
+  for(const text of ['[{"requestId":"request-0001"}]','"request"','7','null','true','','{"a":1}{"b":2}','{"a":1,}']){
+    fs.writeFileSync(file,text);
+    const refused=read();
+    assert.deepEqual([refused.status,refused.stdout.length],[1,0],JSON.stringify(text));
+  }
+});
+
+// What a container would put after a line break to have root's Nginx do its bidding.
+const SMUGGLED=';\naccess_log /etc/written-by-root;\nlocation /taken { return 200 "taken"; }\nif ($host != x';
+const sitesOf=h=>fs.readdirSync(path.join(h.dir('nginx'),'sites-available')).map(name=>fs.readFileSync(path.join(h.dir('nginx'),'sites-available',name),'utf8')).join('\n');
+
+test('a request with a line break in a field is never acted on: one line passing a check must not carry the others into Nginx',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  // grep, and `$` in a pattern, judge a line at a time; and the fields are handed to the shell one per
+  // line. So a value of several lines could pass on the strength of one of them, or move the fields
+  // after it up by one.
+  for(const [script,applier] of Object.entries(APPLIERS)){
+    const good=applier.good,texts=Object.keys(good).filter(name=>typeof good[name]==='string'&&name!=='mode'),requests=[];
+    for(const name of texts)requests.push(
+      [`${name}, then more lines`,{...good,[name]:`${good[name]}\n${SMUGGLED}`}],[`${name} after other lines`,{...good,[name]:`${SMUGGLED}\n${good[name]}`}],
+      [`${name} ending in a line break`,{...good,[name]:`${good[name]}\n`}],[`${name}, then a carriage return and more lines`,{...good,[name]:`${good[name]}\r\n${SMUGGLED}`}],
+      [`${name} ending in a carriage return`,{...good,[name]:`${good[name]}\r`}]);
+    // Each field followed by the value of the next: unnoticed, it would stand in for that field.
+    for(let i=0;i+1<texts.length;i++)requests.push([`${texts[i]} carrying the next field's value`,{...good,[texts[i]]:`${good[texts[i]]}\n${good[texts[i+1]]}`}]);
+    if(good.peers)requests.push(['a peer ending in a line break',{...good,peers:[`${good.peers[0]}\n`]}],['a peer, then more lines',{...good,peers:[`${good.peers[0]}\n${SMUGGLED}`]}],['a peer after other lines',{...good,peers:[`${SMUGGLED}\n${good.peers[0]}`]}]);
+    const h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request),status=readJson(path.join(h.dir(applier.data),applier.status)),sites=sitesOf(h);
+    for(const [what,request] of requests){
+      const calls=h.calls().length;
+      fs.writeFileSync(file,JSON.stringify(request));
+      const result=applier.run(h);
+      assert.deepEqual([result.status,fs.existsSync(file)],[1,false],`${script}, ${what}: ${result.output}`);
+      assert.deepEqual([applier.acted(h),readJson(path.join(h.dir(applier.data),applier.status)),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call)),sitesOf(h)===sites],[false,status,[],true],`${script}, ${what}: nothing was done`);
+    }
+    // The same host still does what a well-formed request asks.
+    fs.writeFileSync(file,JSON.stringify(good));
+    assert.deepEqual([applier.run(h).status,applier.acted(h)],[0,true],script);
+  }
+});
+
+test('a value with a line break in it is refused by every script that is given one on its command line',()=>{
+  // These are run by an operator, and by the apply scripts with values that have been checked; the
+  // check each makes itself must still hold for the whole value.
   const agent=agentOnItsIp(),panel=host();
-  for(const [h,src,data,request,run] of [
-    [agent,'agent/src','agent/data','host-entry-request.json',()=>agent.run('host-entry-apply.sh',[agent.dir('agent')])],
-    [panel,'panel/src','panel/data','host-domain-request.json',()=>panel.run('host-domain-apply.sh')]
+  assert.equal(panel.run('configure-domain.sh',['panel.example.com','ops@example.com']).status,0);
+  const before={agent:[sitesOf(agent),agent.calls().length],panel:[sitesOf(panel),panel.calls().length]};
+  for(const [h,which,script,args,says] of [
+    [agent,'agent','agent-configure-domain.sh',[`hk.example.com\n${SMUGGLED}`,'ops@example.com'],/域名格式无效/],
+    [agent,'agent','agent-configure-domain.sh',[`${SMUGGLED}\nhk.example.com`,'ops@example.com'],/域名格式无效/],
+    [agent,'agent','agent-configure-domain.sh',['hk.example.com',`ops@example.com\n${SMUGGLED}`],/邮箱格式无效/],
+    [agent,'agent','aegis-relay-agent',['domain',`hk.example.com\n${SMUGGLED}`,'ops@example.com'],/域名格式无效/],
+    [agent,'agent','configure-entry-domain.sh',[`entry.example.com\n${SMUGGLED}`,'ops@example.com'],/入口域名格式无效/],
+    [agent,'agent','configure-entry-domain.sh',['entry.example.com',`ops@example.com\n${SMUGGLED}`],/证书邮箱格式无效/],
+    [panel,'panel','configure-domain.sh',[`other.example.com\n${SMUGGLED}`,'ops@example.com'],/域名格式无效/],
+    [panel,'panel','configure-domain.sh',['other.example.com',`ops@example.com\n${SMUGGLED}`],/邮箱格式无效/],
+    [panel,'panel','configure-local-domain.sh',[`emby.example.com\n${SMUGGLED}`,'ops@example.com'],/代理域名格式无效/],
+    [panel,'panel','configure-local-domain.sh',['emby.example.com',`ops@example.com\n${SMUGGLED}`],/证书邮箱格式无效/]
   ]){
-    fs.rmSync(path.join(h.dir(src),'host-site.sh'));
-    // Without the library the only install directories these scripts will touch are the real ones, so
-    // the request in this temporary one stays; what matters is that they stop at once and say why.
-    fs.writeFileSync(path.join(h.dir(data),request),'{}');
-    const calls=h.calls().length,result=run();
-    assert.deepEqual([result.status,/host-site\.sh is missing/.test(result.output),h.since(calls)],[1,true,[]]);
+    const result=h.run(script,args),what=`${script} ${JSON.stringify(args)}: ${result.output}`;
+    assert.deepEqual([result.status,says.test(result.output)],[1,true],what);
+    assert.deepEqual([sitesOf(h)===before[which][0],h.since(before[which][1]).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call))],[true,[]],what);
+  }
+  // A peer of several lines is left out like any other name that is not a domain; the entry is still set up.
+  const entry=agent.run('configure-entry-domain.sh',['entry.example.com','ops@example.com','peer-a.example.com',`peer-b.example.com\n${SMUGGLED}`]);
+  assert.deepEqual([entry.status,agent.enabled('aegis-relay-entry'),/written-by-root|peer-b/.test(sitesOf(agent)),/peer-a\.example\.com/.test(agent.site('aegis-relay-entry'))],[0,true,false,true],entry.output);
+});
+
+test('the entry request says how many times it was tried in a whole number, and nothing that only looks like one',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  const applier=APPLIERS['host-entry-apply.sh'],h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request);
+  for(const attempt of [true,false,0,1001,1.5,'1',null,[1]]){
+    const calls=h.calls().length;
+    fs.writeFileSync(file,JSON.stringify({...applier.good,attempt}));
+    const result=applier.run(h);
+    assert.deepEqual([result.status,result.output,fs.existsSync(file),applier.acted(h),h.since(calls).filter(call=>/^(nginx|certbot|systemctl) /.test(call))],[1,'',false,false,[]],`attempt ${JSON.stringify(attempt)}`);
+  }
+  const {attempt,...unnumbered}=applier.good;
+  fs.writeFileSync(file,JSON.stringify(unnumbered));
+  assert.deepEqual([applier.run(h).status,readJson(path.join(h.dir(applier.data),applier.status)).attempt],[0,1],'a request that does not say is a first attempt');
+});
+
+// GNU mv can be told to rename and nothing else (host_rename); another mv moves a file into a
+// directory of that name, so there the agent's status would be written inside it.
+const GNU_MV=spawnSync('mv',['--version']).status===0;
+test('a request is gone when its script ends, even where the answer cannot be written',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  // The container made a directory where the status goes. The script cannot answer; it must still not
+  // leave the request to start it again and again, nor a log behind each time.
+  const logs=hostLogs;
+  for(const [script,applier] of Object.entries(APPLIERS)){
+    if(script==='agent-host-domain-apply.sh'&&!GNU_MV)continue;
+    const h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request),status=path.join(h.dir(applier.data),applier.status),before=logs();
+    fs.rmSync(status,{force:true});fs.mkdirSync(status);fs.writeFileSync(path.join(status,'inside'),'{}');
+    fs.writeFileSync(file,JSON.stringify(applier.good));
+    const calls=h.calls().length,result=applier.run(h);
+    assert.deepEqual([result.status,fs.existsSync(file),applier.acted(h),h.since(calls).filter(call=>/^(nginx|certbot|systemctl) /.test(call)),fs.readdirSync(status),logs().filter(name=>!before.includes(name)),h.leftovers()],
+      [1,false,false,[],['inside'],[],[]],`${script}: ${result.output}`);
+  }
+});
+
+test('an apply script that has lost the library takes the request and its unanswered status away, whatever they are',()=>{
+  // Each script can only reach the data directory by its own location, or (the entry script, which is
+  // told its install directory) one of the two real ones: so in this temporary host the entry script
+  // leaves the files, and what matters there is that it stops at once and says why.
+  for(const [script,prepare,src,data,name,run,takesAway] of [
+    ['agent-host-domain-apply.sh',agentOnItsIp,'agent/src','agent/data','host-domain',h=>h.run('agent-host-domain-apply.sh'),true],
+    ['host-domain-apply.sh',host,'panel/src','panel/data','host-domain',h=>h.run('host-domain-apply.sh'),true],
+    ['host-entry-apply.sh',agentOnItsIp,'agent/src','agent/data','host-entry',h=>h.run('host-entry-apply.sh',[h.dir('agent')]),false]
+  ])for(const what of ['files','directories']){
+    const h=prepare(),request=path.join(h.dir(data),`${name}-request.json`),status=path.join(h.dir(data),`${name}-status.json`);
+    fs.rmSync(path.join(h.dir(src),'host-site.sh'));fs.rmSync(status,{force:true});
+    for(const file of [request,status]){if(what==='files')fs.writeFileSync(file,'{"state":"pending"}');else{fs.mkdirSync(file);fs.writeFileSync(path.join(file,'inside'),'{}')}}
+    const calls=h.calls().length,result=run(h);
+    assert.deepEqual([result.status,/host-site\.sh is missing/.test(result.output),h.since(calls),fs.existsSync(request),fs.existsSync(status)],[1,true,[],!takesAway,!takesAway],`${script}, ${what}: ${result.output}`);
   }
 });
 

@@ -21,8 +21,8 @@ ENTRY=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
 EMAIL=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 shift 2
 DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
-printf '%s' "$ENTRY" | grep -Eq "$DOMAIN_RE" || { echo "入口域名格式无效: $ENTRY" >&2; exit 1; }
-printf '%s' "$EMAIL" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证书邮箱格式无效" >&2; exit 1; }
+value_matches "$ENTRY" "$DOMAIN_RE" || { echo "入口域名格式无效: $ENTRY" >&2; exit 1; }
+value_matches "$EMAIL" '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证书邮箱格式无效" >&2; exit 1; }
 
 # This machine's own (direct) domain must differ from the entry domain: a steering redirect targets the
 # direct domain precisely because it always reaches this one machine.
@@ -55,7 +55,7 @@ fi
 PEERS=""
 for peer in "$@"; do
   peer=$(printf '%s' "$peer" | tr '[:upper:]' '[:lower:]')
-  printf '%s' "$peer" | grep -Eq "$DOMAIN_RE" || { echo "跳过格式无效的机器域名: $peer" >&2; continue; }
+  value_matches "$peer" "$DOMAIN_RE" || { echo "跳过格式无效的机器域名: $peer" >&2; continue; }
   [ "$peer" != "$ENTRY" ] || continue
   # Nginx refuses to start with an upstream it cannot resolve, so leave such a peer out (with a warning).
   if ! getent hosts "$peer" >/dev/null 2>&1; then echo "警告：$peer 暂时无法解析，本次不转发证书验证到它。" >&2; continue; fi
