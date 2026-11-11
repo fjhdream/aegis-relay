@@ -6,7 +6,8 @@ import path from 'node:path';
 import { activeLocalDomain, domainRequestRole, DOMAIN_REQUEST_FILE, followDomain, forgetDomainSwitch, readDomainStatus, requestDomainSwitch, servingAddress } from '../src/domain-control.js';
 import { isCertificateEmail } from '../src/agent-registry.js';
 import { certificateEmailAtStartup, normalizeCertificateEmail } from '../src/agent-api.js';
-import { cleanEntryRequest, entryAttempt } from '../src/steering-topology.js';
+import { cleanEntryRequest, entryAttempt, entryCommand } from '../src/steering-topology.js';
+import { spawnSync } from 'node:child_process';
 
 test('active local domain prefers the separated data plane and validates bare HTTPS origins',()=>{
   assert.equal(activeLocalDomain({localProxyBaseUrl:'https://embyus.example.com',publicBaseUrl:'https://panel.example.com'}),'embyus.example.com');
@@ -212,13 +213,37 @@ test('a request the host turned away without naming it is not filed again at onc
     refusal(10 * 60_000 + 1);
     assert.equal(followDomain(wanted), true, 'after it, the request is filed again');
     // A failure that names its request is the usual case and keeps the usual rule: another change is asked for at once.
-    forgetDomainSwitch(dir);
-    fs.writeFileSync(path.join(dir, 'host-domain-status.json'), JSON.stringify({ requestId: 'request-0001', state: 'failed', mode: 'domain', desiredDomain: 'other.example.com', currentDomain: '203.0.113.9', message: 'certbot', updatedAt: at(5_000) }));
-    assert.equal(followDomain(wanted), true);
+    // So does a switch an operator ran by hand that failed (it names no request, but it names what it was for, or is one to the IP).
+    for (const failure of [{ requestId: 'request-0001', mode: 'domain', desiredDomain: 'other.example.com' }, { requestId: '', mode: 'domain', desiredDomain: 'jp.example.com' }, { requestId: '', mode: 'ip', desiredDomain: '' }]) {
+      forgetDomainSwitch(dir);
+      fs.writeFileSync(path.join(dir, 'host-domain-status.json'), JSON.stringify({ ...failure, state: 'failed', currentDomain: '203.0.113.9', message: 'certbot', updatedAt: at(5_000) }));
+      assert.equal(followDomain(wanted), true, JSON.stringify(failure));
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   // The entry domain: a nameless refusal waits out the first pause (3 minutes); one that names its request is told apart by what it asked for.
   const entry = { domain: 'entry.example.com', email: 'ops@example.com', peers: ['a.example.com'] }, nameless = ago => ({ requestId: '', state: 'failed', entryDomain: '', peers: [], attempt: 1, message: 'refused', updatedAt: at(ago) });
   assert.deepEqual([entryAttempt(entry, nameless(5_000), now), entryAttempt(entry, nameless(3 * 60_000 - 1), now), entryAttempt(entry, nameless(3 * 60_000), now), entryAttempt(entry, null, now),
     entryAttempt(entry, { requestId: 'request-0001', state: 'failed', entryDomain: 'old.example.com', peers: [], attempt: 2, message: '', updatedAt: at(5_000) }, now),
     entryAttempt(entry, { requestId: 'request-0002', state: 'failed', entryDomain: 'entry.example.com', peers: ['a.example.com'], attempt: 1, message: '', updatedAt: at(5_000) }, now)], [0, 0, 1, 1, 1, 0]);
+});
+
+test('a command the panel shows for copying reaches the shell as the words it was made of', () => {
+  // The certificate email may hold characters a shell reads as its own (', &, |, *, !): pasted as
+  // they are, the command would be cut short, run in the background, or wait for a closing quote.
+  const words = command => spawnSync('/bin/sh', ['-c', `sudo(){ printf '%s\\n' "$@"; }; ${command}`], { encoding: 'utf8', timeout: 5000 });
+  for (const email of ['ops@example.com', "o'brien@example.com", 'ops&x@example.com', 'ops|x@example.com', 'a*b?c@example.com', 'wow!{a,b}~#x@example.com', "it's'x'@example.com"]) {
+    for (const local of [true, false]) {
+      const command = entryCommand({ domain: 'entry.example.com', email, peers: ['a.example.com', 'b.example.com'] }, local), ran = words(command);
+      assert.deepEqual([ran.status, ran.stdout.split('\n').slice(0, -1), ran.stderr], [0, [local ? 'aegis-relay' : 'aegis-relay-agent', 'entry', 'entry.example.com', email, 'a.example.com', 'b.example.com'], ''], command);
+    }
+  }
+  // An ordinary address is shown as it always was, with nothing around it.
+  assert.equal(entryCommand({ domain: 'entry.example.com', email: 'first.last+tag_1%x@example.com', peers: [] }, true), 'sudo aegis-relay entry entry.example.com first.last+tag_1%x@example.com');
+  // The hint the agent installer prints when a certificate could not be issued is made the same way.
+  const quote = /^\s*(shell_word\(\)\{.*\})$/m.exec(fs.readFileSync(new URL('../scripts/agent-install.sh', import.meta.url), 'utf8'))[1];
+  for (const value of ['hk.example.com', "o'brien@example.com", "a&b|c*d 'e' $f"]) {
+    // What comes back is read from the words the shell made of the quoted form, and from nothing else.
+    const back = spawnSync('/bin/sh', ['-c', `${quote}; quoted=$(shell_word "$1"); set --; eval "set -- $quoted" 2>/dev/null; printf '%s|%s' "$#" "\${1-}"`, 'sh', value], { encoding: 'utf8' });
+    assert.equal(back.stdout, `1|${value}`, value);
+  }
 });

@@ -17,7 +17,7 @@ const safeName=value=>{
   if(!name||name.length>80||/[\r\n\0]/.test(name))throw new Error('机器名称应为 1–80 个字符');
   return name;
 };
-export const normalizeCertificateEmail=value=>{const email=String(value||'').trim();if(!isCertificateEmail(email))throw new Error('请先配置有效的统一证书邮箱（不能含有 $、引号、反斜杠或非 ASCII 字符）');return email;};
+export const normalizeCertificateEmail=value=>{const email=String(value||'').trim();if(!isCertificateEmail(email))throw new Error('请先配置有效的统一证书邮箱（不能含有 $、反引号、双引号、反斜杠或非 ASCII 字符，也不能以 #、单引号或 - 开头）');return email;};
 // The certificate email a panel starts with: the stored one while the hosts would accept it, else the
 // one in its environment if they would, else none. (An address that was saved under an older, looser
 // rule is not handed to the hosts to be refused; whatever needs one asks for it to be saved again.)

@@ -6,6 +6,9 @@ import { STEERING_CAPABILITY } from './steering.js';
 // backslash changes how the value is read, a leading # makes it a comment; a leading - is an option
 // to certbot); after it, a plain domain. An address the hosts would refuse is refused here, where the
 // operator sees why.
+// A word of a command the panel shows for an operator to copy into a shell: as it is when nothing in
+// it means anything to a shell, in single quotes otherwise (an email may hold ', &, |, *, ! and more).
+export const shellWord=value=>/^[A-Za-z0-9@%+=:,./_-]+$/.test(String(value))?String(value):`'${String(value).replaceAll("'",`'"'"'`)}'`;
 export const isCertificateEmail=value=>typeof value==='string'&&value.length<=254&&/^[A-Za-z0-9!%&*+\/=?^_{|}~.][A-Za-z0-9!#%&'*+\/=?^_{|}~.-]*@[A-Za-z0-9.-]+$/.test(value);
 
 export const LOCAL_AGENT_ID = 'local';

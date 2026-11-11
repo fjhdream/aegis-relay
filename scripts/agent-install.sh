@@ -193,7 +193,9 @@ if [ "$MODE" = ip ]; then
   fi
 elif [ -n "$DOMAIN" ] && [ -n "$EMAIL" ]; then
   if ! "$INSTALL_DIR/agent-configure-domain.sh" "$DOMAIN" "$EMAIL"; then
-    echo "Agent 已同步并监听 127.0.0.1:8080，但域名证书配置未完成。修复 DNS 后执行: sudo aegis-relay-agent domain $DOMAIN $EMAIL" >&2
+    # The hint is there to be copied: each word in quotes, whatever it holds.
+    shell_word(){ printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+    echo "Agent 已同步并监听 127.0.0.1:8080，但域名证书配置未完成。修复 DNS 后执行: sudo aegis-relay-agent domain $(shell_word "$DOMAIN") $(shell_word "$EMAIL")" >&2
   fi
 else
   echo "Agent 已同步并监听 127.0.0.1:8080。配置 HTTPS: sudo aegis-relay-agent domain 域名 邮箱，或 IP 反代: sudo aegis-relay-agent ip"
