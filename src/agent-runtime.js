@@ -91,6 +91,15 @@ export async function enrollAgent({dataDir,panelUrl,token='',name='',version='0.
 
 function loadMetricStore(file,key){let data={};if(fs.existsSync(file)){try{const loaded=openLocal(fs.readFileSync(file,'utf8'),key);if(loaded&&typeof loaded==='object'&&!Array.isArray(loaded))data=loaded}catch(error){console.error(`[aegis-agent] cached metrics rejected: ${error.message}`)}}const writer=coalescedWriter(file,()=>sealLocal(data,key));return{data,save:writer.save}}
 
+// After a failed attempt wait 2 seconds, then twice as long each time, up to `capMs`; every wait is a
+// quarter shorter to a quarter longer, so agents cut off together do not all come back together
+// (docs/AGENT_PROTOCOL.md §11.3). reset() after an attempt that succeeded.
+function backoff(capMs){
+  let step=0;
+  return {reset(){step=0},next(){step=step?Math.min(capMs,step*2):2_000;return Math.min(capMs,Math.round(step*(0.75+Math.random()/2)));}};
+}
+const CONFIG_BACKOFF_CAP_MS=60_000,HEARTBEAT_BACKOFF_CAP_MS=300_000;
+
 // Config follows a long poll that the panel releases the moment this machine's node set changes, so a
 // change lands within about a second instead of on the next heartbeat. A panel that predates long
 // polling answers 204 at once; the floor keeps that, and wake-ups for other machines' changes, from
@@ -142,11 +151,11 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
   }
 
   async function followConfig(){
-    let backoff=0;
+    const retry=backoff(CONFIG_BACKOFF_CAP_MS);
     while(!stopped.aborted){
       const started=now();let pause;
-      try{const applied=await pollConfig(CONFIG_WAIT_SECONDS);backoff=0;pause=applied?0:CONFIG_POLL_FLOOR_MS-(now()-started)}
-      catch(error){if(stopped.aborted)return;report(error);backoff=Math.min(60_000,Math.max(2_000,backoff*2));pause=backoff}
+      try{const applied=await pollConfig(CONFIG_WAIT_SECONDS);retry.reset();pause=applied?0:CONFIG_POLL_FLOOR_MS-(now()-started)}
+      catch(error){if(stopped.aborted)return;report(error);pause=retry.next()}
       if(pause>0)await sleep(pause,stopped);
     }
   }
@@ -161,7 +170,7 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
   // The heartbeat carries health and telemetry up, and brings down what the panel wants of the host:
   // the domain or IP to serve on and the steering entry domain.
   async function heartbeat(){
-    let delay=2_000,lastMetricSave=0;
+    const retry=backoff(HEARTBEAT_BACKOFF_CAP_MS);let delay,lastMetricSave=0;
     while(!stopped.aborted){
       try{
         const telemetry=telemetryFromMetrics(metrics.snapshot(routes()));
@@ -169,8 +178,8 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
         const status=await checkIn(telemetry);
         followDomain({dir:dataDir,desired:{mode:status.desiredMode,domain:status.desiredDomain,email:status.certificateEmail},installed,nowMs:now()});
         if(status.entry)followEntry({dir:dataDir,entry:cleanEntryRequest(status.entry),nowMs:now()});
-        delay=Math.max(5_000,Number(status.heartbeatSeconds||15)*1000);
-      }catch(error){if(stopped.aborted)return;report(error);delay=Math.min(300_000,Math.max(2_000,delay*2))}
+        retry.reset();delay=Math.max(5_000,Number(status.heartbeatSeconds||15)*1000);
+      }catch(error){if(stopped.aborted)return;report(error);delay=retry.next()}
       await sleep(delay,stopped);
     }
   }
