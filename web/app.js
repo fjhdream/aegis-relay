@@ -5,9 +5,8 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 // A module has no document.currentScript; its own address says where the panel is served from.
 const scriptPath=new URL(import.meta.url).pathname;
 const base=scriptPath.endsWith('/app.js')?scriptPath.replace(/\/app\.js$/,'/api'):location.pathname.replace(/\/$/,'')+'/api';
-// Theme: apply the saved (or system) preference before first paint of the app shell.
+// Theme: theme.js has applied the saved (or the system's) choice before the first paint; the toggle is here.
 const THEME_KEY='aegis-theme';
-(function(){let t;try{t=localStorage.getItem(THEME_KEY)}catch{}if(t!=='dark'&&t!=='light')t=window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';document.documentElement.dataset.theme=t})();
 function toggleTheme(){const next=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=next;try{localStorage.setItem(THEME_KEY,next)}catch{}}
 const state={csrf:'',routes:[],agents:[],panelVersion:'',dashboard:null,editing:null,page:'dashboard',panelIcon:''};
 function showLogin(message='登录已失效，请重新登录'){
@@ -40,7 +39,7 @@ function write(changes){for(const [selector,change] of Object.entries(changes)){
 }}
 // A form's controls as values by control (true or false for a checkbox), and back.
 const readForm=fields=>Object.fromEntries(fields.map(field=>[field.id,$(field.id).type==='checkbox'?$(field.id).checked:$(field.id).value]));
-function writeForm(values){for(const [id,v] of Object.entries(values)){if(typeof v==='boolean')$(id).checked=v;else $(id).value=v??''}}
+function writeForm(values){for(const [id,v] of Object.entries(values)){if($(id).type==='checkbox')$(id).checked=v;else $(id).value=v??''}}
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.classList.remove('hidden');el.classList.toggle('error',error);clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.add('hidden'),3200)}
 function showSecret(content,options){write(secretView(content,options))}
 
@@ -299,7 +298,7 @@ start();
 
 // 自动切流: the page is drawn by view.js; here are the fetching, the timer and the buttons.
 const steering=steeringRefresher({ask:()=>call('/steering',{signal:AbortSignal.timeout(10000)}),onPage:()=>state.page==='steering',signedIn:()=>!!state.csrf,hidden:()=>document.hidden,
-  show:(data,liveOnly)=>liveOnly?renderSteeringLive(data):renderSteering(data),status:text=>{$('#steering-refresh').textContent=text},toast,now:()=>Date.now()});
+  showAll:data=>renderSteering(data),showLive:data=>renderSteeringLive(data),status:text=>{$('#steering-refresh').textContent=text},toast,now:()=>Date.now()});
 const loadSteering=steering.load;
 setInterval(steering.tick,STEERING_REFRESH_MS);
 function renderSteering(d){

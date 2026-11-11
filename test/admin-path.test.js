@@ -11,7 +11,8 @@ test('root domain exposes only the admin shell, assets and API namespace', () =>
 test('every file the admin page is made of is on the one list the server goes by', () => {
   // A file in web/ that is not on the list would be answered 404, and on a panel served at the root
   // of its domain it would be taken for a node path.
-  const files = fs.readdirSync(new URL('../web/', import.meta.url)).filter(name => name !== 'index.html').map(name => `/${name}`).sort();
+  // (Not what a file manager or an editor leaves beside them.)
+  const files = fs.readdirSync(new URL('../web/', import.meta.url)).filter(name => name !== 'index.html' && /^[\w-]+\.(js|css)$/.test(name)).map(name => `/${name}`).sort();
   assert.deepEqual(Object.keys(UI_FILES).sort(), files);
   for (const file of files) {
     assert.equal(isRootAdminRequest(file), true, file);

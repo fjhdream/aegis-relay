@@ -300,9 +300,10 @@ export function steeringSave(values,extra={}){
 // shown and says so (aloud only when the person asked for the page). `tick` is the timer's turn: it
 // loads only while the page is being looked at, and has only the live tables redrawn, so that it never
 // replaces settings someone is in the middle of changing. Everything it touches is handed in: `ask`
-// fetches, `show(data,liveOnly)` draws, `status` writes the line under the title.
+// fetches, `showAll` draws the whole page and `showLive` the live tables only, `status` writes the
+// line under the title.
 export const STEERING_REFRESH_MS=5000;
-export function steeringRefresher({ask,onPage,signedIn,hidden,show,status,toast,now}){
+export function steeringRefresher({ask,onPage,signedIn,hidden,showAll,showLive,status,toast,now}){
   let loading=false;
   async function load(liveOnly=false){
     if(loading)return;
@@ -310,7 +311,7 @@ export function steeringRefresher({ask,onPage,signedIn,hidden,show,status,toast,
     try{
       const data=await ask();
       if(!onPage()||!signedIn())return;
-      show(data,liveOnly);
+      if(liveOnly)showLive(data);else showAll(data);
       status(`每 5 秒刷新 · 更新于 ${clockTime(now())}`);
     }catch(e){if(onPage()){status('刷新失败，保留上次结果，稍后重试');if(!liveOnly)toast(e.message,true)}}
     finally{loading=false}

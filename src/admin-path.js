@@ -4,6 +4,7 @@
 export const UI_FILES = {
   '/app.js': 'text/javascript; charset=utf-8',
   '/view.js': 'text/javascript; charset=utf-8',
+  '/theme.js': 'text/javascript; charset=utf-8',
   '/style.css': 'text/css; charset=utf-8',
   '/help.css': 'text/css; charset=utf-8'
 };
