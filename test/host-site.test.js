@@ -54,9 +54,11 @@ function host() {
   return {
     root,dir,
     // Run a script as the machine would: an agent's from its install directory, the panel's from scripts/.
-    run(script,args=[],extra={}){const result=spawnSync('/bin/sh',[path.join(dir(script.startsWith('agent-')?'agent':'panel/scripts'),script),...args],{encoding:'utf8',env:{...env,...extra}});return {...result,output:`${result.stdout}${result.stderr}`}},
+    run(script,args=[],extra={}){const knobs=Object.fromEntries(Object.entries(process.env).filter(([name])=>name.startsWith('TEST_')));const result=spawnSync('/bin/sh',[path.join(dir(script.startsWith('agent-')?'agent':'panel/scripts'),script),...args],{encoding:'utf8',env:{...env,...knobs,...extra}});return {...result,output:`${result.stdout}${result.stderr}`}},
     site:name=>read(path.join(dir('nginx'),'sites-available',`${name}.conf`)),
     enabled:name=>fs.existsSync(path.join(dir('nginx'),'sites-enabled',`${name}.conf`)),
+    // Since when: the calls made after the first `count` ones.
+    since:count=>(read(calls)||'').trim().split('\n').filter(Boolean).slice(count),
     calls:()=>(read(calls)||'').trim().split('\n').filter(Boolean),
     // The agent's side of things: the status file as the agent reads it, the address it will report on
     // its next heartbeat (the same reading src/agent-runtime.js does), and a request as it files one.
@@ -299,10 +301,89 @@ test('a request from the panel is checked before it reaches Nginx, and answered 
   assert.deepEqual([failed.status,h.requested()],[1,false]);
   const status=h.status();
   assert.deepEqual([status.requestId,status.state,status.mode,status.desiredDomain,status.currentDomain],['request-0003','failed','domain','hk.example.com','203.0.113.9']);
-  assert.ok(status.message.endsWith('Challenge failed for "hk.example.com": DNS problem\\NXDOMAIN'),status.message);
+  assert.ok(status.message.includes('Challenge failed for "hk.example.com": DNS problem\\NXDOMAIN')&&status.message.endsWith('请检查 DNS、Cloudflare 与 80/443 端口后重试。'),status.message);
   assert.deepEqual([h.env('agent').AGENT_DOMAIN,h.env('agent').AGENT_PROXY_MODE],['','ip'],'.env still names the address it had');
   assert.equal(fs.statSync(path.join(h.dir('agent/data'),'host-domain-status.json')).mode&0o777,0o644,'the agent container can read it');
   assert.deepEqual(fs.readdirSync(h.dir('agent/data')),['host-domain-status.json'],'no temporary file is left behind');
+});
+
+test('a switch that fails leaves the agent serving on the address it had',t=>{
+  for(const [who,caller] of Object.entries(CALLERS)){
+    if(caller.python&&!PYTHON){t.diagnostic(`python3 is not installed: skipping "${who}"`);continue}
+    // On its IP, asked for a domain whose certificate cannot be issued.
+    const h=agentOnItsIp(),ipSite=h.site('aegis-relay-agent'),env=h.env('agent'),calls=h.calls().length;
+    process.env.TEST_CERTBOT_FAILS='1';
+    const refused=caller.domain(h,'hk.example.com','ops@example.com');
+    delete process.env.TEST_CERTBOT_FAILS;
+    assert.equal(refused.status,1,who);
+    assert.equal(h.site('aegis-relay-agent'),ipSite,`${who}: the IP site is back, byte for byte`);
+    assert.ok(h.enabled('aegis-relay-agent'),who);
+    const after=h.since(calls),certbot=after.findIndex(call=>call.startsWith('certbot '));
+    assert.ok(certbot>=0&&after.slice(certbot).includes('systemctl reload nginx'),`${who}: Nginx loads the restored site`);
+    assert.deepEqual(h.env('agent'),env,`${who}: .env is untouched`);
+    const status=h.status();
+    assert.deepEqual([status.state,status.mode,status.desiredDomain,status.currentDomain],['failed','domain','hk.example.com','203.0.113.9'],who);
+    assert.match(status.message,/certbot: challenge failed.*已恢复原来的站点/,who);
+    assert.deepEqual(h.reported(),{mode:'ip',domain:'203.0.113.9'},`${who}: the agent goes on reporting its IP`);
+    // The same request again, once the certificate can be had, goes through.
+    assert.equal(caller.domain(h,'hk.example.com','ops@example.com').status,0,who);
+    assert.deepEqual(h.reported(),{mode:'domain',domain:'hk.example.com'},who);
+
+    // On that domain now, with the certificate in its site; a switch Nginx rejects changes nothing.
+    const domainSite=h.site('aegis-relay-agent'),domainEnv=h.env('agent'),mark=h.calls().length;
+    assert.match(domainSite,/# managed by Certbot: hk\.example\.com/);
+    fs.symlinkSync('../sites-available/default',path.join(h.dir('nginx'),'sites-enabled','default'));
+    process.env.TEST_NGINX_REJECTS='1';
+    const toIp=caller.ip(h),toOther=caller.domain(h,'jp.example.com','ops@example.com');
+    delete process.env.TEST_NGINX_REJECTS;
+    assert.deepEqual([toIp.status,toOther.status],[1,1],who);
+    assert.equal(h.site('aegis-relay-agent'),domainSite,`${who}: the site with its certificate is back`);
+    assert.equal(fs.readlinkSync(path.join(h.dir('nginx'),'sites-enabled','default')),'../sites-available/default',`${who}: the default site it moved aside is back`);
+    assert.deepEqual(h.since(mark).filter(call=>call.startsWith('certbot ')),[],`${who}: no certificate is asked for a site Nginx refused`);
+    assert.deepEqual([h.env('agent'),h.status().state,h.status().currentDomain,h.reported()],[domainEnv,'failed','hk.example.com',{mode:'domain',domain:'hk.example.com'}],who);
+  }
+});
+
+test('a first setup that fails leaves no half-made site behind',()=>{
+  // A fresh agent, as the installer runs it: no site yet.
+  const fresh=host();
+  assert.equal(fresh.run('agent-configure-domain.sh',['hk.example.com','ops@example.com'],{TEST_CERTBOT_FAILS:'1'}).status,1);
+  assert.deepEqual([fresh.site('aegis-relay-agent'),fresh.enabled('aegis-relay-agent'),fresh.status().state,fresh.env('agent').AGENT_PROXY_MODE],[null,false,'failed',undefined]);
+  // A site an operator had disabled stays disabled when the attempt to replace it fails.
+  const disabled=host(),available=path.join(disabled.dir('nginx'),'sites-available','aegis-relay-agent.conf');
+  fs.writeFileSync(available,'# kept by hand\n');
+  assert.equal(disabled.run('agent-configure-ip.sh',[],{TEST_NGINX_REJECTS:'1'}).status,1);
+  assert.deepEqual([disabled.site('aegis-relay-agent'),disabled.enabled('aegis-relay-agent')],['# kept by hand\n',false]);
+  // What a successful switch replaced is kept beside the site.
+  assert.equal(disabled.run('agent-configure-ip.sh').status,0);
+  const copies=fs.readdirSync(path.join(disabled.dir('nginx'),'sites-available')).filter(name=>/^aegis-relay-agent\.conf\.backup\.\d{14}$/.test(name));
+  assert.equal(copies.length>=1&&fs.readFileSync(path.join(disabled.dir('nginx'),'sites-available',copies[0]),'utf8'),'# kept by hand\n');
+  assert.deepEqual(fs.readdirSync(os.tmpdir()).filter(name=>name.startsWith('aegis-agent-site.')||name.startsWith('aegis-agent-address.')),[],'no temporary file is left behind');
+});
+
+test('the panel keeps the site it had when a domain setup fails',()=>{
+  const h=host();
+  assert.equal(h.run('configure-domain.sh',['panel.example.com','ops@example.com']).status,0);
+  const live=h.site('aegis-relay'),env=h.env('panel'),calls=h.calls().length;
+  assert.match(live,/# managed by Certbot: panel\.example\.com/);
+  // An update renders the site again. If the certificate step fails then, HTTPS must not be lost.
+  const update=h.run('configure-domain.sh',['panel.example.com','ops@example.com'],{TEST_CERTBOT_FAILS:'1'});
+  assert.deepEqual([update.status,/证书申请失败，已恢复原来的站点/.test(update.output)],[1,true]);
+  assert.equal(h.site('aegis-relay'),live,'the site with its certificate is back');
+  const after=h.since(calls),certbot=after.findIndex(call=>call.startsWith('certbot '));
+  assert.ok(after.slice(certbot).includes('systemctl reload nginx'));
+  assert.deepEqual([h.env('panel'),after.filter(call=>call.startsWith('docker'))],[env,[]],'.env is untouched and the panel is not restarted');
+  // The same for Nginx refusing the new site, and for the two-domain setup at either certificate.
+  assert.equal(h.run('configure-domain.sh',['other.example.com','ops@example.com'],{TEST_NGINX_REJECTS:'1'}).status,1);
+  assert.equal(h.site('aegis-relay'),live);
+  assert.equal(h.run('configure-local-domain.sh',['emby.example.com','ops@example.com'],{TEST_NGINX_REJECTS:'1'}).status,1);
+  assert.equal(h.run('configure-local-domain.sh',['emby.example.com','ops@example.com'],{TEST_CERTBOT_FAILS:'1'}).status,1);
+  assert.deepEqual([h.site('aegis-relay'),h.env('panel')],[live,env]);
+  // A first setup that fails leaves nothing on port 80 in the panel's name.
+  const fresh=host();
+  assert.equal(fresh.run('configure-domain.sh',['panel.example.com','ops@example.com'],{TEST_CERTBOT_FAILS:'1'}).status,1);
+  assert.deepEqual([fresh.site('aegis-relay'),fresh.enabled('aegis-relay'),fresh.env('panel')],[null,false,{ADMIN_PATH:'secret-admin'}]);
+  assert.deepEqual(fs.readdirSync(os.tmpdir()).filter(name=>name.startsWith('aegis-panel-site.')),[],'no temporary file is left behind');
 });
 
 test('the aegis-relay-agent command says how it is used instead of guessing',()=>{

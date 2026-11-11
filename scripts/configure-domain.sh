@@ -21,9 +21,8 @@ if [ -n "$PUBLIC_IP" ] && [ -n "$DNS_IP" ] && [ "$PUBLIC_IP" != "$DNS_IP" ]; the
   echo "警告：$DOMAIN 当前解析到 $DNS_IP，本机公网 IP 为 $PUBLIC_IP。"
   echo "请确认 DNS 已生效，否则证书申请会失败。"
 fi
-SITE="$AEGIS_NGINX_DIR/sites-available/aegis-relay.conf"
-BACKUP=""
-if [ -f "$SITE" ]; then BACKUP="$SITE.backup.$(date +%Y%m%d%H%M%S)"; cp "$SITE" "$BACKUP"; fi
+NEW_SITE=$(mktemp "${TMPDIR:-/tmp}/aegis-panel-site.XXXXXX")
+trap 'rm -f "$NEW_SITE"' EXIT
 {
   data_plane_upstream aegis_relay_backend aegis_connection_upgrade
   cat <<EOF
@@ -54,17 +53,11 @@ server {
 EOF
   data_plane_location aegis_relay_backend aegis_connection_upgrade
   echo "}"
-} > "$SITE"
-ln -sfn "$SITE" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay.conf"
-if ! nginx -t; then
-  [ -n "$BACKUP" ] && cp "$BACKUP" "$SITE"
-  echo "Nginx 配置校验失败，已回滚。" >&2
-  exit 1
-fi
-systemctl enable --now nginx
-systemctl reload nginx
+} > "$NEW_SITE"
+site_install aegis-relay "$NEW_SITE" || exit 1
 if ! certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"; then
-  echo "证书申请失败。9080 临时公网入口保持不变，请修复 DNS/防火墙后重试。" >&2
+  site_restore aegis-relay
+  echo "证书申请失败，已恢复原来的站点。9080 临时公网入口保持不变，请修复 DNS/防火墙后重试。" >&2
   exit 1
 fi
 systemctl enable --now certbot.timer 2>/dev/null || true
