@@ -380,6 +380,8 @@ Agent 默认每 30 秒发送：
 }
 ```
 
+`applyState` 取 `waiting`（还没有应用过配置）、`active`（最近收到的配置已应用）或 `error`（最近收到的配置被拒绝；Agent 继续运行上一份，直到有配置应用成功）。
+
 控制面响应当前 `desiredRevision`、建议轮询间隔和服务器时间。心跳不得包含节点地址、访问密码、请求 URL、Emby Token 或客户端 IP。
 
 ### 11.2 配置长轮询

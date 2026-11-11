@@ -4,7 +4,7 @@
 // health and the client lists. Panel and machines of different versions talk to each other, so the
 // shape on the wire only ever grows, and what one side reads is cleaned here, in one place.
 //
-// The transport is `send(payload) -> response`: a signed HTTPS call on agents (agent-main.js) and
+// The transport is `send(payload) -> response`: a signed HTTPS call on agents (agent-runtime.js) and
 // localTransport() on the panel machine and in tests.
 
 const VERDICTS=Object.freeze(['ok','starved_down','starved_up','unknown']);
