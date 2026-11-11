@@ -10,13 +10,18 @@ import { readSyncResponse, requeueReport, takeReport } from './steering-sync.js'
 // plane: it measures how well each playback session is being served here, and at request boundaries
 // either serves the request or 302s it to a peer machine's direct domain. Machines share per-session
 // state through the panel (SteeringHub); none of it is ever needed for correctness, only for quality.
-export const STEER_PARAM='aegis_steer';
+const STEER_PARAM='aegis_steer';
 export const STEERING_CAPABILITY='steering-v1';
 export const STEERING_MODES=Object.freeze(['off','shadow','on']);
 // egress-v1: this machine relays a node's upstream traffic through the node's egress machine, and
 // recognises such relayed requests when it is the egress machine itself.
 export const EGRESS_CAPABILITY='egress-v1';
 export const EGRESS_HEADER='x-aegis-egress',EGRESS_HOST_HEADER='x-aegis-egress-host';
+// The scheme the client used rides in the standard Forwarded header ("proto=http", RFC 7239), not in a
+// new x-aegis one: every egress-v1 machine already deletes Forwarded from what it sends on, so an older
+// egress machine never hands it to the upstream and an older relaying machine never lets a client's
+// own through. Absent, or anything else, means HTTPS, which is all an egress machine assumed before.
+export const EGRESS_PROTO_HEADER='forwarded';
 export const STEER_DEFAULTS=Object.freeze({
   hlsWindowMs:20_000,minHlsSegments:4,progressiveWindowTicks:120,verdictTtlMs:60_000,dwellMs:120_000,
   switchWindowMs:600_000,maxSwitches:3,improve:1.3,penaltyMs:600_000,tokenTtlMs:30_000,sessionTtlMs:30*60_000,
@@ -41,7 +46,7 @@ const targetTag=id=>crypto.createHash('sha256').update(`AegisRelay:steer-target:
 // A per-node key derived from the node's routeAuthKey, which every machine serving the node already
 // holds. Kept separate from the AES key of the .aegis-relay continuation tokens.
 const steerKeys=new WeakMap();
-export function steerKey(route) {
+function steerKey(route) {
   if(!route||!isRouteAuthKey(route.routeAuthKey))return null;
   const cached=steerKeys.get(route);
   if(cached&&cached.source===route.routeAuthKey)return cached.key;
@@ -110,7 +115,7 @@ export function clientPrefix(ip) {
 }
 
 // The same X-Real-IP the relay's viewer list trusts: set by the fronting Nginx, never by the client.
-export function clientIpOf(req) {
+function clientIpOf(req) {
   const first=value=>String(value||'').split(',')[0].trim();
   return first(req.headers['x-real-ip'])||first(req.headers['x-forwarded-for'])||String(req.socket?.remoteAddress||'');
 }
@@ -122,8 +127,8 @@ export function prefixKeyFor(route, ip) {
 }
 
 // A request one machine relays to the node's egress machine carries a short-lived proof derived from
-// the node key (which only the machines serving the node hold), plus the host the client used. The
-// egress machine then builds every link for that host and leaves steering and accounting to the relay.
+// the node key (which only the machines serving the node hold), plus the host and scheme the client used.
+// The egress machine then builds every link for them and leaves steering and accounting to the relay.
 export function egressToken(route, nowMs) {
   const key=steerKey(route);
   return key?b64u(mac(key,'egress',String(Math.floor(nowMs/60_000))).subarray(0,16)):'';
@@ -133,8 +138,11 @@ export function relayedEgress(route, headers, nowMs) {
   const key=steerKey(route),token=String(headers?.[EGRESS_HEADER]||''),host=String(headers?.[EGRESS_HOST_HEADER]||'').trim().toLowerCase();
   if(!key||!/^[A-Za-z0-9_-]{22}$/.test(token)||!/^[a-z0-9.-]{1,253}(?::\d{1,5})?$/.test(host))return null;
   const raw=Buffer.from(token,'base64url'),minute=Math.floor(nowMs/60_000);
+  // A machine in IP reverse-proxy mode serves its clients plain HTTP. The X-Forwarded-Proto that reaches
+  // the egress machine is its own Nginx's, for the HTTPS hop, so it says nothing about the client.
+  const proto=headers?.[EGRESS_PROTO_HEADER]==='proto=http'?'http':'https';
   // Machine clocks drift a little; a captured proof is stale within minutes.
-  for(let skew=-2;skew<=2;skew++)if(crypto.timingSafeEqual(raw,mac(key,'egress',String(minute+skew)).subarray(0,16)))return {host};
+  for(let skew=-2;skew<=2;skew++)if(crypto.timingSafeEqual(raw,mac(key,'egress',String(minute+skew)).subarray(0,16)))return {host,proto};
   return null;
 }
 

@@ -28,12 +28,14 @@ export function normalizeClientList(value) {
   return out;
 }
 
+const storedSteering=data=>data?.settings?.steering&&typeof data.settings.steering==='object'?data.settings.steering:{};
+
 export function readSteeringSettings(data) {
-  const raw=data?.settings?.steering&&typeof data.settings.steering==='object'?data.settings.steering:{};
+  const raw=storedSteering(data);
   const boundMB=Number(raw.boundMB);
   return {
     mode:STEERING_MODES.includes(raw.mode)?raw.mode:'off',
-    entryDomain:typeof raw.entryDomain==='string'?raw.entryDomain:'',
+    entryDomain:readEntryDomain(data),
     excludedClients:Array.isArray(raw.excludedClients)?raw.excludedClients:[],
     autoExcluded:raw.autoExcluded&&typeof raw.autoExcluded==='object'&&!Array.isArray(raw.autoExcluded)?raw.autoExcluded:{},
     boundedClients:Array.isArray(raw.boundedClients)?raw.boundedClients:[],
@@ -43,6 +45,14 @@ export function readSteeringSettings(data) {
   };
 }
 const clientMap=value=>value&&typeof value==='object'&&!Array.isArray(value)?value:{};
+
+// The entry domain alone, exactly as readSteeringSettings reports it. The panel machine checks it on
+// every proxied request, so it reads one field and writes nothing (steeringSettings would replace the
+// stored settings with a freshly normalised copy each time).
+export function readEntryDomain(data) {
+  const raw=storedSteering(data);
+  return typeof raw.entryDomain==='string'?raw.entryDomain:'';
+}
 
 // Client types whose open-ended Range gets capped: the operator's list plus the ones detected
 // automatically, minus any that failed to continue (which is checked even for listed ones).
@@ -75,7 +85,7 @@ export function agentSteeringIssues(agent, settings) {
   return issues;
 }
 
-export function steerableAgent(agent, settings) {
+function steerableAgent(agent, settings) {
   return agentSteeringIssues(agent,settings).length===0;
 }
 

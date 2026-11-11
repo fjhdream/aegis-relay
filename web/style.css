@@ -138,6 +138,7 @@ svg{stroke-linecap:round;stroke-linejoin:round}
 
 /* ============================================================ Inputs */
 .auth-form label,.form-grid label{display:block;color:var(--text-2);font-size:13px;font-weight:500;margin-bottom:16px}
+.auth-form label small{display:block;color:var(--text-3);font-weight:400;margin-top:4px}
 .auth-form input,.form-grid input,.form-grid textarea,.form-grid select,
 .diagnostic-action select,.import-area{
   display:block;width:100%;margin-top:6px;padding:8px 12px;color:var(--text);
@@ -172,6 +173,8 @@ svg{stroke-linecap:round;stroke-linejoin:round}
 .link-btn,.icon-btn{border:0;background:none;color:var(--text)}
 .link-btn{font-size:13px;color:var(--text-2)}
 .link-btn:hover{color:var(--text);text-decoration:underline;text-underline-offset:3px}
+/* the login form's switch between the TOTP code and a recovery code, tucked under the field it swaps */
+.auth-form .link-btn{display:block;padding:4px 0;margin:-10px 0 12px}
 .text-btn{margin-top:12px;padding:0;background:none;border:0;color:var(--rail-text-3);font-size:13px}
 .text-btn:hover{color:var(--rail-text)}
 

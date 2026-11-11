@@ -19,7 +19,6 @@ const HISTORY_MAX=5000,HISTORY_TTL_MS=7*24*3600_000,HISTORY_EVERY_MS=60_000;
 const EFFECT_RING=200,EFFECT_TIMEOUT_MS=10*60_000,RECOVER_MS=180_000,PERSIST_MS=120_000;
 // Silence also means pause/stop/cache; only a matched next-byte request proves compatibility.
 const BOUND_SAMPLE=10,BOUND_PENDING=32,TRIAL_SUCCESSES=3,TRIAL_MIN_LANDINGS=5,TRIAL_MIN_LANDED=0.9;
-const list=value=>Array.isArray(value)?value.slice(0,BATCH):[];
 const text=(value,max=80)=>String(value||'').replace(/[\r\n\0]/g,'').trim().slice(0,max);
 const number=(value,min=0,max=Number.MAX_SAFE_INTEGER)=>{const n=Number(value);return Number.isFinite(n)?Math.min(max,Math.max(min,n)):min};
 const median=values=>{const sorted=[...values].sort((left,right)=>left-right);return sorted.length?Math.round(sorted[Math.floor(sorted.length/2)]*10)/10:0};
@@ -238,7 +237,7 @@ export class SteeringHub {
     return syncResponse({
       serverTime:now,cursor:changed.length===BATCH?changed.at(-1).seq:this.seq,
       sessions:changed.map(session=>sessionUpdate(session,this.prior(session,now))),
-      peers:this.peers(),
+      peers:this.peers(now),
       excludedClients:excludedClients(settings),
       boundedClients:boundedClientList(settings),trialClients:this.trialClients(settings),boundBytes:settings.boundMB*1024*1024
     });
@@ -247,12 +246,14 @@ export class SteeringHub {
   // The operator cleared the automatic capped-range results: forget the evidence behind them as well.
   clearRangeVerdicts() { this.bounds.clear(); }
 
-  peers() {
+  // A machine's last contact is judged by the hub's clock like every other time here. In production that
+  // is the clock the panel stamps lastSeen with; reading the wall clock would ignore an injected one.
+  peers(now=this.clock()) {
     const out=[];
     for(const agent of this.store.data.agents||[]){
       if(agent.state==='revoked')continue;
       const local=agent.id===LOCAL_AGENT_ID,health=this.health.get(agent.id);
-      const healthy=local||(remoteAgentStatus(agent)==='online'&&agent.proxyHealthy===true&&agentKnows(agent,STEERING_CAPABILITY)&&Number(agent.desiredRevision||0)===Number(agent.appliedRevision||0));
+      const healthy=local||(remoteAgentStatus(agent,now)==='online'&&agent.proxyHealthy===true&&agentKnows(agent,STEERING_CAPABILITY)&&Number(agent.desiredRevision||0)===Number(agent.appliedRevision||0));
       out.push({id:agent.id,healthy,at:health?.at||0,routes:health?.routes||{}});
     }
     return out;
@@ -265,7 +266,7 @@ export class SteeringHub {
     const clients=[...this.clients.values()].map(stat=>{const landed=stat.results.filter(Boolean).length;return{client:stat.client,total:stat.results.length,landed,autoExcluded:auto.has(stat.client.toLowerCase())}});
     const bounded=new Set(boundedClientList(settings).map(client=>client.toLowerCase())),trials=new Set(this.trialClients(settings).map(client=>client.toLowerCase()));
     const ranges=[...this.bounds.values()].map(stat=>{const key=stat.client.toLowerCase();return{client:stat.client,continued:stat.results.filter(Boolean).length,total:stat.results.length,trialContinued:stat.trials.filter(Boolean).length,trialTotal:stat.trials.length,state:bounded.has(key)?'on':trials.has(key)?'trial':'off'}});
-    return {sessions,events:this.events.slice(-50).reverse(),clients,ranges,effects:this.effectSummary(),networks:this.history.size,machines:this.peers(),playback:this.playback.view(now)};
+    return {sessions,events:this.events.slice(-50).reverse(),clients,ranges,effects:this.effectSummary(),networks:this.history.size,machines:this.peers(now),playback:this.playback.view(now)};
   }
 
   effectSummary() {

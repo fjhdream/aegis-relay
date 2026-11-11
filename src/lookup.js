@@ -34,5 +34,3 @@ export function guardedLookup(allowPrivate) {
     });
   };
 }
-
-export function clearLookupCache() { cache.clear(); }

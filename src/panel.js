@@ -9,7 +9,7 @@ import { agentEntryUrl, agentKnows, deploymentId, ensureLocalDeployment, LOCAL_A
 import { enrollmentInstallCommand, issueEnrollment, normalizeCertificateEmail } from './agent-api.js';
 import { baseHostname, followEntry, readDomainStatus, readEntryStatus, requestDomainSwitch } from './domain-control.js';
 import { STEERING_MODES } from './steering.js';
-import { agentSteeringIssues, desiredEntry, egressIssues, egressTopology, ENTRY_CAPABILITY, entryCommand, entryCoverageGaps, normalizeClientList, normalizeEntryDomain, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
+import { agentSteeringIssues, desiredEntry, egressIssues, egressTopology, ENTRY_CAPABILITY, entryCommand, entryCoverageGaps, normalizeClientList, normalizeEntryDomain, readSteeringSettings, routeSteeringIssues, steeringEntryBaseUrl, steeringSettings } from './steering-topology.js';
 import { nodeLines } from './line-sync.js';
 
 // The panel: every change an operator makes to nodes, their distribution channels, machines, steering
@@ -364,9 +364,10 @@ export class Panel {
   }
 
   // What the 自动切流 page needs: settings, per-machine/per-node readiness, the entry-domain command each
-  // machine has to run once, and the live view from the hub.
+  // machine has to run once, and the live view from the hub. A read (the page polls it), so it
+  // leaves the stored settings as they are; only updateSteering takes the editable copy.
   steering() {
-    const data=this.data,settings=steeringSettings(data),agents=this.agents();
+    const data=this.data,settings=readSteeringSettings(data),agents=this.agents();
     const machines=data.agents.filter(agent=>agent.state!=='revoked').map(agent=>{const view=agents.find(item=>item.id===agent.id)||{};return{id:agent.id,name:agent.name||agent.id,domain:view.domain||agent.domain||'',local:agent.id===LOCAL_AGENT_ID,status:view.status,agentVersion:view.agentVersion||'',steerTarget:agent.steerTarget!==false,issues:agentSteeringIssues({...agent,domain:view.domain||agent.domain},settings)}});
     const email=data.settings.certificateEmail||'',entryCommands=[];
     // Machines that know entry-v1 (and the panel itself) set the entry domain up on their own; the command

@@ -76,4 +76,3 @@ export function followEntry({dir,entry,nowMs=Date.now()}){
 }
 
 export const DOMAIN_REQUEST_FILE=REQUEST_FILE;
-export const DOMAIN_STATUS_FILE=STATUS_FILE;

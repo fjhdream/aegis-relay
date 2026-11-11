@@ -7,9 +7,8 @@ import { sealAgentSnapshot } from './agent-config.js';
 import { sanitizeTelemetry } from './telemetry.js';
 import { cleanEntryStatus, desiredEntry, ENTRY_CAPABILITY } from './steering-topology.js';
 
-export const AGENT_PROTOCOL_VERSION=1;
-export const ENROLLMENT_TTL_MS=10*60_000;
-const EMPTY_SHA256=b64u(crypto.createHash('sha256').update(Buffer.alloc(0)).digest());
+const AGENT_PROTOCOL_VERSION=1;
+const ENROLLMENT_TTL_MS=10*60_000;
 
 const sha256=value=>b64u(crypto.createHash('sha256').update(value).digest());
 const nowSeconds=()=>Math.floor(Date.now()/1000);
@@ -265,5 +264,3 @@ export class AgentApi {
     }catch(error){return this.reject(res,error,error.nonce||requestNonce);}
   }
 }
-
-export const EMPTY_BODY_SHA256=EMPTY_SHA256;

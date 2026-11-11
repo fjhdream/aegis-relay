@@ -41,7 +41,6 @@ async function call(path,options={}){
 const value=id=>$(id).value, bool=id=>value(id)==='true', escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.classList.remove('hidden');el.classList.toggle('error',error);clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.add('hidden'),3200)}
 function bytes(n=0){const units=['B','KB','MB','GB','TB'];let i=0;n=Number(n)||0;while(n>=1024&&i<units.length-1){n/=1024;i++}return`${n>=10||i===0?n.toFixed(0):n.toFixed(1)} ${units[i]}`}
-function uptime(start){if(!start)return'—';let s=Math.max(0,(Date.now()-new Date(start))/1000),d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}天 ${h}时`:`${h}时 ${m}分`}
 function recentDays(daily,count=14){const rows=[];for(let ago=count-1;ago>=0;ago--){const day=new Date();day.setUTCHours(0,0,0,0);day.setUTCDate(day.getUTCDate()-ago);const key=day.toISOString().slice(0,10);rows.push({key,label:`${day.getUTCMonth()+1}/${day.getUTCDate()}`,bytes:Number(daily?.[key]||0)})}return rows}
 function showSecret(content,{eyebrow='连接信息',title='节点连接信息',description='完整节点地址和连接密码可由管理员随时再次查看。'}={}){$('#modal-eyebrow').textContent=eyebrow;$('#modal-title').textContent=title;$('#modal-description').textContent=description;$('#secret').textContent=content;$('#modal').classList.remove('hidden')}
 
@@ -70,7 +69,9 @@ async function start(){
   try{const status=await call('/status');$('#auth').classList.remove('hidden');$(status.initialized?'#login':'#setup').classList.remove('hidden')}catch(e){$('#gate-msg').textContent=e.message}
 }
 $('#setup-btn').onclick=async()=>{try{await call('/setup',{method:'POST',body:JSON.stringify({username:value('#su-user'),password:value('#su-pass'),setupToken:value('#su-token')})});$('#setup').classList.add('hidden');$('#login').classList.remove('hidden');$('#gate-msg').textContent='管理员已创建，请用密码登录；可稍后在“个人设置”开启两步验证。'}catch(e){$('#gate-msg').textContent=e.message}};
-$('#login-btn').onclick=async()=>{try{const data=await call('/login',{method:'POST',body:JSON.stringify({password:value('#password'),code:value('#code')})});state.csrf=data.csrf;await enterApp()}catch(e){$('#gate-msg').textContent=e.message}};
+// With two-step verification on, a saved recovery code stands in for the TOTP code; each mode sends only its own field.
+$('#login-btn').onclick=async()=>{try{const password=value('#password'),body=$('#recovery-field').classList.contains('hidden')?{password,code:value('#code')}:{password,recovery:value('#recovery').trim()};const data=await call('/login',{method:'POST',body:JSON.stringify(body)});state.csrf=data.csrf;await enterApp()}catch(e){$('#gate-msg').textContent=e.message}};
+$('#recovery-toggle').onclick=()=>{const recovery=$('#recovery-field').classList.contains('hidden');$('#code-field').classList.toggle('hidden',recovery);$('#recovery-field').classList.toggle('hidden',!recovery);setValue(recovery?'#code':'#recovery','');$('#recovery-toggle').textContent=recovery?'改用动态验证码':'丢失验证器？使用恢复码';$(recovery?'#recovery':'#code').focus()};
 $('#logout').onclick=async()=>{try{await call('/logout',{method:'POST',body:'{}'})}finally{location.reload()}};
 
 async function refreshAll(){const [routes,dashboard]=await Promise.all([call('/routes'),call('/dashboard')]);state.routes=routes.routes;state.dashboard=dashboard;renderRoutes();renderDashboard(dashboard);renderTraffic(dashboard);fillDiagnosticNodes()}
