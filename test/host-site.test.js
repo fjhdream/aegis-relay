@@ -64,7 +64,7 @@ const INSTALLED_ON_AGENT=[...fs.readFileSync(path.join(SCRIPTS,'agent-install.sh
 function host() {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-host-')),dir=name=>path.join(root,name),calls=dir('calls');
   ROOTS.push(root);
-  for(const name of ['nginx/sites-available','nginx/sites-enabled','letsencrypt','acme-root','tmp','agent/data','agent/src','panel/scripts','panel/src'])fs.mkdirSync(dir(name),{recursive:true});
+  for(const name of ['nginx/sites-available','nginx/sites-enabled','letsencrypt','acme-root','tmp','agent/data','agent/src','panel/scripts','panel/src','panel/data'])fs.mkdirSync(dir(name),{recursive:true});
   for(const name of INSTALLED_ON_AGENT)fs.copyFileSync(path.join(SCRIPTS,name),path.join(dir('agent'),name));
   // The panel machine keeps the whole repository: its scripts in scripts/, the library beside them in src/.
   for(const name of fs.readdirSync(SCRIPTS))fs.copyFileSync(path.join(SCRIPTS,name),path.join(dir('panel/scripts'),name));
@@ -635,6 +635,98 @@ test('a value is written into .env as it is, and a write that fails leaves .env 
   assert.deepEqual([panel.env('panel'),panel.calls().some(call=>call.startsWith('certbot ')),panel.calls().some(call=>call.startsWith('docker compose up'))],[{ADMIN_PATH:'secret-admin'},true,false],'it had got as far as the certificate, and did not restart the panel');
 });
 
+// The three scripts a systemd path unit starts as root when a container leaves a request in its data
+// directory: where the request goes, one a careful container would file, how the script is run, and
+// how to tell that it acted.
+const APPLIERS={
+  'agent-host-domain-apply.sh':{data:'agent/data',request:'host-domain-request.json',status:'host-domain-status.json',
+    good:{version:1,requestId:'request-0101',mode:'domain',desiredDomain:'hk.example.com',certificateEmail:'ops@example.com'},
+    prepare:()=>agentOnItsIp(),run:(h,extra)=>h.run('agent-host-domain-apply.sh',[],extra),acted:h=>/server_name hk\.example\.com;/.test(h.site('aegis-relay-agent'))},
+  'host-domain-apply.sh':{data:'panel/data',request:'host-domain-request.json',status:'host-domain-status.json',
+    good:{requestId:'request-0102',desiredDomain:'emby.example.com',certificateEmail:'ops@example.com'},
+    prepare:()=>{const h=host();assert.equal(h.run('configure-domain.sh',['panel.example.com','ops@example.com']).status,0);return h},
+    run:(h,extra)=>h.run('host-domain-apply.sh',[],extra),acted:h=>h.env('panel').LOCAL_PROXY_BASE_URL==='https://emby.example.com'},
+  'host-entry-apply.sh':{data:'agent/data',request:'host-entry-request.json',status:'host-entry-status.json',
+    good:{version:1,requestId:'request-0103',entryDomain:'entry.example.com',certificateEmail:'ops@example.com',peers:['peer-a.example.com'],attempt:1},
+    prepare:()=>agentOnItsIp(),run:(h,extra)=>h.run('host-entry-apply.sh',[h.dir('agent')],extra),acted:h=>h.enabled('aegis-relay-entry')}
+};
+const readJson=file=>{try{return JSON.parse(fs.readFileSync(file,'utf8'))}catch{return null}};
+
+test('a request is acted on only if it is a small regular file; anything else at its name is taken away unread',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  for(const [script,applier] of Object.entries(APPLIERS)){
+    // What a container files, handled.
+    const fine=applier.prepare(),at=h=>path.join(h.dir(applier.data),applier.request),statusOf=h=>path.join(h.dir(applier.data),applier.status);
+    fs.writeFileSync(at(fine),JSON.stringify(applier.good));
+    const handled=applier.run(fine);
+    assert.deepEqual([handled.status,fs.existsSync(at(fine)),applier.acted(fine),readJson(statusOf(fine)).state,readJson(statusOf(fine)).requestId,fs.statSync(statusOf(fine)).mode&0o777],[0,false,true,'active',applier.good.requestId,0o644],`${script}: ${handled.output}`);
+    assert.deepEqual(fine.leftovers(),[],script);
+    // The data directory belongs to the container's user, so anything can be at the request's name.
+    // Each of these would do harm if root opened it the ordinary way; the request text in them is valid.
+    const text=JSON.stringify(applier.good),planted={
+      'a link to a file elsewhere':(h,file)=>{fs.writeFileSync(path.join(h.root,'elsewhere.json'),text);fs.symlinkSync(path.join(h.root,'elsewhere.json'),file)},
+      'a link to /dev/zero, which never ends':(h,file)=>fs.symlinkSync('/dev/zero',file),
+      'a pipe, which never answers':(h,file)=>assert.equal(spawnSync('mkfifo',[file]).status,0),
+      'a directory':(h,file)=>{fs.mkdirSync(file);fs.writeFileSync(path.join(file,'inside'),text)},
+      'a request far larger than any real one':(h,file)=>fs.writeFileSync(file,text+' '.repeat(70_000)),
+      'a file that pretends to be huge':(h,file)=>{fs.writeFileSync(file,text);fs.truncateSync(file,512*1024*1024)},
+      'a list instead of an object':(h,file)=>fs.writeFileSync(file,JSON.stringify([applier.good])),
+      'bytes that are not text':(h,file)=>fs.writeFileSync(file,Buffer.from([0xff,0xfe,0x00,0x7b]))
+    };
+    for(const [what,plant] of Object.entries(planted)){
+      const h=applier.prepare(),file=at(h),status=readJson(statusOf(h)),calls=h.calls().length,started=Date.now();
+      plant(h,file);
+      const result=applier.run(h);
+      assert.deepEqual([result.status,result.error?.code],[1,undefined],`${script}, ${what}: ${result.output}`);
+      assert.ok(Date.now()-started<10_000,`${script}, ${what}: took ${Date.now()-started}ms`);
+      assert.throws(()=>fs.lstatSync(file),/ENOENT/,`${script}, ${what}: nothing is left for the path unit to start on again`);
+      assert.deepEqual([applier.acted(h),readJson(statusOf(h)),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call))],[false,status,[]],`${script}, ${what}: nothing was done`);
+      if(what.startsWith('a link to a file'))assert.equal(fs.readFileSync(path.join(h.root,'elsewhere.json'),'utf8'),text,'the file behind the link is left alone');
+    }
+    // No request at all: nothing to do.
+    const idle=applier.prepare(),before=idle.calls().length;
+    assert.deepEqual([applier.run(idle).status,idle.since(before).filter(call=>!call.startsWith('id '))],[0,[]],script);
+  }
+});
+
+test('the status a request is answered with is made readable through its descriptor, not by its name',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  // The two scripts that write their status with python make a temporary file in the container's
+  // directory. Suppose the container swaps it for a link the moment it appears (done here by wrapping
+  // mkstemp): a chmod by name would then make the file behind the link readable to everyone.
+  const wrap=fs.mkdtempSync(path.join(os.tmpdir(),'aegis-host-python-'));ROOTS.push(wrap);
+  fs.writeFileSync(path.join(wrap,'sitecustomize.py'),`import os, tempfile
+_mkstemp = tempfile.mkstemp
+def mkstemp(*args, **kwargs):
+    descriptor, name = _mkstemp(*args, **kwargs)
+    if '-status.' in os.path.basename(name):
+        os.unlink(name)
+        os.symlink(os.environ['TEST_VICTIM'], name)
+    return descriptor, name
+tempfile.mkstemp = mkstemp
+`);
+  for(const script of ['host-domain-apply.sh','host-entry-apply.sh']){
+    const applier=APPLIERS[script],h=applier.prepare(),victim=path.join(h.root,'victim');
+    fs.writeFileSync(victim,'root only\n');fs.chmodSync(victim,0o600);
+    fs.writeFileSync(path.join(h.dir(applier.data),applier.request),JSON.stringify(applier.good));
+    applier.run(h,{PYTHONPATH:wrap,TEST_VICTIM:victim});
+    assert.deepEqual([fs.readFileSync(victim,'utf8'),fs.statSync(victim).mode&0o777,applier.acted(h)],['root only\n',0o600,true],script);
+  }
+});
+
+test('an apply script that has lost the library drops the request instead of spinning on it',()=>{
+  const agent=agentOnItsIp(),panel=host();
+  for(const [h,src,data,request,run] of [
+    [agent,'agent/src','agent/data','host-entry-request.json',()=>agent.run('host-entry-apply.sh',[agent.dir('agent')])],
+    [panel,'panel/src','panel/data','host-domain-request.json',()=>panel.run('host-domain-apply.sh')]
+  ]){
+    fs.rmSync(path.join(h.dir(src),'host-site.sh'));
+    // Without the library the only install directories these scripts will touch are the real ones, so
+    // the request in this temporary one stays; what matters is that they stop at once and say why.
+    fs.writeFileSync(path.join(h.dir(data),request),'{}');
+    const calls=h.calls().length,result=run();
+    assert.deepEqual([result.status,/host-site\.sh is missing/.test(result.output),h.since(calls)],[1,true,[]]);
+  }
+});
+
 test('the aegis-relay-agent command says how it is used instead of guessing',()=>{
   const h=agentOnItsIp(),calls=h.calls().length;
   for(const args of [['domain'],['domain','hk.example.com'],['domain','hk.example.com','ops@example.com','extra'],['entry','entry.example.com'],['nonsense']]){
@@ -704,7 +796,7 @@ test('whichever version of the installer delivers the scripts, the library comes
   }
   // Every script that needs the library looks for it in src/, beside itself or one directory up.
   const sourcing=fs.readdirSync(SCRIPTS).filter(name=>text(name).includes('host-site.sh')).sort();
-  assert.deepEqual(sourcing,['agent-configure-domain.sh','agent-configure-ip.sh','agent-host-domain-apply.sh','agent-upgrade.sh','configure-domain.sh','configure-entry-domain.sh','configure-local-domain.sh']);
+  assert.deepEqual(sourcing,['agent-configure-domain.sh','agent-configure-ip.sh','agent-host-domain-apply.sh','agent-upgrade.sh','configure-domain.sh','configure-entry-domain.sh','configure-local-domain.sh','host-domain-apply.sh','host-entry-apply.sh']);
   for(const name of sourcing)for(const line of text(name).split('\n').filter(line=>/(^|[ ;])\. "/.test(line)))assert.match(line,/\. "\$(AEGIS_HERE|INSTALL_DIR)\/(\.\.\/)?src\/host-site\.sh"/,`${name}: ${line}`);
   // The panel machine keeps the whole repository, src/ and scripts/ side by side.
   assert.match(text('bootstrap.sh'),/^cp -a "\$TMP_DIR\/source\/\." "\$INSTALL_DIR\/"$/m);

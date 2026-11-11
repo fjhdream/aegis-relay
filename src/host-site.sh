@@ -110,6 +110,65 @@ site_restore(){
 }
 
 # ---------------------------------------------------------------------------------------------------
+# Requests. A container cannot touch the host's Nginx or certificates, so it leaves a request file in
+# its data directory and a systemd path unit starts a script here, as root, to act on it. That
+# directory belongs to the container's user: whatever is at the request's name is that user's doing.
+
+# The request, printed, if it is what a request can be: a regular file of at most 64 KiB, opened
+# without following a link and without waiting. Anything else fails, unread: a link (to a file only
+# root may read, or to /dev/zero), a pipe that would keep the unit waiting for ever, a file large
+# enough to exhaust the host's memory.
+#   host_request_text FILE
+host_request_text(){
+  python3 - "$1" <<'PY'
+import os, stat, sys
+LIMIT = 65536
+try:
+    descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError:
+    sys.exit(1)
+try:
+    information = os.fstat(descriptor)
+    if not stat.S_ISREG(information.st_mode) or information.st_size > LIMIT:
+        sys.exit(1)
+    text = b''
+    while len(text) <= LIMIT:
+        piece = os.read(descriptor, LIMIT + 1 - len(text))
+        if not piece:
+            break
+        text += piece
+    if len(text) > LIMIT:
+        sys.exit(1)
+finally:
+    os.close(descriptor)
+sys.stdout.buffer.write(text)
+PY
+}
+
+# The named fields of a request, one per line, read once so that all of them come from the same
+# request. A field that is missing, not a string, or holds a line break comes out as an empty line;
+# a request that is not a JSON object fails.
+#   host_request_fields FILE NAME [NAME ...]
+host_request_fields(){
+  aegis_request_file=$1; shift
+  host_request_text "$aegis_request_file" | python3 -c '
+import json, sys
+request = json.load(sys.stdin)
+if not isinstance(request, dict):
+    sys.exit(1)
+for name in sys.argv[1:]:
+    field = request.get(name, "")
+    print(field if isinstance(field, str) and "\n" not in field and "\r" not in field else "")
+' "$@"
+}
+
+# Take away whatever is at a request's name, so that the path unit watching it comes to rest. A
+# request is a file; if the container put a directory or a link there, that goes too (a link is
+# removed, not followed).
+#   host_request_drop FILE
+host_request_drop(){ rm -rf -- "$1" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------------------------------------------
 # An agent's direct address (直连地址, see GLOSSARY.md): the domain (HTTPS) or the public IP (plain
 # HTTP) its Nginx answers on, in front of the agent container. Every way of setting it comes through
 # agent_serve_domain and agent_serve_ip: the installer, the upgrade, the aegis-relay-agent command and
