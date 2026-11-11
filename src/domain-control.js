@@ -46,17 +46,63 @@ export function readDomainStatus(dir){
   };
 }
 
-export function requestDomainSwitch({dir,domain,email,currentDomain=''}){
+export function requestDomainSwitch({dir,domain,email,currentDomain='',nowMs=Date.now()}){
   const desiredDomain=normalizeAgentDomain(domain),certificateEmail=String(email||'').trim().toLowerCase();
   if(!/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(desiredDomain))throw new Error('代理域名必须是未携带端口或路径的完整 DNS 域名');
   if(!certificateEmail)throw new Error('请先在部署向导保存统一证书邮箱');
   if(!/^[^\s@]+@[^\s@]+$/.test(certificateEmail)||certificateEmail.length>254)throw new Error('证书邮箱格式无效');
-  const requestId=randomToken(18),requestedAt=new Date().toISOString();
+  const requestId=randomToken(18),requestedAt=new Date(nowMs).toISOString();
   const request={version:1,requestId,mode:'domain',desiredDomain,certificateEmail,requestedAt};
   const status={requestId,state:'pending',mode:'domain',desiredDomain,currentDomain,message:'等待主机申请证书并切换 Nginx',updatedAt:requestedAt};
   writeJson(path.join(dir,STATUS_FILE),status);
   writeJson(path.join(dir,REQUEST_FILE),request);
   return status;
+}
+
+// IP reverse-proxy mode carries no domain or email: the host unit detects the public IP and serves
+// plain HTTP.
+function requestIpSwitch({dir,currentDomain='',nowMs=Date.now()}){
+  const requestId=randomToken(18),requestedAt=new Date(nowMs).toISOString();
+  writeJson(path.join(dir,STATUS_FILE),{requestId,state:'pending',mode:'ip',desiredDomain:'',currentDomain,message:'等待主机切换为 IP 反代（HTTP）',updatedAt:requestedAt});
+  writeJson(path.join(dir,REQUEST_FILE),{version:1,requestId,mode:'ip',requestedAt});
+}
+
+// Where an agent serves right now: what the host last switched it to, else what it was installed with
+// (`installed` is {mode,domain,ip} from the install command; mode 'ip' or a missing domain means its
+// public IP over plain HTTP). `domain` is the IP in IP mode.
+export function servingAddress({dir,installed={}}){
+  const status=readDomainStatus(dir),switched=status?.state==='active';
+  const mode=switched?status.mode:installed.mode==='ip'?'ip':installed.domain?'domain':installed.ip?'ip':'domain';
+  return {mode,domain:switched&&status.currentDomain?status.currentDomain:(mode==='ip'?installed.ip:installed.domain)||''};
+}
+
+// A switch the host failed to make is asked for again after this long.
+const DOMAIN_RETRY_MS=10*60_000;
+// Files a request when the panel wants this agent on another domain, or on its IP, than the one it
+// serves on. `desired` is {mode,domain,email} as the panel's check-in answer has it: mode 'ip', or a
+// domain with the certificate email; neither means the panel wants nothing changed. One host change at
+// a time, and a switch already asked for is left to the host unless it failed long enough ago.
+export function followDomain({dir,desired={},installed={},nowMs=Date.now()}){
+  const toIp=desired.mode==='ip',domain=toIp?'':String(desired.domain||'');
+  if(!toIp&&!domain)return false;
+  const serving=servingAddress({dir,installed});
+  if(toIp?serving.mode==='ip':serving.mode==='domain'&&serving.domain===domain)return false;
+  if(fs.existsSync(path.join(dir,REQUEST_FILE)))return false;
+  const status=readDomainStatus(dir);
+  if(status&&(toIp?status.mode==='ip':status.mode==='domain'&&status.desiredDomain===domain)){
+    if(status.state!=='failed')return false;
+    const age=nowMs-Date.parse(status.updatedAt||'');
+    if(!Number.isFinite(age)||age<=DOMAIN_RETRY_MS)return false;
+  }
+  if(toIp){requestIpSwitch({dir,currentDomain:serving.domain,nowMs});return true;}
+  // A domain or certificate email the host could not act on is not worth a request.
+  try{requestDomainSwitch({dir,domain,email:desired.email,currentDomain:serving.domain,nowMs});return true;}catch{return false;}
+}
+
+// A machine that enrolls again starts a new life: what the host did for the previous one must not be
+// reported as its own.
+export function forgetDomainSwitch(dir){
+  for(const file of [STATUS_FILE,REQUEST_FILE])try{fs.rmSync(path.join(dir,file),{force:true})}catch{}
 }
 
 // The steering entry domain: same plumbing, its own host unit (host-entry-apply.sh).
