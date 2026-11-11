@@ -196,6 +196,23 @@ test('dashboard feed, settings and the static shell',async()=>{
   assert.equal((await call('GET','/missing.js',undefined,{auth:false,prefix:''})).status,404);
 });
 
+test('the page and everything it loads are served, each asked for by version',async()=>{
+  const version=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8')).version,get=file=>call('GET',`/${file}`,undefined,{auth:false,prefix:''});
+  const page=await get('');
+  assert.match(page.headers.get('content-type'),/^text\/html/);
+  // The app is a module (it imports the rest), and nothing is left for the browser to guess a version of.
+  const scripts=[...page.text.matchAll(/<script\b([^>]*)>/g)].map(match=>match[1].trim()),styles=[...page.text.matchAll(/<link rel="stylesheet" href="([^"]+)"/g)].map(match=>match[1]);
+  assert.deepEqual([scripts,styles],[[`type="module" src="app.js?v=${version}"`],[`style.css?v=${version}`,`help.css?v=${version}`]]);
+  const app=await get(`app.js?v=${version}`),imports=[...app.text.matchAll(/^import\b[^'\n]*'([^']+)'/gm)].map(match=>match[1]);
+  assert.deepEqual(imports,[`./view.js?v=${version}`]);
+  for(const [file,type] of [[`app.js?v=${version}`,/^text\/javascript/],...imports.map(name=>[name.slice(2),/^text\/javascript/]),...styles.map(name=>[name,/^text\/css/])]){
+    const answer=await get(file);
+    assert.deepEqual([answer.status,type.test(answer.headers.get('content-type')),answer.headers.get('cache-control'),answer.text.length>0],[200,true,'no-store',true],file);
+  }
+  // What the browser is given for view.js is the file the tests import.
+  assert.equal((await get(`view.js?v=${version}`)).text,fs.readFileSync(path.join(ROOT,'web','view.js'),'utf8'));
+});
+
 test('a rejected update leaves the node and the machine exactly as they were',async()=>{
   const node=async alias=>(await call('GET','/routes')).body.routes.find(r=>r.alias===alias);
   const edge=await node('edge'),path=(await call('GET',`/routes/${edge.id}/credentials`)).body.clientPath;

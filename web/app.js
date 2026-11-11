@@ -1,23 +1,15 @@
+// The page's side of the panel: it fetches, hands the data to view.js, writes what comes back into the
+// page and listens for what the person does next. What is shown is decided in view.js.
+import {ADDR_MASK,BRAND_MARK,DEFAULT_FAVICON,EYE_SVG,TITLES,UA_PRESETS,bytes,credentialText,escapeHtml,qrSvg,recentDays,routeMatches} from './view.js';
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-const scriptPath=new URL(document.currentScript?.src||location.href).pathname;
+// A module has no document.currentScript; its own address says where the panel is served from.
+const scriptPath=new URL(import.meta.url).pathname;
 const base=scriptPath.endsWith('/app.js')?scriptPath.replace(/\/app\.js$/,'/api'):location.pathname.replace(/\/$/,'')+'/api';
 // Theme: apply the saved (or system) preference before first paint of the app shell.
 const THEME_KEY='aegis-theme';
 (function(){let t;try{t=localStorage.getItem(THEME_KEY)}catch{}if(t!=='dark'&&t!=='light')t=window.matchMedia&&matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';document.documentElement.dataset.theme=t})();
 function toggleTheme(){const next=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=next;try{localStorage.setItem(THEME_KEY,next)}catch{}}
 const state={csrf:'',routes:[],agents:[],panelVersion:'',dashboard:null,editing:null,page:'dashboard',panelIcon:''};
-const titles={dashboard:'仪表盘',nodes:'节点管理',agents:'代理机器',steering:'自动切流',traffic:'流量统计',access:'访问监控',diagnostics:'故障诊断',audit:'安全审计',notifications:'通知提醒',account:'个人设置',deployment:'部署向导'};
-// One-click client-identity templates for authorized upstreams. Device ID stays untouched so it remains unique per install.
-const UA_PRESETS=[
-  {name:'透传（默认）',clear:true},
-  {name:'Infuse',userAgent:'Infuse-Direct/8.1.1',client:'Infuse',deviceName:'Infuse'},
-  {name:'Emby Web',userAgent:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',client:'Emby Web',deviceName:'Chrome'},
-  {name:'Emby for Android',userAgent:'Emby/3.4.10 (Android 14; Pixel 8)',client:'Emby for Android',deviceName:'Pixel 8'},
-  {name:'Fileball',userAgent:'Fileball/1.5.0',client:'Fileball',deviceName:'Fileball'},
-  {name:'SenPlayer',userAgent:'SenPlayer/1.2.0',client:'SenPlayer',deviceName:'SenPlayer'},
-  {name:'VidHub',userAgent:'VidHub/1.9 (iOS 17)',client:'VidHub',deviceName:'VidHub'},
-];
-
 function showLogin(message='登录已失效，请重新登录'){
   state.csrf='';
   $('#app').classList.add('hidden');
@@ -38,16 +30,10 @@ async function call(path,options={}){
   if(!response.ok)throw Error(data.error||'请求失败');
   return data;
 }
-const value=id=>$(id).value, bool=id=>value(id)==='true', escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const value=id=>$(id).value, bool=id=>value(id)==='true';
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.classList.remove('hidden');el.classList.toggle('error',error);clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.add('hidden'),3200)}
-function bytes(n=0){const units=['B','KB','MB','GB','TB'];let i=0;n=Number(n)||0;while(n>=1024&&i<units.length-1){n/=1024;i++}return`${n>=10||i===0?n.toFixed(0):n.toFixed(1)} ${units[i]}`}
-function recentDays(daily,count=14){const rows=[];for(let ago=count-1;ago>=0;ago--){const day=new Date();day.setUTCHours(0,0,0,0);day.setUTCDate(day.getUTCDate()-ago);const key=day.toISOString().slice(0,10);rows.push({key,label:`${day.getUTCMonth()+1}/${day.getUTCDate()}`,bytes:Number(daily?.[key]||0)})}return rows}
 function showSecret(content,{eyebrow='连接信息',title='节点连接信息',description='完整节点地址和连接密码可由管理员随时再次查看。'}={}){$('#modal-eyebrow').textContent=eyebrow;$('#modal-title').textContent=title;$('#modal-description').textContent=description;$('#secret').textContent=content;$('#modal').classList.remove('hidden')}
 
-// The AegisRelay mark: a solid shield with an A cut out of it, drawn on a 24-unit grid in currentColor.
-const BRAND_MARK_PATH='M12 2.4 19.6 5.3v6.2c0 4.9-3.2 8.5-7.6 10.3-4.4-1.8-7.6-5.4-7.6-10.3V5.3zM12 8.1 15.9 15.8h-2.3L12 12.5l-1.6 3.3H8.1z';
-const BRAND_MARK=`<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="${BRAND_MARK_PATH}"/></svg>`;
-const DEFAULT_FAVICON='data:image/svg+xml;base64,'+btoa(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#09090b"/><path transform="translate(12.16 12.16) scale(1.653)" fill="#ffffff" fill-rule="evenodd" d="${BRAND_MARK_PATH}"/></svg>`);
 function applyPanelIcon(icon){
   state.panelIcon=String(icon||'');
   for(const el of document.querySelectorAll('.brand-mark')){
@@ -78,7 +64,7 @@ async function refreshAll(){const [routes,dashboard]=await Promise.all([call('/r
 function renderDashboard(data){
   const machines=Array.isArray(data.machines)?data.machines:[],online=machines.filter(machine=>machine.status==='online'&&machine.proxyHealthy).length;
   $('#m-nodes').textContent=state.routes.length;$('#m-running').textContent=`${data.running} 个运行中`;$('#m-traffic').textContent=bytes(data.totalBytes);$('#m-month-traffic').textContent=`本月 ${bytes(data.monthBytes)}`;$('#m-requests').textContent=Number(data.totalRequests||0).toLocaleString();$('#m-active').textContent=`${data.active||0} 个活动连接`;$('#m-agents').textContent=`${online} / ${machines.length}`;$('#m-agent-state').textContent=machines.length?`${machines.length-online} 台需关注`:'暂无代理机器';
-  const days=recentDays(data.daily),max=Math.max(1,...days.map(day=>day.bytes)),today=days.at(-1)?.bytes||0,week=days.slice(-7).reduce((sum,day)=>sum+day.bytes,0),peak=days.reduce((best,day)=>day.bytes>best.bytes?day:best,days[0]);
+  const days=recentDays(data.daily,Date.now()),max=Math.max(1,...days.map(day=>day.bytes)),today=days.at(-1)?.bytes||0,week=days.slice(-7).reduce((sum,day)=>sum+day.bytes,0),peak=days.reduce((best,day)=>day.bytes>best.bytes?day:best,days[0]);
   $('#traffic-chart').innerHTML=days.map(day=>{const pct=day.bytes?Math.max(3,day.bytes/max*100):0;return`<div class="traffic-day${day.bytes?'':' empty'}" title="${day.key} · ${bytes(day.bytes)}"><div class="traffic-track"><i style="height:${pct}%"></i>${day.bytes?`<b class="traffic-value" style="bottom:calc(${pct}% + 6px)">${bytes(day.bytes)}</b>`:''}</div><small>${day.label}</small></div>`}).join('');
   $('#traffic-insights').innerHTML=`<div><small>今日流量</small><strong>${bytes(today)}</strong></div><div><small>近 7 天</small><strong>${bytes(week)}</strong></div><div><small>单日峰值</small><strong>${bytes(peak?.bytes||0)}</strong><em>${peak?.label||'—'}</em></div><div><small>播放请求</small><strong>${Number(data.playbackRequests||0).toLocaleString()}</strong></div>`;
   const statusLabel={online:'在线',stale:'连接延迟',offline:'失联',revoked:'已撤销'};
@@ -90,14 +76,10 @@ function renderPresets(){const host=$('#profile-presets');if(!host)return;host.i
 function applyPreset(p){if(p.clear){$('#profile-enabled').checked=false;for(const id of ['#profile-ua','#profile-client','#profile-device'])setValue(id,'')}else{$('#profile-enabled').checked=true;setValue('#profile-ua',p.userAgent||'');setValue('#profile-client',p.client||'');setValue('#profile-device',p.deviceName||'')}markActivePreset()}
 function markActivePreset(){const ua=value('#profile-ua'),host=$('#profile-presets');if(!host)return;host.querySelectorAll('.preset-chip').forEach(chip=>{const p=UA_PRESETS[+chip.dataset.i];chip.classList.toggle('active',!p.clear&&!!ua&&p.userAgent===ua)})}
 async function testConnection(route,row){const btn=row.querySelector('.test-node');btn.disabled=true;btn.classList.remove('good','warn','bad');btn.textContent='测试中…';try{const d=await call(`/diagnostics/${route.id}`);const p=(d.main||[])[0]||{},lat=Number(p.latencyMs),cls=!p.online?'bad':lat<300?'good':lat<800?'warn':'bad';btn.classList.add(cls);btn.textContent=p.online?(isFinite(lat)?lat+' ms':'在线'):'失败';toast(p.online?`${route.name} 在线 · ${isFinite(lat)?lat+' ms':'—'} · HTTP ${p.status||'—'}${p.embyVersion?` · Emby ${p.embyVersion}`:''}`:`${route.name} 连接失败${p.error?' · '+p.error:''}`,!p.online)}catch(e){btn.classList.add('bad');btn.textContent='失败';toast(e.message,true)}finally{btn.disabled=false}}
-function credentialText(route,data){const origin=String(data.publicBaseUrl||location.origin).replace(/\/$/,'');const full=`${origin}${data.clientPath}`;return data.accessKey?`客户端服务器地址（复制这一整行）\n${full}\n\n地址保护码（已经包含在上面的地址中，无需单独填写）\n${data.accessKey}\n\n在 Emby 客户端添加服务器时，只需粘贴完整服务器地址。`:`客户端服务器地址（复制这一整行）\n${full}\n\n此节点没有启用连接密码，知道地址的人都可以访问。`}
 function askConnectionKey(){return prompt('输入新的连接密码（8–64 位字母、数字、下划线或连字符）。留空将安全随机生成；点击取消则不更换。','')}
-async function viewCredentials(route){try{const data=await call(`/routes/${route.id}/credentials`);if(!data.available){if(!confirm('这个节点由旧版本创建，当时没有保存可恢复的连接密码。是否现在更换密码？更换后旧客户端地址会立即失效。'))return;const custom=askConnectionKey();if(custom===null)return;const rotated=await call(`/routes/${route.id}/rotate-key`,{method:'POST',body:JSON.stringify({accessKey:custom})});showSecret(credentialText(route,rotated));return}showSecret(credentialText(route,data))}catch(e){toast(e.message,true)}}
-const ADDR_MASK='••••••••••••••••••';
+async function viewCredentials(route){try{const data=await call(`/routes/${route.id}/credentials`);if(!data.available){if(!confirm('这个节点由旧版本创建，当时没有保存可恢复的连接密码。是否现在更换密码？更换后旧客户端地址会立即失效。'))return;const custom=askConnectionKey();if(custom===null)return;const rotated=await call(`/routes/${route.id}/rotate-key`,{method:'POST',body:JSON.stringify({accessKey:custom})});showSecret(credentialText(rotated,location.origin));return}showSecret(credentialText(data,location.origin))}catch(e){toast(e.message,true)}}
 async function nodeUrl(r){if(r._url)return r._url;const d=await call(`/routes/${r.id}/credentials`);if(!d.available)throw new Error('该节点由旧版本创建，未保存可恢复的地址，请先“更换密码”。');r._url=String(d.publicBaseUrl||location.origin).replace(/\/$/,'')+d.clientPath;return r._url}
 function statusPills(r){const pills=[`<span class="pill ${r.enabled?'on':'off'}">${r.enabled?'运行中':'已停用'}</span>`,`<span class="pill ${r.accessMode==='key'?'lock':'off'}">${r.accessMode==='key'?'密钥':'公开'}</span>`];if(r.clientProfile&&r.clientProfile.enabled)pills.push(`<span class="pill disguise">伪装${r.clientProfile.client?'：'+escapeHtml(r.clientProfile.client):''}</span>`);if(r.streamRewrite&&r.streamRewrite.enabled)pills.push(`<span class="pill split">分离推流</span>`);const dn=state.dashboard&&state.dashboard.nodes&&state.dashboard.nodes.find(n=>n.id===r.id);if(dn&&dn.suspicious)pills.push(`<span class="pill danger" title="30 天内不同设备 ${dn.distinctDevices} 超过阈值（动态 IP 不计入）">⚠ 疑似被分发</span>`);return pills.concat(r.tags.map(t=>`<span class="tag">${escapeHtml(t)}</span>`)).join('')}
-const EYE_SVG='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
-function routeMatches(r,q){if(!q)return true;const hay=`${r.name} ${r.alias} ${(r.tags||[]).join(' ')}`.toLowerCase();return hay.includes(q)}
 let dragRouteId=null;
 async function persistOrder(){
   const updates=state.routes.map((route,index)=>({route,order:(index+1)*10})).filter(item=>Number(item.route.sortOrder)!==item.order);
@@ -154,7 +136,7 @@ function renderRoutes(){
     row.querySelector('.toggle-node').onclick=()=>patchRoute(r,{enabled:!r.enabled});
     row.querySelector('.star').onclick=()=>patchRoute(r,{favorite:!r.favorite});
     row.querySelector('.edit-node').onclick=()=>openDrawer(r);
-    row.querySelector('.rotate-node').onclick=async()=>{if(!confirm('更换连接密码后，所有使用旧地址的客户端会立即失效。确认继续吗？'))return;const custom=askConnectionKey();if(custom===null)return;try{const x=await call(`/routes/${r.id}/rotate-key`,{method:'POST',body:JSON.stringify({accessKey:custom})});r._url=null;showSecret(credentialText(r,x))}catch(e){toast(e.message,true)}};
+    row.querySelector('.rotate-node').onclick=async()=>{if(!confirm('更换连接密码后，所有使用旧地址的客户端会立即失效。确认继续吗？'))return;const custom=askConnectionKey();if(custom===null)return;try{const x=await call(`/routes/${r.id}/rotate-key`,{method:'POST',body:JSON.stringify({accessKey:custom})});r._url=null;showSecret(credentialText(x,location.origin))}catch(e){toast(e.message,true)}};
     const reminder=row.querySelector('.reminder-node');if(reminder)reminder.onclick=async()=>{await call(`/routes/${r.id}/reminder-complete`,{method:'POST',body:'{}'});toast('维护提醒周期已重新开始');await refreshAll()};
     row.querySelector('.delete-node').onclick=async()=>{if(confirm(`确认删除“${r.name}”？`)){await call(`/routes/${r.id}`,{method:'DELETE'});toast('节点已删除');await refreshAll()}};
   });
@@ -244,12 +226,6 @@ async function loadDeployment(){const d=await call('/deployment');$('#deployment
 async function loadNotifications(){const d=await call('/notifications');$('#telegram-state').textContent=d.telegram.configured?'已配置':'未配置';$('#telegram-enabled').checked=d.telegram.enabled;setValue('#telegram-chat','');setValue('#telegram-token','')}
 
 
-function qrSvg(qr){
-  const quiet=4,scale=5,dim=(qr.size+quiet*2)*scale;
-  let path='';
-  qr.rows.forEach((row,y)=>{[...row].forEach((bit,x)=>{if(bit==='1')path+=`M${(x+quiet)*scale} ${(y+quiet)*scale}h${scale}v${scale}h-${scale}z`})});
-  return `<svg viewBox="0 0 ${dim} ${dim}" width="${dim}" height="${dim}" role="img" aria-label="两步验证二维码"><rect width="${dim}" height="${dim}" fill="#fff"/><path d="${path}" fill="#000"/></svg>`;
-}
 function showTotpStage(stage){for(const id of ['#totp-off','#totp-setup','#totp-on'])$(id).classList.toggle('hidden',id!=='#'+stage)}
 async function loadAccount(){
   const d=await call('/account');
@@ -302,7 +278,7 @@ $('#icon-apply-url').onclick=async()=>{
   try{await savePanelIcon({url});setValue('#icon-url','');toast('面板图标已更新')}catch(e){toast(e.message,true)}finally{btn.disabled=false;btn.textContent='拉取并使用'}
 };
 $('#icon-reset').onclick=async()=>{try{await savePanelIcon({icon:''});toast('已恢复默认图标')}catch(e){toast(e.message,true)}};
-async function switchPage(page){state.page=page;$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${page}-page`).classList.remove('hidden');$$('[data-page]').forEach(x=>x.classList.toggle('active',x.dataset.page===page));$('#page-title').textContent=titles[page];$('#global-add').style.display=page==='dashboard'?'':'none';closeMenu();if(page==='audit')await loadAudit();if(page==='agents')await loadAgents();if(page==='steering')await loadSteering();if(page==='deployment')await loadDeployment();if(page==='notifications')await loadNotifications();if(page==='account')await loadAccount();if(page==='diagnostics')await loadRuntime();if(page==='access')await loadAccess()}
+async function switchPage(page){state.page=page;$$('.page').forEach(x=>x.classList.add('hidden'));$(`#${page}-page`).classList.remove('hidden');$$('[data-page]').forEach(x=>x.classList.toggle('active',x.dataset.page===page));$('#page-title').textContent=TITLES[page];$('#global-add').style.display=page==='dashboard'?'':'none';closeMenu();if(page==='audit')await loadAudit();if(page==='agents')await loadAgents();if(page==='steering')await loadSteering();if(page==='deployment')await loadDeployment();if(page==='notifications')await loadNotifications();if(page==='account')await loadAccount();if(page==='diagnostics')await loadRuntime();if(page==='access')await loadAccess()}
 async function loadAccess(){const host=$('#access-list');host.innerHTML='<article class="panel empty-state"><h3>正在汇总访问记录…</h3></article>';try{const d=await call('/access');const nodes=(d.nodes||[]).filter(n=>state.routes.some(r=>r.id===n.id));if(!nodes.length){host.innerHTML='<article class="panel empty-state"><h3>暂无访问记录</h3><p>有人通过反代观看后，这里会按“节点 › 分发通道 › 设备”折叠显示。</p></article>';return}
   const fmt=t=>t?new Date(Number(t)).toLocaleString():'—';
   host.innerHTML=nodes.map(n=>{
@@ -340,7 +316,7 @@ function renderLinePreview(route){const box=$('#line-sync-preview');$('#line-syn
 $('#line-sync-enabled').onchange=()=>$('#line-sync-options').classList.toggle('hidden',!$('#line-sync-enabled').checked);
 $('#line-sync-upstream').onchange=()=>$('#line-sync-upstream-hint').classList.toggle('hidden',!$('#line-sync-upstream').checked);
 $('#access-mode').onchange=()=>{$('#access-key').disabled=value('#access-mode')==='alias_only';if($('#access-key').disabled)setValue('#access-key','')};
-$('#save-node').onclick=async()=>{try{const data=formData();if(state.editing){const before=state.routes.find(x=>x.id===state.editing),changed=before&&before.accessMode!==data.accessMode;if(changed&&!confirm(data.accessMode==='key'?'开启连接密码后，客户端地址会变成带密码的新地址，所有现有客户端都需要重新填写。确认继续吗？':'关闭连接密码后，只要知道短路径的人都能访问这个节点，且客户端地址会变短。确认继续吗？'))return;if(!changed){delete data.accessMode;delete data.accessKey}const updated=await call(`/routes/${state.editing}`,{method:'PATCH',body:JSON.stringify(data)});const target=state.routes.find(x=>x.id===state.editing);if(target)target._url=null;if(changed&&updated.clientPath){closeDrawer();await refreshAll();showSecret(credentialText(updated.route,updated),{title:'客户端地址已更新',description:'连接密码设置已更改，请把下面的新地址同步到所有客户端。'});return}toast('节点已更新')}else{const x=await call('/routes',{method:'POST',body:JSON.stringify({...data,agentId:value('#deploy-agent')})});showSecret(credentialText(x.route,x))}closeDrawer();await refreshAll()}catch(e){toast(e.message,true)}};
+$('#save-node').onclick=async()=>{try{const data=formData();if(state.editing){const before=state.routes.find(x=>x.id===state.editing),changed=before&&before.accessMode!==data.accessMode;if(changed&&!confirm(data.accessMode==='key'?'开启连接密码后，客户端地址会变成带密码的新地址，所有现有客户端都需要重新填写。确认继续吗？':'关闭连接密码后，只要知道短路径的人都能访问这个节点，且客户端地址会变短。确认继续吗？'))return;if(!changed){delete data.accessMode;delete data.accessKey}const updated=await call(`/routes/${state.editing}`,{method:'PATCH',body:JSON.stringify(data)});const target=state.routes.find(x=>x.id===state.editing);if(target)target._url=null;if(changed&&updated.clientPath){closeDrawer();await refreshAll();showSecret(credentialText(updated,location.origin),{title:'客户端地址已更新',description:'连接密码设置已更改，请把下面的新地址同步到所有客户端。'});return}toast('节点已更新')}else{const x=await call('/routes',{method:'POST',body:JSON.stringify({...data,agentId:value('#deploy-agent')})});showSecret(credentialText(x,location.origin))}closeDrawer();await refreshAll()}catch(e){toast(e.message,true)}};
 $('#profile-ua').oninput=markActivePreset;$('#close-drawer').onclick=closeDrawer;$('#cancel-edit').onclick=closeDrawer;$('#drawer-backdrop').onclick=closeDrawer;$$('.add-node').forEach(b=>b.onclick=()=>openDrawer());$('#global-add').onclick=()=>openDrawer();
 
 async function openAgentModal(){try{setValue('#agent-name','');setValue('#agent-domain-new','');$('#agent-command-wrap').classList.add('hidden');$('#agent-enroll-form').classList.remove('hidden');const routesHost=$('#agent-enroll-routes');routesHost.innerHTML=state.routes.map(route=>`<label><input type="checkbox" data-enroll-route="${route.id}"><span><b>${escapeHtml(route.name)}</b><small>/${escapeHtml(route.alias)}/</small></span></label>`).join('')||'<small>暂时不部署节点，注册后仍可选择。</small>';routesHost.onchange=e=>{const box=e.target.closest('[data-enroll-route]');if(box)box.closest('label').classList.toggle('checked',box.checked)};$('#agent-modal').classList.remove('hidden');setTimeout(()=>$('#agent-name').focus(),0)}catch(e){toast(e.message,true)}}
