@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import http from 'node:http';
 import zlib from 'node:zlib';
 import { pipeline, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
@@ -21,7 +22,7 @@ const RELAY_REDIRECT_SEGMENT = '.aegis-relay';
 // relay under a dedicated path so the client never leaves our domain, and proxy the path back to the
 // real stream domain. Only operator-declared stream hosts are ever reachable through it (SSRF guard).
 const RELAY_VOD_SEGMENT = '.aegis-vod';
-export const RELAY_SERVER_OPTIONS=Object.freeze({highWaterMark:RELAY_HIGH_WATER_MARK,noDelay:true,keepAlive:true,keepAliveInitialDelay:15_000});
+const RELAY_SERVER_OPTIONS=Object.freeze({highWaterMark:RELAY_HIGH_WATER_MARK,noDelay:true,keepAlive:true,keepAliveInitialDelay:15_000});
 // Who is using a node — for the operator to spot a relay that has been redistributed. The real client
 // IP comes from the X-Real-IP the fronting Nginx sets (the relay strips it before going upstream, so
 // the upstream never sees it); the device fields come from the Emby headers / auth line / query.
@@ -574,4 +575,39 @@ export function handleUpgrade(req, socket, head, routeSource, key) {
     r.pipe(socket);
   });
   up.on('error',()=>socket.destroy());up.end();
+}
+
+// The HTTP server a machine puts in front of its relay, the same on the panel machine and on every
+// agent: media-sized socket buffers, no request timeout (a playback is one long request), keep-alive
+// that outlasts the Nginx in front of it, WebSocket upgrades, and a last line of defence that answers
+// 502 instead of letting one bad request take the relay down mid-playback. Not listening yet.
+//   route(req,res,relay)  sees every request first and answers it or hands it to relay(req,res); the
+//                         panel machine serves its admin and agent API on the same port. Without it
+//                         every request is relayed.
+//   acceptUpgrade(req)    return false to drop a WebSocket upgrade before the relay sees it.
+export function createRelayServer({routeSource,key,metrics=null,steering=null,route=null,acceptUpgrade=null,label='aegis'}) {
+  const relay=makeProxyHandler(routeSource,key,metrics,steering);
+  const failed=(res,error)=>{
+    console.error(`[${label}] relay error`,error&&error.stack||error);
+    if(res.headersSent||res.destroyed||res.writableEnded)return;
+    try{res.writeHead(502,{'cache-control':'no-store'});res.end('bad gateway')}catch{}
+  };
+  const server=http.createServer(RELAY_SERVER_OPTIONS,(req,res)=>{
+    res.on('error',()=>{});
+    try{
+      const out=route?route(req,res,relay):relay(req,res);
+      if(out&&typeof out.catch==='function')out.catch(error=>failed(res,error));
+    }catch(error){failed(res,error)}
+  });
+  server.requestTimeout=0;server.keepAliveTimeout=75_000;server.keepAliveTimeoutBuffer=5_000;server.headersTimeout=80_000;
+  server.on('connection',socket=>{socket.setNoDelay(true);socket.setKeepAlive(true,15_000)});
+  server.on('clientError',(_error,socket)=>{if(!socket.destroyed)socket.destroy()});
+  server.on('upgrade',(req,socket,head)=>{
+    socket.on('error',()=>socket.destroy());
+    try{
+      if(acceptUpgrade&&!acceptUpgrade(req))return socket.destroy();
+      handleUpgrade(req,socket,head,routeSource,key);
+    }catch(error){console.error(`[${label}] upgrade error`,error&&error.stack||error);socket.destroy()}
+  });
+  return server;
 }
