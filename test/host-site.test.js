@@ -57,6 +57,8 @@ function host() {
     run(script,args=[],extra={}){const knobs=Object.fromEntries(Object.entries(process.env).filter(([name])=>name.startsWith('TEST_')));const result=spawnSync('/bin/sh',[path.join(dir(script.startsWith('agent-')?'agent':'panel/scripts'),script),...args],{encoding:'utf8',env:{...env,...knobs,...extra}});return {...result,output:`${result.stdout}${result.stderr}`}},
     site:name=>read(path.join(dir('nginx'),'sites-available',`${name}.conf`)),
     enabled:name=>fs.existsSync(path.join(dir('nginx'),'sites-enabled',`${name}.conf`)),
+    // What an upgrade does once the new agent is up: the library's agent_serve_current, as agent-upgrade.sh calls it.
+    upgrade(extra={}){const knobs=Object.fromEntries(Object.entries(process.env).filter(([name])=>name.startsWith('TEST_')));const result=spawnSync('/bin/sh',['-c','set -eu; . "$1"; agent_serve_current','sh',path.join(dir('agent'),'host-site.sh')],{encoding:'utf8',env:{...env,...knobs,...extra}});return {...result,output:`${result.stdout}${result.stderr}`}},
     // Since when: the calls made after the first `count` ones.
     since:count=>(read(calls)||'').trim().split('\n').filter(Boolean).slice(count),
     calls:()=>(read(calls)||'').trim().split('\n').filter(Boolean),
@@ -384,6 +386,67 @@ test('the panel keeps the site it had when a domain setup fails',()=>{
   assert.equal(fresh.run('configure-domain.sh',['panel.example.com','ops@example.com'],{TEST_CERTBOT_FAILS:'1'}).status,1);
   assert.deepEqual([fresh.site('aegis-relay'),fresh.enabled('aegis-relay'),fresh.env('panel')],[null,false,{ADMIN_PATH:'secret-admin'}]);
   assert.deepEqual(fs.readdirSync(os.tmpdir()).filter(name=>name.startsWith('aegis-panel-site.')),[],'no temporary file is left behind');
+});
+
+test('an upgrade renders again the address Nginx serves, whatever .env says',()=>{
+  // A healthy agent on a domain, and one on its IP: the same address afterwards, freshly rendered.
+  const onDomain=host();onDomain.run('agent-configure-domain.sh',['hk.example.com','ops@example.com']);
+  fs.appendFileSync(path.join(onDomain.dir('nginx'),'sites-available','aegis-relay-agent.conf'),'# tuning from an older version\n');
+  assert.equal(onDomain.upgrade().status,0);
+  assert.deepEqual([onDomain.reported(),onDomain.status().state,onDomain.site('aegis-relay-agent').includes('older version'),/server_name hk\.example\.com;/.test(onDomain.site('aegis-relay-agent'))],[{mode:'domain',domain:'hk.example.com'},'active',false,true]);
+  assert.equal(onDomain.calls().filter(call=>call.startsWith('certbot --nginx -d hk.example.com ')&&call.endsWith('-m ops@example.com')).length,2,'the certificate is put back into the new site');
+  const onIp=agentOnItsIp();
+  assert.equal(onIp.upgrade().status,0);
+  assert.deepEqual([onIp.reported(),/server_name _;/.test(onIp.site('aegis-relay-agent'))],[{mode:'ip',domain:'203.0.113.9'},true]);
+
+  // An agent an older version left with AGENT_PROXY_MODE=ip in .env while Nginx serves its domain: it
+  // keeps the domain, and from now on reports it. Read from .env it would be switched to its IP.
+  const drifted=host();drifted.run('agent-configure-domain.sh',['hk.example.com','ops@example.com']);
+  fs.writeFileSync(path.join(drifted.dir('agent'),'.env'),'AGENT_DOMAIN=hk.example.com\nAGENT_EMAIL=ops@example.com\nAGENT_PROXY_MODE=ip\nAGENT_PROXY_IP=203.0.113.9\n');
+  drifted.forgetStatus();
+  assert.deepEqual(drifted.reported(),{mode:'ip',domain:'203.0.113.9'},'before: it reports its IP');
+  assert.equal(drifted.upgrade().status,0);
+  assert.match(drifted.site('aegis-relay-agent'),/server_name hk\.example\.com;/);
+  assert.deepEqual([drifted.reported(),drifted.env('agent').AGENT_PROXY_MODE],[{mode:'domain',domain:'hk.example.com'},'domain']);
+  // The other way round: Nginx serves the IP site while .env still names a domain.
+  const other=agentOnItsIp();
+  fs.writeFileSync(path.join(other.dir('agent'),'.env'),'AGENT_DOMAIN=old.example.com\nAGENT_EMAIL=ops@example.com\n');
+  assert.equal(other.upgrade().status,0);
+  assert.deepEqual([other.reported(),other.env('agent').AGENT_DOMAIN,other.calls().filter(call=>call.startsWith('certbot ')).length],[{mode:'ip',domain:'203.0.113.9'},'',0]);
+
+  // A failed re-render leaves the machine as it was and tells the upgrade so.
+  const live=onDomain.site('aegis-relay-agent'),failed=onDomain.upgrade({TEST_CERTBOT_FAILS:'1'});
+  assert.deepEqual([failed.status,onDomain.site('aegis-relay-agent'),onDomain.reported()],[1,live,{mode:'domain',domain:'hk.example.com'}]);
+  // A domain site with no certificate email on record cannot be rendered again; nothing is touched.
+  const noEmail=host();noEmail.run('agent-configure-domain.sh',['hk.example.com','ops@example.com']);
+  fs.writeFileSync(path.join(noEmail.dir('agent'),'.env'),'AGENT_DOMAIN=hk.example.com\n');
+  const kept=noEmail.site('aegis-relay-agent'),calls=noEmail.calls().length,refused=noEmail.upgrade();
+  assert.deepEqual([refused.status,/没有证书邮箱/.test(refused.output),noEmail.site('aegis-relay-agent'),noEmail.since(calls)],[1,true,kept,[]]);
+});
+
+test('an upgrade on a machine with no site yet goes by .env, and does nothing when nothing was set up',()=>{
+  const env=(h,text)=>fs.writeFileSync(path.join(h.dir('agent'),'.env'),text);
+  // Installed with a domain whose certificate failed at the time: the upgrade tries again.
+  const pending=host();env(pending,'AGENT_DOMAIN=hk.example.com\nAGENT_EMAIL=ops@example.com\n');
+  assert.equal(pending.upgrade().status,0);
+  assert.deepEqual(pending.reported(),{mode:'domain',domain:'hk.example.com'});
+  const ip=host();env(ip,'AGENT_DOMAIN=\nAGENT_PROXY_MODE=ip\nAGENT_PROXY_IP=203.0.113.9\n');
+  assert.equal(ip.upgrade().status,0);
+  assert.match(ip.site('aegis-relay-agent'),/server_name _;/);
+  // A site the operator disabled counts as none.
+  const disabled=agentOnItsIp();fs.rmSync(path.join(disabled.dir('nginx'),'sites-enabled','aegis-relay-agent.conf'));env(disabled,'AGENT_DOMAIN=hk.example.com\nAGENT_EMAIL=ops@example.com\n');
+  assert.equal(disabled.upgrade().status,0);
+  assert.match(disabled.site('aegis-relay-agent'),/server_name hk\.example\.com;/);
+  // Nothing set up: no domain, or a domain without an email, and no site. The upgrade says how to set one up.
+  for(const text of ['AGENT_DOMAIN=\nAGENT_EMAIL=\n','AGENT_DOMAIN=hk.example.com\nAGENT_EMAIL=\n','']){
+    const bare=host();env(bare,text);
+    const result=bare.upgrade();
+    assert.deepEqual([result.status,bare.site('aegis-relay-agent'),bare.status(),bare.calls()],[3,null,null,[]],JSON.stringify(text));
+  }
+  // agent-upgrade.sh is the caller: it must hand the outcome on, not swallow it.
+  const upgrade=fs.readFileSync(path.join(SCRIPTS,'agent-upgrade.sh'),'utf8');
+  assert.match(upgrade,/^\. "\$INSTALL_DIR\/host-site\.sh"\nagent_serve_current \|\| case \$\? in\n  3\) echo "若尚未配置直连地址/m);
+  assert.ok(upgrade.indexOf('agent_up --force-recreate')<upgrade.indexOf('agent_serve_current'),'the new agent is running before its site is rendered again');
 });
 
 test('the aegis-relay-agent command says how it is used instead of guessing',()=>{
