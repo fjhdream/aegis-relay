@@ -35,7 +35,8 @@ const cfg = {
   setupToken: process.env.SETUP_TOKEN || '', secureCookies: process.env.SECURE_COOKIES !== 'false', publicBaseUrl:process.env.PUBLIC_BASE_URL||'', localProxyBaseUrl:process.env.LOCAL_PROXY_BASE_URL||'', certificateEmail:process.env.CERTIFICATE_EMAIL||''
 };
 const key = deriveKey(process.env.APP_MASTER_KEY); const store = new Store(cfg.dataFile, key);
-if(!store.data.settings.certificateEmail&&cfg.certificateEmail){store.data.settings.certificateEmail=normalizeCertificateEmail(cfg.certificateEmail);store.save();}
+// An address in the environment that no host would accept is left out, not a reason to stay down.
+if(!store.data.settings.certificateEmail&&cfg.certificateEmail){try{store.data.settings.certificateEmail=normalizeCertificateEmail(cfg.certificateEmail);store.save();}catch(error){console.error(`CERTIFICATE_EMAIL ignored: ${error.message}`);}}
 const configuredLocalDomain=activeLocalDomain(cfg);
 // Every machine's desired snapshot, the panel's own included. Anything below that changes nodes,
 // deployments, machines or steering settings calls snapshots.refresh(); it works out who changed.

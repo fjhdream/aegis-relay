@@ -1,5 +1,11 @@
 import { STEERING_CAPABILITY } from './steering.js';
 
+// A certificate email as every host accepts it (email_ok in src/host-site.sh): at most 254 characters
+// of plain ASCII from the usual set. It is written into .env files and handed to certbot by root, so
+// nothing in it may be syntax to a shell or to Compose; an address outside this set is refused here,
+// where the operator sees why, rather than by a host later.
+export const isCertificateEmail=value=>typeof value==='string'&&value.length<=254&&/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$/.test(value);
+
 export const LOCAL_AGENT_ID = 'local';
 
 // Whether a machine runs a feature it declared as a capability. The panel machine runs this very

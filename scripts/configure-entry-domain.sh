@@ -22,7 +22,7 @@ EMAIL=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 shift 2
 DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 value_matches "$ENTRY" "$DOMAIN_RE" || { echo "入口域名格式无效: $ENTRY" >&2; exit 1; }
-value_matches "$EMAIL" '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "证书邮箱格式无效" >&2; exit 1; }
+email_ok "$EMAIL" || { echo "证书邮箱格式无效" >&2; exit 1; }
 
 # This machine's own (direct) domain must differ from the entry domain: a steering redirect targets the
 # direct domain precisely because it always reaches this one machine.

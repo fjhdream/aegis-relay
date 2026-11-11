@@ -1,5 +1,5 @@
 import { isRouteAuthKey } from './route-auth.js';
-import { agentKnows, LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
+import { agentKnows, isCertificateEmail, LOCAL_AGENT_ID, routesForAgent } from './agent-registry.js';
 import { EGRESS_CAPABILITY, STEERING_CAPABILITY, STEERING_MODES } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
 import { LINE_SYNC_CAPABILITY, lineSyncUpstream, nodeLines } from './line-sync.js';
@@ -195,7 +195,7 @@ export function desiredEntry(data, agentId) {
 export function cleanEntryRequest(value) {
   if(!value||typeof value!=='object')return null;
   const domain=String(value.domain||'').toLowerCase(),email=String(value.email||'').toLowerCase(),peers=Array.isArray(value.peers)?value.peers.map(peer=>String(peer).toLowerCase()):null;
-  if(!DOMAIN_RE.test(domain)||!/^[^\s@]+@[^\s@]+$/.test(email)||email.length>254||!peers||peers.length>16||!peers.every(peer=>DOMAIN_RE.test(peer)&&peer!==domain))return null;
+  if(!DOMAIN_RE.test(domain)||!isCertificateEmail(email)||!peers||peers.length>16||!peers.every(peer=>DOMAIN_RE.test(peer)&&peer!==domain))return null;
   return {domain,email,peers:[...new Set(peers)].sort()};
 }
 

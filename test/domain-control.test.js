@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { activeLocalDomain, domainRequestRole, DOMAIN_REQUEST_FILE, followDomain, forgetDomainSwitch, readDomainStatus, requestDomainSwitch, servingAddress } from '../src/domain-control.js';
+import { isCertificateEmail } from '../src/agent-registry.js';
+import { normalizeCertificateEmail } from '../src/agent-api.js';
+import { cleanEntryRequest } from '../src/steering-topology.js';
 
 test('active local domain prefers the separated data plane and validates bare HTTPS origins',()=>{
   assert.equal(activeLocalDomain({localProxyBaseUrl:'https://embyus.example.com',publicBaseUrl:'https://panel.example.com'}),'embyus.example.com');
@@ -162,4 +165,25 @@ test('an agent that enrolls again forgets what the host did for its previous lif
   assert.deepEqual(fs.readdirSync(host.dir),[]);
   assert.deepEqual(host.serving(),{mode:'domain',domain:'hk.example.com'});
   forgetDomainSwitch(host.dir);
+});
+
+test('no request is filed with a certificate email a host would refuse', () => {
+  // The hosts write the email into .env, where `${` starts a variable for Compose, and hand it to
+  // certbot as root. One rule (isCertificateEmail) decides, wherever an email comes in.
+  const odd = ['ops${x@example.com', 'ops@ex\u0001ample.com', 'ops@example.com x', '用户@example.com', "a'b@example.com", 'a b@example.com', 'a@b@c', `${'a'.repeat(243)}@example.com`, '', null, undefined, 7];
+  const fine = ['ops@example.com', 'First.Last+relay_1%x-y@Sub.Example-Domain.com', `${'a'.repeat(242)}@example.com`];
+  assert.deepEqual([odd.map(isCertificateEmail), fine.map(isCertificateEmail)], [odd.map(() => false), fine.map(() => true)]);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-domain-email-'));
+  try {
+    for (const email of odd.filter(value => typeof value === 'string' && value)) {
+      assert.throws(() => normalizeCertificateEmail(email), /统一证书邮箱/, JSON.stringify(email));
+      assert.throws(() => requestDomainSwitch({ dir, domain: 'hk.example.com', email }), /证书邮箱格式无效/, JSON.stringify(email));
+      assert.equal(followDomain({ dir, desired: { mode: '', domain: 'hk.example.com', email }, installed: { mode: 'ip', domain: '', ip: '203.0.113.9' } }), false, JSON.stringify(email));
+      assert.equal(cleanEntryRequest({ domain: 'entry.example.com', email, peers: [] }), null, JSON.stringify(email));
+      assert.deepEqual(fs.readdirSync(dir), [], 'nothing was written');
+    }
+    assert.equal(normalizeCertificateEmail('  Ops@Example.com '), 'Ops@Example.com');
+    assert.equal(requestDomainSwitch({ dir, domain: 'hk.example.com', email: 'First.Last+relay_1%x-y@Sub.Example-Domain.com' }).state, 'pending');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, DOMAIN_REQUEST_FILE), 'utf8')).certificateEmail, 'first.last+relay_1%x-y@sub.example-domain.com');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
