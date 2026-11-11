@@ -9,7 +9,7 @@ import { activeUpstreamLine, getRuntimeStatus } from './upstream-exchange.js';
 import { Metrics } from './metrics.js';
 import { diagnoseRoute } from './diagnostics.js';
 import { Notifier } from './notifier.js';
-import { adminRelative, isRootAdminRequest, normalizeAdminPath } from './admin-path.js';
+import { UI_FILES, adminRelative, isRootAdminRequest, normalizeAdminPath } from './admin-path.js';
 import { LocalAgent } from './local-agent.js';
 import { DesiredSnapshots } from './desired-snapshots.js';
 import { LOCAL_AGENT_ID, publicAgent } from './agent-registry.js';
@@ -75,9 +75,9 @@ function pruneSessions(){const now=Date.now();for(const [sid,session] of Object.
 pruneSessions();
 const loginLimiter = new RateLimiter(6, 5 * 60_000);
 const ui = fs.readFileSync(path.join(ROOT, 'web', 'index.html'),'utf8').replace('APP_JS',`app.js?v=${APP_VERSION}`).replace('STYLE_CSS',`style.css?v=${APP_VERSION}`).replace('HELP_CSS',`help.css?v=${APP_VERSION}`).replaceAll('APP_VERSION',APP_VERSION);
-const appjs = fs.readFileSync(path.join(ROOT,'web','app.js'));
-const stylesheet = fs.readFileSync(path.join(ROOT,'web','style.css'));
-const helpStylesheet = fs.readFileSync(path.join(ROOT,'web','help.css'));
+// The page asks for app.js by version, so that no cache hands a new page an old script; app.js asks
+// for the modules it imports the same way.
+const uiFiles = new Map(Object.keys(UI_FILES).map(name=>[name,name==='/app.js'?Buffer.from(fs.readFileSync(path.join(ROOT,'web',name),'utf8').replace(/(from\s*'\.\/[\w.-]+\.js)'/g,`$1?v=${APP_VERSION}'`)):fs.readFileSync(path.join(ROOT,'web',name))]));
 const agentInstaller = fs.readFileSync(path.join(ROOT,'scripts','agent-install.sh'));
 const agentUpgrader = fs.readFileSync(path.join(ROOT,'scripts','agent-upgrade.sh'));
 
@@ -310,9 +310,7 @@ async function serveAdmin(req,res,prefix){
     const rel=adminRelative(u.pathname,prefix);if(rel===null)return json(res,404,{error:'not found'});
     if(rel.startsWith('/api/'))return await api(req,res,rel.slice(4),prefix);
     if(req.method!=='GET')return json(res,405,{error:'method not allowed'});
-    if(rel==='/app.js'){res.writeHead(200,headers({'content-type':'text/javascript; charset=utf-8'}));return res.end(appjs)}
-    if(rel==='/style.css'){res.writeHead(200,headers({'content-type':'text/css; charset=utf-8'}));return res.end(stylesheet)}
-    if(rel==='/help.css'){res.writeHead(200,headers({'content-type':'text/css; charset=utf-8'}));return res.end(helpStylesheet)}
+    if(uiFiles.has(rel)){res.writeHead(200,headers({'content-type':UI_FILES[rel]}));return res.end(uiFiles.get(rel))}
     if(rel!=='/'&&rel!=='/index.html')return json(res,404,{error:'not found'});
     res.writeHead(200,headers({'content-type':'text/html; charset=utf-8'}));res.end(ui);
   }catch(e){json(res,e.status||400,{error:String(e.message||'request rejected').slice(0,160)});}

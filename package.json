@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "check": "for f in src/*.js web/app.js; do node --check \"$f\" || exit 1; done",
+    "check": "for f in src/*.js web/*.js; do node --check \"$f\" || exit 1; done",
     "test": "node --test"
   },
   "license": "MIT"
