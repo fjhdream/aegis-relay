@@ -1,53 +1,9 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
-import vm from 'node:vm';
-// With two-step verification on, the server takes a saved recovery code in place of the TOTP code
-// (test/admin-api.test.js), and enabling it tells the operator to keep the codes for a lost authenticator.
-// So the login form needs a way to send one: the TOTP field stays the default, a switch swaps it for a
-// recovery-code field, and each mode posts only its own second factor.
-test('the login form signs in with a recovery code in place of the TOTP code, never sending both',async()=>{
-  const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');
-  const tag=id=>(html.match(new RegExp(`<[^>]*\\bid="${id}"[^>]*>`))||[''])[0],elements=new Map();let focused='';
-  // Each stub element starts with the classes index.html gives it, so the test sees the form's real initial mode.
-  const el=id=>{if(!elements.has(id)){const classes=new Set(/\bclass="([^"]*)"/.exec(tag(id.slice(1)))?.[1].split(/\s+/));elements.set(id,{value:'',textContent:'',focus(){focused=id},classList:{contains:c=>classes.has(c),add:c=>classes.add(c),remove:c=>classes.delete(c),toggle(c,on=!classes.has(c)){on?classes.add(c):classes.delete(c);return on}}})}return elements.get(id)};
-  const sent=[];let reject=false,entered=0;
-  const context=vm.createContext({$:el,value:id=>el(id).value,setValue:(id,v)=>{el(id).value=v??''},state:{csrf:''},enterApp:async()=>{entered++},call:async(path,options)=>{sent.push({path,body:JSON.parse(options.body)});if(reject)throw Error('invalid credentials');return {csrf:'fresh'}}});
-  vm.runInContext(js.slice(js.indexOf("$('#setup-btn').onclick"),js.indexOf("$('#logout').onclick")),context);
-  const login=async()=>{await el('#login-btn').onclick();return sent.at(-1).body},shown=id=>!el(id).classList.contains('hidden');
-  el('#password').value='correct horse battery';el('#code').value='123456';el('#recovery').value='left over';
-  assert.deepEqual(await login(),{password:'correct horse battery',code:'123456'},'the default sends the TOTP code and nothing else');
-  assert.equal(sent[0].path,'/login');assert.equal(context.state.csrf,'fresh');assert.equal(entered,1);
-  assert.equal(typeof el('#recovery-toggle').onclick,'function','the login form must offer a switch to a recovery code');
-  el('#recovery-toggle').onclick();
-  assert.ok(shown('#recovery-field')&&!shown('#code-field'),'recovery mode replaces the TOTP field');
-  assert.equal(el('#code').value,'','switching clears the field it hides');assert.equal(focused,'#recovery');
-  assert.equal(el('#recovery-toggle').textContent,'改用动态验证码');
-  // A pasted code often carries a space or a line break turned into one; the hidden TOTP field may still hold a value.
-  el('#recovery').value=' \tAbC-dEf_1234 ';el('#code').value='654321';
-  assert.deepEqual(await login(),{password:'correct horse battery',recovery:'AbC-dEf_1234'},'recovery mode sends the trimmed code and no TOTP code');
-  reject=true;await el('#login-btn').onclick();
-  assert.equal(el('#gate-msg').textContent,'invalid credentials');assert.equal(entered,2);
-  assert.ok(shown('#recovery-field')&&!shown('#code-field'),'a failed login stays in recovery mode');
-  assert.deepEqual(sent.at(-1).body,{password:'correct horse battery',recovery:'AbC-dEf_1234'});
-  el('#recovery-toggle').onclick();
-  assert.ok(shown('#code-field')&&!shown('#recovery-field'));assert.equal(el('#recovery').value,'');assert.equal(focused,'#code');
-  assert.equal(el('#recovery-toggle').textContent,'丢失验证器？使用恢复码');
-  reject=false;el('#code').value='000111';
-  assert.deepEqual(await login(),{password:'correct horse battery',code:'000111'});
-  // The markup behind it: the TOTP field as before, a recovery field a real code (randomToken(9): 12
-  // base64url characters, case-sensitive) fits in, a non-submitting switch, and no inline colours.
-  assert.match(tag('code'),/inputmode="numeric" maxlength="6" autocomplete="one-time-code"/);
-  for(const attr of ['autocomplete="off"','autocapitalize="off"','autocorrect="off"','spellcheck="false"'])assert.ok(tag('recovery').includes(attr),`#recovery needs ${attr}`);
-  assert.doesNotMatch(tag('recovery'),/inputmode="numeric"|maxlength="([0-9]|1[01])"/);
-  assert.match(html,/<label id="recovery-field"[^>]*>恢复码<small>[^<]*只能使用一次/);
-  assert.match(html,/<button type="button" id="recovery-toggle"[^>]*>丢失验证器？使用恢复码<\/button>/);
-  assert.doesNotMatch(html.match(/<div id="login"[^]*?<\/div>/)[0],/style="/);
-});
 test('front-end id selectors resolve to real elements',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');const ids=new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(x=>x[1])),referenced=[...js.matchAll(/\$\(['"]#([A-Za-z0-9_-]+)['"]\)/g)].map(x=>x[1]);const missing=[...new Set(referenced.filter(x=>!ids.has(x)))];assert.deepEqual(missing,[])});
 test('admin page has no inline executable scripts',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');assert.equal(/<script(?![^>]+src=)/i.test(html),false);assert.match(html,/STYLE_CSS/);assert.match(html,/HELP_CSS/);assert.match(html,/APP_JS/)});
 test('node editor uses fixed proxy takeover and supports viewing client addresses',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');assert.match(html,/高级设置/);assert.match(html,/开启（推荐，防止他人盗用）/);assert.doesNotMatch(html,/遇到 302 播放跳转时/);assert.doesNotMatch(js,/directStream/);assert.match(html,/代理全程接管/);assert.match(js,/addr-reveal/);assert.match(js,/addr-copy/);assert.match(js,/\/credentials/)});
-test('node credentials support custom keys and use context-specific copy',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8'),js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');assert.match(html,/id="access-key"/);assert.match(html,/留空则安全随机生成/);assert.match(js,/askConnectionKey/);assert.match(html,/完整节点地址和连接密码可由管理员随时再次查看/);assert.match(js,/恢复码（每行一个，只显示这一次）/)});
+test('node credentials support custom keys and use context-specific copy',()=>{const html=fs.readFileSync(new URL('../web/index.html',import.meta.url),'utf8');assert.match(html,/id="access-key"/);assert.match(html,/留空则安全随机生成/);assert.match(html,/完整节点地址和连接密码可由管理员随时再次查看/)});
 test('admin client derives API path from its script and handles expired sessions',()=>{const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');assert.match(js,/new URL\(import\.meta\.url\)\.pathname/);assert.match(js,/content-type/);assert.match(js,/登录已失效，请重新登录/);assert.doesNotMatch(js,/response\.json\(\)/)});
-test('gateway errors are identified as a restarting management service',()=>{const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8');assert.match(js,/\[502,503,504\]/);assert.match(js,/容器可能正在重启/)});
 test('read-only diagnostics use GET to pass restrictive reverse proxies',()=>{const js=fs.readFileSync(new URL('../web/app.js',import.meta.url),'utf8'),server=fs.readFileSync(new URL('../src/server.js',import.meta.url),'utf8');assert.match(js,/call\(`\/diagnostics\/\$\{route\.id\}`\)/);assert.match(js,/call\(`\/diagnostics\/\$\{id\}`\)/);assert.match(server,/req\.method!=='GET'&&req\.method!=='POST'\)return notFound/)});
 test('admin server does not return the HTML shell for unknown API-like paths',()=>{const server=fs.readFileSync(new URL('../src/server.js',import.meta.url),'utf8');assert.match(server,/rel!==\'\/\'&&rel!==\'\/index\.html\'/);assert.match(server,/登录已失效，请重新登录/)});
 test('container data directory uses the installer-managed non-root identity',()=>{const dockerfile=fs.readFileSync(new URL('../Dockerfile',import.meta.url),'utf8'),compose=fs.readFileSync(new URL('../compose.yml',import.meta.url),'utf8'),bootstrap=fs.readFileSync(new URL('../scripts/bootstrap.sh',import.meta.url),'utf8');assert.match(dockerfile,/AEGIS_UID=10001/);assert.match(compose,/user: "10001:10001"/);assert.match(bootstrap,/chown -R 10001:10001 data/)});

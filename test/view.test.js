@@ -531,3 +531,107 @@ test('access is shown node by node and channel by channel, only for nodes that s
   assert.match(view.ACCESS_LOADING['#access-list'].html,/正在汇总访问记录/);
   assert.equal(view.accessFailed('storage <down>')['#access-list'].html,'<article class="panel empty-state"><h3>加载失败</h3><p>storage &lt;down&gt;</p></article>');
 });
+
+// ---------------------------------------------------------------------------------------------------
+// The panel's answers, signing in, and the smaller pages.
+test('an answer from the API is its data, or a reason a person can act on',()=>{
+  const read=(status,type,body,path='/routes')=>view.readResponse({status,ok:status>=200&&status<300,type,body,path}),JSON_TYPE='application/json; charset=utf-8';
+  assert.deepEqual([read(200,JSON_TYPE,'{"routes":[1]}'),read(201,JSON_TYPE,''),read(200,JSON_TYPE,'{}')],[{data:{routes:[1]}},{data:{}},{data:{}}]);
+  assert.deepEqual([read(409,JSON_TYPE,'{"error":"alias already exists"}'),read(500,JSON_TYPE,'{}'),read(200,JSON_TYPE,'{"routes":[')],[{error:'alias already exists'},{error:'请求失败'},{error:'管理接口返回了损坏的数据，请刷新页面后重试'}]);
+  // Something between the browser and the panel answered instead of the panel.
+  for(const status of [502,503,504])assert.deepEqual(read(status,'text/html','<html>'),{error:`管理服务连接中断（HTTP ${status}），容器可能正在重启，请稍后重试并检查服务日志`});
+  assert.deepEqual([read(200,'text/html','<html>'),read(404,'text/html','<html>'),read(500,null,'')],[{error:'管理接口返回了网页而不是数据（HTTP 200），请刷新页面后重试'},{error:'请求未到达管理接口（HTTP 404），请检查 Nginx/CDN 是否允许 /api/ 路径'},{error:'请求未到达管理接口（HTTP 500），请检查 Nginx/CDN 是否允许 /api/ 路径'}]);
+  // The session is over, whoever says so; a wrong password at the door is not that.
+  const over={error:'登录已失效，请重新登录',signedOut:true};
+  assert.deepEqual([read(401,JSON_TYPE,'{"error":"unauthorized"}'),read(401,'text/html','<html>'),read(401,JSON_TYPE,'{"error":"invalid credentials"}','/login'),read(401,'text/html','','/login')],[over,over,{error:'invalid credentials'},{error:'请求未到达管理接口（HTTP 401），请检查 Nginx/CDN 是否允许 /api/ 路径'}]);
+});
+
+test('the live feed is read event by event, however the pieces arrive',()=>{
+  assert.deepEqual(view.feedEvents('event: dashboard\ndata: {"a":1}\n\n: keep-alive\n\ndata: {"a":2}\n\ndata: {"a"'),{events:['{"a":1}','{"a":2}'],rest:'data: {"a"'});
+  assert.deepEqual([view.feedEvents(''),view.feedEvents('data: {"a":3}\n\n'),view.feedEvents('data: {"a":3}\n')],[{events:[],rest:''},{events:['{"a":3}'],rest:''},{events:[],rest:'data: {"a":3}\n'}]);
+  // What is left over is put before the next piece.
+  const first=view.feedEvents('data: {"a"');
+  assert.deepEqual(view.feedEvents(first.rest+':4}\n\n'),{events:['{"a":4}'],rest:''});
+});
+
+// With two-step verification on, the server takes a saved recovery code in place of the TOTP code
+// (test/admin-api.test.js), and enabling it tells the operator to keep the codes for a lost authenticator.
+// So the login form needs a way to send one: the TOTP field stays the default, a switch swaps it for a
+// recovery-code field, and each mode posts only its own second factor.
+test('the login form signs in with a recovery code in place of the TOTP code, never sending both',()=>{
+  const tag=id=>(HTML.match(new RegExp(`<[^>]*\\bid="${id}"[^>]*>`))||[''])[0],hidden=id=>/\bclass="[^"]*\bhidden\b/.test(tag(id));
+  // The page starts on the TOTP code, as index.html has it.
+  assert.deepEqual([hidden('code-field'),hidden('recovery-field')],[false,true]);
+  const typed={password:'correct horse battery',code:'123456',recovery:'left over'};
+  assert.deepEqual(view.loginRequest({...typed,usingRecovery:false}),{password:'correct horse battery',code:'123456'},'the default sends the TOTP code and nothing else');
+  const toRecovery=view.secondFactorView(true);
+  assert.deepEqual(toRecovery,{focus:'#recovery',changes:{'#code-field':{hidden:true},'#recovery-field':{hidden:false},'#code':{value:''},'#recovery-toggle':{text:'改用动态验证码'}}},'recovery mode replaces the TOTP field, and clears the field it hides');
+  // A pasted code often carries a space or a line break turned into one; the hidden TOTP field may still hold a value.
+  assert.deepEqual(view.loginRequest({password:'correct horse battery',code:'654321',recovery:' \tAbC-dEf_1234 ',usingRecovery:true}),{password:'correct horse battery',recovery:'AbC-dEf_1234'},'recovery mode sends the trimmed code and no TOTP code');
+  assert.deepEqual(view.secondFactorView(false),{focus:'#code',changes:{'#code-field':{hidden:false},'#recovery-field':{hidden:true},'#recovery':{value:''},'#recovery-toggle':{text:'丢失验证器？使用恢复码'}}});
+  // The markup behind it: the TOTP field as before, a recovery field a real code (randomToken(9): 12
+  // base64url characters, case-sensitive) fits in, a non-submitting switch, and no inline colours.
+  assert.match(tag('code'),/inputmode="numeric" maxlength="6" autocomplete="one-time-code"/);
+  for(const attr of ['autocomplete="off"','autocapitalize="off"','autocorrect="off"','spellcheck="false"'])assert.ok(tag('recovery').includes(attr),`#recovery needs ${attr}`);
+  assert.doesNotMatch(tag('recovery'),/inputmode="numeric"|maxlength="([0-9]|1[01])"/);
+  assert.match(HTML,/<label id="recovery-field"[^>]*>恢复码<small>[^<]*只能使用一次/);
+  assert.match(HTML,/<button type="button" id="recovery-toggle"[^>]*>丢失验证器？使用恢复码<\/button>/);
+  assert.doesNotMatch(HTML.match(/<div id="login"[^]*?<\/div>/)[0],/style="/);
+});
+
+test('what is shown once to be copied says what it is: a node address unless told otherwise',()=>{
+  assert.deepEqual(view.secretView('https://emby.example.com/m/k/'),{'#modal-eyebrow':{text:'连接信息'},'#modal-title':{text:'节点连接信息'},'#modal-description':{text:'完整节点地址和连接密码可由管理员随时再次查看。'},'#secret':{text:'https://emby.example.com/m/k/'},'#modal':{hidden:false}});
+  const codes=view.recoveryCodes({recovery:['aaaa-bbbb','cccc-dddd']}),shown=view.secretView(codes.content,codes.options);
+  assert.deepEqual([shown['#secret'].text,shown['#modal-eyebrow'].text,shown['#modal-title'].text,/离线保存/.test(shown['#modal-description'].text)],['恢复码（每行一个，只显示这一次）\naaaa-bbbb\ncccc-dddd','恢复码','两步验证已开启',true]);
+  assert.deepEqual(view.secretView('x',{title:'客户端地址已更新'})['#modal-eyebrow'],{text:'连接信息'},'what is not said keeps its default');
+  assert.deepEqual([view.iconStateView(true),view.iconStateView(false)],[{'#icon-state':{text:'自定义',className:'pill on'}},{'#icon-state':{text:'默认',className:'pill '}}]);
+});
+
+test('diagnostics list the nodes, each upstream\'s standing, and what a probe found',()=>{
+  assert.equal(view.diagnosticOptions([node({id:'r1',name:'A<B'}),node({id:'r2',name:'Shows'})]),'<option value="r1">A&lt;B</option><option value="r2">Shows</option>');
+  assert.equal(view.runtimeView({nodes:[{alias:'m<1',upstreams:[{circuitOpen:false,lastError:''},{circuitOpen:true,lastError:'ECONNREFUSED'},{circuitOpen:false,lastError:'hang <up>'}]},{alias:'s',upstreams:[]}]})['#diag-runtime'].html,
+    '<span class="pill on">m&lt;1 · 线路 1 · 就绪</span><span class="pill warn">m&lt;1 · 线路 2 · 熔断</span><span class="pill warn">m&lt;1 · 线路 3 · hang &lt;up&gt;</span>');
+  const report=view.diagnosticView({node:{name:'<Movies>'},main:[{online:true,status:200,latencyMs:120,embyVersion:'4.9<',tls:{authorized:true,validTo:'Dec 1 2027'}},{online:false,status:0,latencyMs:'timeout',error:'ETIMEDOUT <x>'}],stream:[{online:true,status:302,latencyMs:640,tls:{authorized:false,validTo:''}}],headerPreview:{'User-Agent':'Infuse','X-<Emby>':'a&b'}})['#diagnostic-result'].html;
+  const cards=report.split('<article class="panel diag-card">').slice(1);
+  assert.equal(cards.length,3);
+  for(const text of ['<span class="eyebrow">主回源</span><h3>&lt;Movies&gt;</h3>','<b class="good">在线</b>','<span>HTTP 状态</span><b>200</b>','<b class="good">120 ms</b>','<b>4.9&lt;</b>','<span>TLS</span><b class="good">有效</b>','<b>Dec 1 2027</b>',
+    '<b class="bad">失败</b></div><div class="diag-line"><span>HTTP 状态</span><b>—</b></div><div class="diag-line"><span>响应延迟</span><b class="bad">timeout</b>','<span>错误</span><b class="bad">ETIMEDOUT &lt;x&gt;</b>'])assert.ok(cards[0].includes(text),text);
+  assert.ok(cards[1].includes('<span class="eyebrow">推流域名</span>')&&cards[1].includes('<b class="warn">640 ms</b>')&&cards[1].includes('<b class="warn">未验证</b></div><div class="diag-line"><span>证书到期</span><b>—</b>'));
+  assert.ok(cards[2].includes('<h3>请求头策略</h3><div class="diag-line"><span>User-Agent</span><b>Infuse</b></div><div class="diag-line"><span>X-&lt;Emby&gt;</span><b>a&amp;b</b></div>'));
+  assert.equal(view.diagnosticView({node:{name:'N'},main:[],headerPreview:{}})['#diagnostic-result'].html.split('diag-card').length-1,2,'no stream card for a node that streams from its main upstream');
+  assert.match(view.DIAGNOSTIC_RUNNING['#diagnostic-result'].html,/正在探测回源/);
+});
+
+test('the audit log, the deployment page and the notification settings show what the panel has, escaped',()=>{
+  assert.equal(view.auditView({audit:[{at:'2026-11-11T08:00:00Z',action:'login.failed <x>',ip:'2001:db8::1',detail:'bad "password" & more'}]})['#audit-list'].html,
+    `<div class="event"><time>${view.localTime('2026-11-11T08:00:00Z')}</time><strong>login.failed &lt;x&gt;</strong><div><span>2001:db8::1</span><br>bad &quot;password&quot; &amp; more</div></div>`);
+  assert.match(view.auditView({audit:[]})['#audit-list'].html,/暂无审计事件/);
+  const set=view.deploymentView({publicBaseUrl:'https://panel.example.com',localProxyBaseUrl:'https://emby<.example.com',splitDomains:true,certificateEmail:'ops@example.com'});
+  assert.ok(set['#deployment-status'].html.includes('<strong>https://panel.example.com</strong>')&&set['#deployment-status'].html.includes('<strong>https://emby&lt;.example.com</strong>')&&set['#deployment-status'].html.includes('<small>域名隔离</small><strong>已分离</strong>'));
+  assert.deepEqual([set['#certificate-email'],set['#certificate-email-state']],[{value:'ops@example.com'},{text:'已配置',className:'pill on'}]);
+  const unset=view.deploymentView({});
+  assert.deepEqual([unset['#deployment-status'].html.split('尚未设置').length-1,/等待在代理机器中切换/.test(unset['#deployment-status'].html),unset['#certificate-email'],unset['#certificate-email-state']],[2,true,{value:''},{text:'未配置',className:'pill warn'}]);
+  // The token and the chat are never shown back.
+  assert.deepEqual([view.notificationsView({telegram:{configured:true,enabled:true}}),view.notificationsView({telegram:{configured:false,enabled:false}})],
+    [{'#telegram-state':{text:'已配置'},'#telegram-enabled':{checked:true},'#telegram-chat':{value:''},'#telegram-token':{value:''}},{'#telegram-state':{text:'未配置'},'#telegram-enabled':{checked:false},'#telegram-chat':{value:''},'#telegram-token':{value:''}}]);
+});
+
+test('the account page shows two-step verification in the stage it is in, and never keeps a typed password',()=>{
+  const on=view.accountView({username:'admin<1>',totpEnabled:true,recoveryRemaining:7}),off=view.accountView({username:'',totpEnabled:false});
+  assert.deepEqual([on['#account-user'],on['#totp-state'],on['#totp-hint'].text,on['#totp-off'],on['#totp-setup'],on['#totp-on']],[{text:'admin<1>'},{text:'已开启',className:'pill on'},'登录时需要输入动态验证码。剩余恢复码 7 个。',{hidden:true},{hidden:true},{hidden:false}]);
+  assert.deepEqual([off['#account-user'],off['#totp-state'],off['#totp-hint'].text,off['#totp-off'],off['#totp-setup'],off['#totp-on']],[{text:'admin'},{text:'未开启',className:'pill warn'},'开启后，登录时除密码外还需要输入动态验证码。',{hidden:false},{hidden:true},{hidden:true}]);
+  for(const id of ['#pw-current','#pw-new','#pw-confirm','#totp-password','#totp-code','#totp-off-password','#totp-off-code'])assert.deepEqual([on[id],off[id],control(id)?.tag],[{value:''},{value:''},'input'],id);
+  const setup=view.totpSetupView({secret:'JBSWY3DPEHPK3PXP',qr:{size:1,rows:['1']}});
+  assert.deepEqual([setup['#totp-secret'],setup['#totp-off'],setup['#totp-setup'],setup['#totp-on'],setup['#totp-qr'].html.startsWith('<svg viewBox="0 0 45 45"')],[{text:'JBSWY3DPEHPK3PXP'},{hidden:true},{hidden:false},{hidden:true},true]);
+  assert.deepEqual(view.totpStageView('totp-off'),{'#totp-off':{hidden:false},'#totp-setup':{hidden:true},'#totp-on':{hidden:true}});
+  // A new password: long enough, and typed the same twice, before the panel is asked.
+  assert.deepEqual([view.passwordChange({current:'old',next:'thirteen-char',again:'thirteen-char'}),view.passwordChange({current:'old',next:'fourteen-chars',again:'fourteen-charz'}),view.passwordChange({current:'old',next:'fourteen-chars',again:'fourteen-chars'})],
+    [{error:'新密码至少 14 位'},{error:'两次输入的新密码不一致'},{body:{currentPassword:'old',newPassword:'fourteen-chars'}}]);
+});
+
+test('an import says what it made, and an export is named for its day',()=>{
+  const made=view.importOutcome({imported:2,credentials:[{alias:'a',clientPath:'/a/k1/',accessKey:'k1'},{alias:'b',clientPath:'/b/',accessKey:''}]});
+  assert.deepEqual([made.message,made.secret.content,made.secret.options.title],['已导入 2 个节点','新生成的节点凭据\n\na\n/a/k1/\nk1\n\nb\n/b/','导入节点连接信息']);
+  assert.deepEqual(view.importOutcome({imported:0,credentials:[]}),{message:'已导入 0 个节点',secret:null});
+  assert.equal(view.exportName(Date.parse('2026-03-02T23:30:00+08:00')),'aegis-relay-2026-03-02.json');
+});

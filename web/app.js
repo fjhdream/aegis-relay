@@ -1,6 +1,6 @@
 // The page's side of the panel: it fetches, hands the data to view.js, writes what comes back into the
 // page and listens for what the person does next. What is shown is decided in view.js.
-import {ACCESS_LOADING,ADDR_MASK,BRAND_MARK,DEFAULT_FAVICON,DEPLOY_HERE,ROUTE_FIELDS,STEERING_FIELDS,STEERING_REFRESH_MS,TITLES,UA_PRESETS,accessFailed,accessView,agentSave,agentsView,awaitingSync,blankRouteForm,channelRows,channelsGate,clientAddress,credentialText,dashboardView,deployOptions,domainSwitch,egressOptions,enrollFormView,enrollmentView,escapeHtml,linePreviewView,moved,nodeListView,orderChanges,presetChips,presetIs,presetValues,qrSvg,routeFormView,routeSave,routeToForm,routesChosen,steeringLiveView,steeringRefresher,steeringSave,steeringView,switchProgress,testOutcome,trafficView} from './view.js';
+import {ACCESS_LOADING,ADDR_MASK,BRAND_MARK,DEFAULT_FAVICON,DEPLOY_HERE,DIAGNOSTIC_RUNNING,ROUTE_FIELDS,STEERING_FIELDS,STEERING_REFRESH_MS,TITLES,UA_PRESETS,accessFailed,accessView,accountView,agentSave,agentsView,auditView,awaitingSync,blankRouteForm,channelRows,channelsGate,clientAddress,credentialText,dashboardView,deployOptions,deploymentView,diagnosticOptions,diagnosticView,domainSwitch,egressOptions,enrollFormView,enrollmentView,exportName,feedEvents,iconStateView,importOutcome,linePreviewView,loginRequest,moved,nodeListView,notificationsView,orderChanges,passwordChange,presetChips,presetIs,presetValues,readResponse,recoveryCodes,routeFormView,routeSave,routeToForm,routesChosen,runtimeView,secondFactorView,secretView,steeringLiveView,steeringRefresher,steeringSave,steeringView,switchProgress,testOutcome,totpSetupView,totpStageView,trafficView} from './view.js';
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 // A module has no document.currentScript; its own address says where the panel is served from.
 const scriptPath=new URL(import.meta.url).pathname;
@@ -20,15 +20,10 @@ function showLogin(message='登录已失效，请重新登录'){
 }
 async function call(path,options={}){
   options.headers={'content-type':'application/json',...(state.csrf?{'x-csrf-token':state.csrf}:{}),...(options.headers||{})};
-  const response=await fetch(base+path,options),type=String(response.headers.get('content-type')||''),raw=await response.text();
-  let data={};
-  if(type.includes('application/json')){try{data=raw?JSON.parse(raw):{}}catch{throw Error('管理接口返回了损坏的数据，请刷新页面后重试')}}
-  else if(response.status===401&&path!=='/login'){showLogin();throw Error('登录已失效，请重新登录')}
-  else if([502,503,504].includes(response.status))throw Error(`管理服务连接中断（HTTP ${response.status}），容器可能正在重启，请稍后重试并检查服务日志`);
-  else throw Error(response.ok?`管理接口返回了网页而不是数据（HTTP ${response.status}），请刷新页面后重试`:`请求未到达管理接口（HTTP ${response.status}），请检查 Nginx/CDN 是否允许 /api/ 路径`);
-  if(response.status===401&&path!=='/login'){showLogin();throw Error('登录已失效，请重新登录')}
-  if(!response.ok)throw Error(data.error||'请求失败');
-  return data;
+  const response=await fetch(base+path,options),answer=readResponse({status:response.status,ok:response.ok,type:response.headers.get('content-type'),body:await response.text(),path});
+  if(answer.signedOut)showLogin();
+  if(answer.error)throw Error(answer.error);
+  return answer.data;
 }
 const value=id=>$(id).value;
 // Write what view.js decided: for each element, the properties it names.
@@ -47,7 +42,7 @@ function write(changes){for(const [selector,change] of Object.entries(changes)){
 const readForm=fields=>Object.fromEntries(fields.map(field=>[field.id,$(field.id).type==='checkbox'?$(field.id).checked:$(field.id).value]));
 function writeForm(values){for(const [id,v] of Object.entries(values)){if(typeof v==='boolean')$(id).checked=v;else $(id).value=v??''}}
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.classList.remove('hidden');el.classList.toggle('error',error);clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.add('hidden'),3200)}
-function showSecret(content,{eyebrow='连接信息',title='节点连接信息',description='完整节点地址和连接密码可由管理员随时再次查看。'}={}){$('#modal-eyebrow').textContent=eyebrow;$('#modal-title').textContent=title;$('#modal-description').textContent=description;$('#secret').textContent=content;$('#modal').classList.remove('hidden')}
+function showSecret(content,options){write(secretView(content,options))}
 
 function applyPanelIcon(icon){
   state.panelIcon=String(icon||'');
@@ -58,7 +53,7 @@ function applyPanelIcon(icon){
   let link=document.querySelector('link[rel="icon"]');
   if(!link){link=document.createElement('link');link.rel='icon';document.head.appendChild(link)}
   link.href=state.panelIcon||DEFAULT_FAVICON;
-  const iconState=$('#icon-state');if(iconState){iconState.textContent=state.panelIcon?'自定义':'默认';iconState.className=`pill ${state.panelIcon?'on':''}`}
+  write(iconStateView(!!state.panelIcon));
 }
 
 async function enterApp(){$('#auth').classList.add('hidden');$('#app').classList.remove('hidden');await refreshAll();streamDashboard()}
@@ -71,8 +66,8 @@ async function start(){
 }
 $('#setup-btn').onclick=async()=>{try{await call('/setup',{method:'POST',body:JSON.stringify({username:value('#su-user'),password:value('#su-pass'),setupToken:value('#su-token')})});$('#setup').classList.add('hidden');$('#login').classList.remove('hidden');$('#gate-msg').textContent='管理员已创建，请用密码登录；可稍后在“个人设置”开启两步验证。'}catch(e){$('#gate-msg').textContent=e.message}};
 // With two-step verification on, a saved recovery code stands in for the TOTP code; each mode sends only its own field.
-$('#login-btn').onclick=async()=>{try{const password=value('#password'),body=$('#recovery-field').classList.contains('hidden')?{password,code:value('#code')}:{password,recovery:value('#recovery').trim()};const data=await call('/login',{method:'POST',body:JSON.stringify(body)});state.csrf=data.csrf;await enterApp()}catch(e){$('#gate-msg').textContent=e.message}};
-$('#recovery-toggle').onclick=()=>{const recovery=$('#recovery-field').classList.contains('hidden');$('#code-field').classList.toggle('hidden',recovery);$('#recovery-field').classList.toggle('hidden',!recovery);setValue(recovery?'#code':'#recovery','');$('#recovery-toggle').textContent=recovery?'改用动态验证码':'丢失验证器？使用恢复码';$(recovery?'#recovery':'#code').focus()};
+$('#login-btn').onclick=async()=>{try{const data=await call('/login',{method:'POST',body:JSON.stringify(loginRequest({password:value('#password'),code:value('#code'),recovery:value('#recovery'),usingRecovery:!$('#recovery-field').classList.contains('hidden')}))});state.csrf=data.csrf;await enterApp()}catch(e){$('#gate-msg').textContent=e.message}};
+$('#recovery-toggle').onclick=()=>{const swapped=secondFactorView($('#recovery-field').classList.contains('hidden'));write(swapped.changes);$(swapped.focus).focus()};
 $('#logout').onclick=async()=>{try{await call('/logout',{method:'POST',body:'{}'})}finally{location.reload()}};
 
 async function refreshAll(){const [routes,dashboard]=await Promise.all([call('/routes'),call('/dashboard')]);state.routes=routes.routes;state.dashboard=dashboard;renderRoutes();renderDashboard(dashboard);renderTraffic(dashboard);fillDiagnosticNodes()}
@@ -136,13 +131,13 @@ async function patchRoute(route,data){try{await call(`/routes/${route.id}`,{meth
 
 function renderTraffic(data){write(trafficView({data,routes:state.routes}))}
 
-function fillDiagnosticNodes(){const select=$('#diag-node'),current=select.value;select.innerHTML=state.routes.map(r=>`<option value="${r.id}">${escapeHtml(r.name)}</option>`).join('');if(state.routes.some(r=>r.id===current))select.value=current}
-async function loadRuntime(){const d=await call('/diagnostics');$('#diag-runtime').innerHTML=d.nodes.flatMap(n=>n.upstreams.map((u,i)=>`<span class="pill ${u.circuitOpen||u.lastError?'warn':'on'}">${escapeHtml(n.alias)} · 线路 ${i+1} · ${u.circuitOpen?'熔断':u.lastError?escapeHtml(u.lastError):'就绪'}</span>`)).join('')}
+function fillDiagnosticNodes(){const select=$('#diag-node'),current=select.value;select.innerHTML=diagnosticOptions(state.routes);if(state.routes.some(r=>r.id===current))select.value=current}
+async function loadRuntime(){write(runtimeView(await call('/diagnostics')))}
 $('#refresh-access').onclick=loadAccess;
 $('#add-channel').onclick=async()=>{if(!state.editing)return toast('请先保存节点，再添加分发通道',true);const route=state.routes.find(r=>r.id===state.editing);if(!route)return;try{await call(`/routes/${route.id}/channels`,{method:'POST',body:JSON.stringify({label:value('#channel-label').trim()})});setValue('#channel-label','');await renderChannels(route);toast('分发通道已添加')}catch(e){toast(e.message,true)}};
-$('#run-diagnostic').onclick=async()=>{const id=value('#diag-node');if(!id)return toast('请先创建节点',true);$('#diagnostic-result').innerHTML='<article class="panel empty-state"><h3>正在探测回源…</h3></article>';try{const d=await call(`/diagnostics/${id}`);const section=(title,list)=>`<article class="panel diag-card"><span class="eyebrow">${title}</span><h3>${escapeHtml(d.node.name)}</h3>${(list||[]).map(x=>{const lat=Number(x.latencyMs),lcls=!x.online?'bad':lat<300?'good':lat<800?'warn':'bad';return`<div class="diag-line"><span>连接状态</span><b class="${x.online?'good':'bad'}">${x.online?'在线':'失败'}</b></div><div class="diag-line"><span>HTTP 状态</span><b>${x.status||'—'}</b></div><div class="diag-line"><span>响应延迟</span><b class="${lcls}">${isFinite(lat)?lat+' ms':x.latencyMs}</b></div><div class="diag-line"><span>Emby 版本</span><b>${escapeHtml(x.embyVersion||'—')}</b></div>${x.tls?`<div class="diag-line"><span>TLS</span><b class="${x.tls.authorized?'good':'warn'}">${x.tls.authorized?'有效':'未验证'}</b></div><div class="diag-line"><span>证书到期</span><b>${escapeHtml(x.tls.validTo||'—')}</b></div>`:''}${x.error?`<div class="diag-line"><span>错误</span><b class="bad">${escapeHtml(x.error)}</b></div>`:''}`}).join('')}</article>`;$('#diagnostic-result').innerHTML=section('主回源',d.main)+(d.stream?section('推流域名',d.stream):'')+`<article class="panel diag-card"><span class="eyebrow">请求头</span><h3>请求头策略</h3>${Object.entries(d.headerPreview).map(([k,v])=>`<div class="diag-line"><span>${escapeHtml(k)}</span><b>${escapeHtml(v)}</b></div>`).join('')}</article>`;await loadRuntime()}catch(e){toast(e.message,true)}};
+$('#run-diagnostic').onclick=async()=>{const id=value('#diag-node');if(!id)return toast('请先创建节点',true);write(DIAGNOSTIC_RUNNING);try{write(diagnosticView(await call(`/diagnostics/${id}`)));await loadRuntime()}catch(e){toast(e.message,true)}};
 
-async function loadAudit(){const d=await call('/audit');$('#audit-list').innerHTML=d.audit.map(x=>`<div class="event"><time>${new Date(x.at).toLocaleString()}</time><strong>${escapeHtml(x.action)}</strong><div><span>${escapeHtml(x.ip)}</span><br>${escapeHtml(x.detail)}</div></div>`).join('')||'<div class="empty-state"><p>暂无审计事件</p></div>'}
+async function loadAudit(){write(auditView(await call('/audit')))}
 // Renumber with gaps so a later single move only has to rewrite the machines that actually moved.
 async function persistAgentOrder(){
   const updates=orderChanges(state.agents);
@@ -209,30 +204,21 @@ function watchAgentSync(){
 }
 let domainWatchTimer=null;
 function watchDomainSwitch(){clearTimeout(domainWatchTimer);domainWatchTimer=setTimeout(async()=>{try{await loadAgents();const progress=switchProgress(state.agents);if(progress.working){watchDomainSwitch();return}if(progress.failure){toast(progress.failure,true);return}await refreshAll()}catch{watchDomainSwitch()}},4000)}
-async function loadDeployment(){const d=await call('/deployment');$('#deployment-status').innerHTML=`<article class="deploy-card"><small>管理面板域名</small><strong>${escapeHtml(d.publicBaseUrl||'尚未设置')}</strong></article><article class="deploy-card"><small>本地代理域名</small><strong>${escapeHtml(d.localProxyBaseUrl||'尚未设置')}</strong></article><article class="deploy-card"><small>域名隔离</small><strong>${d.splitDomains?'已分离':'等待在代理机器中切换'}</strong></article>`;setValue('#certificate-email',d.certificateEmail||'');$('#certificate-email-state').textContent=d.certificateEmail?'已配置':'未配置';$('#certificate-email-state').className=`pill ${d.certificateEmail?'on':'warn'}`;return d}
-async function loadNotifications(){const d=await call('/notifications');$('#telegram-state').textContent=d.telegram.configured?'已配置':'未配置';$('#telegram-enabled').checked=d.telegram.enabled;setValue('#telegram-chat','');setValue('#telegram-token','')}
+async function loadDeployment(){const d=await call('/deployment');write(deploymentView(d));return d}
+async function loadNotifications(){write(notificationsView(await call('/notifications')))}
 
 
-function showTotpStage(stage){for(const id of ['#totp-off','#totp-setup','#totp-on'])$(id).classList.toggle('hidden',id!=='#'+stage)}
-async function loadAccount(){
-  const d=await call('/account');
-  $('#account-user').textContent=d.username||'admin';
-  $('#totp-state').textContent=d.totpEnabled?'已开启':'未开启';
-  $('#totp-state').className=`pill ${d.totpEnabled?'on':'warn'}`;
-  $('#totp-hint').textContent=d.totpEnabled?`登录时需要输入动态验证码。剩余恢复码 ${d.recoveryRemaining} 个。`:'开启后，登录时除密码外还需要输入动态验证码。';
-  showTotpStage(d.totpEnabled?'totp-on':'totp-off');
-  for(const id of ['#pw-current','#pw-new','#pw-confirm','#totp-password','#totp-code','#totp-off-password','#totp-off-code'])setValue(id,'');
-}
+function showTotpStage(stage){write(totpStageView(stage))}
+async function loadAccount(){write(accountView(await call('/account')))}
 $('#save-password').onclick=async()=>{
-  if(value('#pw-new').length<14)return toast('新密码至少 14 位',true);
-  if(value('#pw-new')!==value('#pw-confirm'))return toast('两次输入的新密码不一致',true);
-  try{await call('/account/password',{method:'POST',body:JSON.stringify({currentPassword:value('#pw-current'),newPassword:value('#pw-new')})});toast('密码已更新');await loadAccount()}catch(e){toast(e.message,true)}
+  const change=passwordChange({current:value('#pw-current'),next:value('#pw-new'),again:value('#pw-confirm')});
+  if(change.error)return toast(change.error,true);
+  try{await call('/account/password',{method:'POST',body:JSON.stringify(change.body)});toast('密码已更新');await loadAccount()}catch(e){toast(e.message,true)}
 };
 $('#totp-begin').onclick=async()=>{
   try{
     const d=await call('/account/totp/begin',{method:'POST',body:JSON.stringify({password:value('#totp-password')})});
-    $('#totp-qr').innerHTML=qrSvg(d.qr);$('#totp-secret').textContent=d.secret;
-    showTotpStage('totp-setup');setTimeout(()=>$('#totp-code').focus(),0);
+    write(totpSetupView(d));setTimeout(()=>$('#totp-code').focus(),0);
   }catch(e){toast(e.message,true)}
 };
 $('#totp-cancel').onclick=()=>showTotpStage('totp-off');
@@ -240,7 +226,7 @@ $('#totp-confirm').onclick=async()=>{
   try{
     const d=await call('/account/totp/enable',{method:'POST',body:JSON.stringify({code:value('#totp-code')})});
     await loadAccount();
-    showSecret(`恢复码（每行一个，只显示这一次）\n${d.recovery.join('\n')}`,{eyebrow:'恢复码',title:'两步验证已开启',description:'请立即离线保存这些恢复码；丢失验证器时可用它们登录。'});
+    const codes=recoveryCodes(d);showSecret(codes.content,codes.options);
   }catch(e){toast(e.message,true)}
 };
 $('#totp-disable').onclick=async()=>{
@@ -302,13 +288,13 @@ $('#create-enrollment').onclick=async()=>{const button=$('#create-enrollment');t
 $('#copy-agent-command').onclick=async()=>{await navigator.clipboard.writeText($('#agent-command').textContent);toast('安装指令已复制')};
 
 $('#node-search').oninput=()=>renderRoutes();
-$('#export-btn').onclick=async()=>{try{const d=await call('/export'),blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`aegis-relay-${new Date().toISOString().slice(0,10)}.json`;a.click();URL.revokeObjectURL(a.href);toast('配置已导出；连接密码不会包含在文件中')}catch(e){toast(e.message,true)}};
-$('#import-btn').onclick=()=>$('#import-modal').classList.remove('hidden');$('#close-import').onclick=()=>$('#import-modal').classList.add('hidden');$('#do-import').onclick=async()=>{try{const parsed=JSON.parse(value('#import-json')),d=await call('/import',{method:'POST',body:JSON.stringify(parsed)});$('#import-modal').classList.add('hidden');const secrets=d.credentials.map(x=>`${x.alias}\n${x.clientPath}${x.accessKey?`\n${x.accessKey}`:''}`).join('\n\n');if(secrets)showSecret(`新生成的节点凭据\n\n${secrets}`,{eyebrow:'IMPORT CREDENTIALS',title:'导入节点连接信息',description:'这些节点地址和连接密码可由管理员随时再次查看。'});toast(`已导入 ${d.imported} 个节点`);await refreshAll()}catch(e){toast(e.message,true)}};
+$('#export-btn').onclick=async()=>{try{const d=await call('/export'),blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=exportName(Date.now());a.click();URL.revokeObjectURL(a.href);toast('配置已导出；连接密码不会包含在文件中')}catch(e){toast(e.message,true)}};
+$('#import-btn').onclick=()=>$('#import-modal').classList.remove('hidden');$('#close-import').onclick=()=>$('#import-modal').classList.add('hidden');$('#do-import').onclick=async()=>{try{const parsed=JSON.parse(value('#import-json')),d=await call('/import',{method:'POST',body:JSON.stringify(parsed)});$('#import-modal').classList.add('hidden');const outcome=importOutcome(d);if(outcome.secret)showSecret(outcome.secret.content,outcome.secret.options);toast(outcome.message);await refreshAll()}catch(e){toast(e.message,true)}};
 $('#close-modal').onclick=()=>$('#modal').classList.add('hidden');$('#copy-secret').onclick=async()=>{await navigator.clipboard.writeText($('#secret').textContent);toast('已复制到剪贴板')};
 $('#save-notifications').onclick=async()=>{try{await call('/notifications',{method:'PUT',body:JSON.stringify({telegram:{enabled:$('#telegram-enabled').checked,botToken:value('#telegram-token'),chatId:value('#telegram-chat')}})});toast('通知设置已保存');await loadNotifications()}catch(e){toast(e.message,true)}};$('#test-notifications').onclick=async()=>{try{await call('/notifications/test',{method:'POST',body:'{}'});toast('测试消息已发送')}catch(e){toast(e.message,true)}};
 $('#save-certificate-email').onclick=async()=>{try{await call('/deployment',{method:'PUT',body:JSON.stringify({certificateEmail:value('#certificate-email')})});toast('统一证书邮箱已保存');await loadDeployment()}catch(e){toast(e.message,true)}};
 
-async function streamDashboard(){if(!state.csrf)return;try{const response=await fetch(base+'/events',{headers:{'x-csrf-token':state.csrf}});if(response.status===401){showLogin();return}if(!response.ok||!String(response.headers.get('content-type')||'').includes('text/event-stream'))throw Error('event stream unavailable');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const{done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const chunks=buffer.split('\n\n');buffer=chunks.pop();for(const chunk of chunks){const line=chunk.split('\n').find(x=>x.startsWith('data: '));if(line){state.dashboard=JSON.parse(line.slice(6));renderDashboard(state.dashboard);renderTraffic(state.dashboard)}}}}catch{if(!state.csrf)return;$('#live-state').innerHTML='<i></i>重连中';setTimeout(streamDashboard,5000)}}
+async function streamDashboard(){if(!state.csrf)return;try{const response=await fetch(base+'/events',{headers:{'x-csrf-token':state.csrf}});if(response.status===401){showLogin();return}if(!response.ok||!String(response.headers.get('content-type')||'').includes('text/event-stream'))throw Error('event stream unavailable');const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const{done,value}=await reader.read();if(done)break;const feed=feedEvents(buffer+decoder.decode(value,{stream:true}));buffer=feed.rest;for(const data of feed.events){state.dashboard=JSON.parse(data);renderDashboard(state.dashboard);renderTraffic(state.dashboard)}}}catch{if(!state.csrf)return;$('#live-state').innerHTML='<i></i>重连中';setTimeout(streamDashboard,5000)}}
 start();
 
 // 自动切流: the page is drawn by view.js; here are the fetching, the timer and the buttons.
