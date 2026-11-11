@@ -336,3 +336,142 @@ test('adding a machine starts from an empty form listing the nodes, and ends wit
   const made=view.enrollmentView({command:'curl … | sudo sh -s -- --name \'HK <2>\'',expiresAt:'2026-11-11T08:10:00Z'});
   assert.deepEqual(made,{'#agent-command':{text:'curl … | sudo sh -s -- --name \'HK <2>\''},'#agent-command-expiry':{text:`有效期至 ${new Date('2026-11-11T08:10:00Z').toLocaleTimeString()}`},'#agent-enroll-form':{hidden:true},'#agent-command-wrap':{hidden:false}});
 });
+
+// ---------------------------------------------------------------------------------------------------
+// Automatic steering.
+const NOW=Date.parse('2026-11-11T08:00:00Z');
+// The steering page as the refresher sees it: what was asked for, drawn, said under the title and said aloud.
+function steeringPage(ask){
+  const seen={shown:[],status:'',toasts:[]},where={page:'steering',csrf:'test',hidden:false};
+  const refresher=view.steeringRefresher({ask,onPage:()=>where.page==='steering',signedIn:()=>!!where.csrf,hidden:()=>where.hidden,show:(data,liveOnly)=>seen.shown.push({data,liveOnly}),status:text=>{seen.status=text},toast:(message,error)=>seen.toasts.push([message,error]),now:()=>NOW});
+  return {refresher,seen,where};
+}
+
+test('cache-aware advice remains explicitly observational and escapes client names',()=>{
+  const data={machines:[{id:'a',name:'ZGO'}],routes:[],live:{playback:[{session:'abc123',client:'<VidHub>',routeId:'n1',state:'possible_stall',lastProgressAt:NOW,machines:[{id:'a',samples:3,rateBps:1e6,bitrate:20e6,margin:0.4,advice:'would_switch'}]}]}};
+  const html=view.steeringLiveView(data,NOW)['#steering-playback'].html;
+  assert.match(html,/建议试切（未执行）/);assert.match(html,/疑似停滞/);assert.match(html,/最近 3 段/);
+  assert.match(html,/&lt;VidHub&gt;/);assert.doesNotMatch(html,/<VidHub>/);
+  assert.match(html,/<strong>ZGO<\/strong> · 建议试切（未执行）<br><small class="muted">传输 8\.0 Mbps · 影片 20\.0 Mbps · 最近 3 段 · 码率余量 0\.40×<\/small>/);
+  data.live.playback=[];
+  assert.match(view.steeringLiveView(data,NOW)['#steering-playback'].html,/已有缓存的播放可能暂时没有新取流请求/);
+});
+
+test('steering refreshes live data without overwriting unsaved settings or overlapping requests',async()=>{
+  let resolve,calls=0;
+  const {refresher,seen,where}=steeringPage(()=>{calls++;return new Promise(r=>{resolve=r})});
+  assert.equal(view.STEERING_REFRESH_MS,5000,'the open steering page needs a periodic refresh');
+  // What the timer has drawn cannot touch a setting: the live tables name none of the settings' controls.
+  const data={settings:{boundedClients:['VidHub'],boundMB:64},machines:[],routes:[],live:{ranges:[{client:'VidHub',continued:8,trialContinued:0,state:'on'}]}};
+  const whole=view.steeringView(data,NOW),live=view.steeringLiveView(data,NOW),settings=view.STEERING_FIELDS.map(field=>field.id);
+  assert.deepEqual([settings.filter(id=>id in live),settings.filter(id=>!(id in whole))],[[],[]]);
+  assert.deepEqual([whole['#steering-bounded'],whole['#steering-bound'],whole['#steering-bound-auto']],[{value:'VidHub'},{value:64},{checked:false}]);
+  assert.match(live['#steering-ranges'].html,/8 次/);
+  // One request at a time, and the timer asks for the live tables only.
+  const pending=refresher.tick();await refresher.tick();assert.equal(calls,1);
+  resolve(data);await pending;
+  assert.deepEqual([seen.shown,seen.toasts],[[{data,liveOnly:true}],[]]);
+  assert.match(seen.status,/^每 5 秒刷新 · 更新于 /);
+  for(const [field,value] of [['hidden',true],['page','dashboard'],['csrf','']]){
+    Object.assign(where,{hidden:false,page:'steering',csrf:'test',[field]:value});
+    await refresher.tick();assert.equal(calls,1,field);
+  }
+  // Opening the page asks for all of it.
+  Object.assign(where,{hidden:false,page:'steering',csrf:'test'});
+  const opened=refresher.load();resolve(data);await opened;
+  assert.deepEqual([calls,seen.shown.at(-1).liveOnly],[2,false]);
+});
+
+test('steering refresh keeps the last snapshot on failure and recovers on the next poll',async()=>{
+  let fail=true;
+  const {refresher,seen}=steeringPage(async()=>{if(fail)throw Error('offline');return {live:{ranges:[]}}});
+  await refresher.tick();
+  assert.deepEqual([seen.shown,seen.toasts],[[],[]],'nothing is redrawn, and the timer does not interrupt with a message');
+  assert.match(seen.status,/刷新失败/);
+  // Asked for by the person, the failure is said aloud.
+  await refresher.load();
+  assert.deepEqual(seen.toasts,[['offline',true]]);
+  fail=false;await refresher.tick();assert.match(seen.status,/更新于/);assert.equal(seen.shown.length,1);
+});
+
+test('a steering response arriving after navigation does not change the hidden page',async()=>{
+  for(const leave of [where=>{where.page='dashboard'},where=>{where.csrf=''}]){
+    let resolve;
+    const {refresher,seen,where}=steeringPage(()=>new Promise(r=>{resolve=r}));
+    const pending=refresher.tick();leave(where);resolve({live:{ranges:[]}});await pending;
+    assert.deepEqual([seen.shown,seen.status],[[],'']);
+  }
+  // Nor does a failure that arrives after the person has gone elsewhere.
+  let reject;
+  const {refresher,seen,where}=steeringPage(()=>new Promise((_,r)=>{reject=r}));
+  const pending=refresher.load();where.page='dashboard';reject(Error('offline'));await pending;
+  assert.deepEqual([seen.status,seen.toasts],['',[]]);
+});
+
+test('playback UI labels stale measurements as history and shows the last stream request',()=>{
+  const data={settings:{},machines:[],routes:[],live:{sessions:[{session:'abc123',client:'VidHub',routeId:'n1',lastSeen:NOW,scores:{old:{verdict:'ok',rateBps:12e6,at:1000,stale:true},fresh:{verdict:'ok',rateBps:1e6,at:999000,stale:false},unknown:{verdict:'unknown',rateBps:0,at:1000,stale:true}}},{session:'cached',client:'VidHub',lastSeen:NOW-120000,scores:{}}]}};
+  const html=view.steeringView(data,NOW)['#steering-sessions'].html;
+  assert.match(html,/历史测速已过期/);assert.match(html,/历史速率/);assert.match(html,/最近取流/);
+  assert.match(html,/近 1 分钟有取流/);assert.match(html,/近期未取流/);
+  assert.match(html,/unknown · 测速样本不足/);assert.doesNotMatch(html,/unknown · 历史测速已过期/);
+  assert.match(html,/fresh · 正常 · 8\.0 Mbps/);
+  assert.doesNotMatch(html,/old · 正常 · 96\.0 Mbps/);
+  // "Recent" is told against the moment the page is drawn at, to the minute.
+  const at=lastSeen=>view.steeringLiveView({live:{sessions:[{session:'s',lastSeen,scores:{}}]}},NOW)['#steering-sessions'].html.includes('近 1 分钟有取流');
+  assert.deepEqual([at(NOW-60000),at(NOW-60001)],[true,false]);
+});
+
+test('the steering page shows the settings as saved, who can take part, and what each machine must run',()=>{
+  const d={settings:{mode:'shadow',entryDomain:'entry.example.com',excludedClients:['Infuse','a<b'],boundedClients:['VidHub'],boundMB:48,boundAuto:true,autoExcluded:{SenPlayer:1},autoBounded:{Fileball:1},autoUnbounded:{'Emby Web':1}},certificateEmail:'ops@example.com',
+    machines:[{id:'local',name:'<本机>',local:true,domain:'emby.example.com',issues:[],steerTarget:true},{id:'ip"1',name:'IP',local:false,domain:'',issues:['没有 HTTPS <域名>','已关闭'],steerTarget:false}],
+    entryCommands:[{name:'A<1>',auto:true,state:'failed',attempt:3,message:'证书 <未签发>',command:'sudo aegis-relay entry "x"'},{name:'B',auto:true,state:'active',message:'已生效',command:'c2'},{name:'C',auto:true,state:'nonsense',command:'c3'},{name:'Old',auto:false,command:'sudo run <me>'}],
+    routes:[{id:'r1',name:'<Movies>',alias:'movies',enabled:true,issues:[],entryGaps:['IP','Gone'],egressAgentId:'local',egressActive:true},{id:'r2',name:'',alias:'shows',enabled:false,issues:['未开启自动切流']},{id:'r3',name:'Anime',alias:'anime',enabled:true,issues:['只有一台机器','未开启自动切流'],egressAgentId:'x',egressActive:false,egressIssues:['出口 <不在线>']}],live:{}};
+  const page=view.steeringView(d,NOW);
+  assert.deepEqual([page['#steering-mode'],page['#steering-entry'],page['#steering-excluded'],page['#steering-bounded'],page['#steering-bound'],page['#steering-bound-auto'],page['#steering-mode-state']],
+    [{value:'shadow'},{value:'entry.example.com'},{value:'Infuse\na<b'},{value:'VidHub'},{value:48},{checked:true},{text:'只测不切',className:'pill info'}]);
+  assert.deepEqual([page['#steering-auto-excluded'].text,page['#steering-auto-ranges'].text],['自动排除（跳转后经常没有到达目标机器）：SenPlayer','自动加入分段：Fileball；历史停用（可清空后重试）：Emby Web']);
+  assert.match(page['#steering-status'].html,/<strong>1 \/ 2<\/strong>.*<small>正在切流的节点<\/small><strong>1<\/strong>.*<strong>entry\.example\.com<\/strong>/);
+  const machines=page['#steering-machines'].html;
+  for(const text of ['<strong>&lt;本机&gt;</strong><br><small class="muted">面板本机</small>','<span class="pill on">可参与</span>','data-id="local" checked>','<span class="pill warn">没有 HTTPS &lt;域名&gt;</span> <span class="pill warn">已关闭</span>','data-id="ip&quot;1" >','<td>—</td>'])assert.ok(machines.includes(text),text);
+  const commands=page['#steering-commands'].html;
+  for(const text of ['<strong>A&lt;1&gt;</strong><span class="pill warn">暂未成功，稍后自动重试（第 3 次）</span><small class="muted">证书 &lt;未签发&gt;</small>','<strong>B</strong><span class="pill on">已生效</span></div>','<strong>C</strong><span class="pill ">等待机器执行</span>',
+    '<pre>sudo aegis-relay entry &quot;x&quot;</pre><button class="btn ghost copy-steer-command" data-command="sudo aegis-relay entry &quot;x&quot;">复制命令</button>','<pre>sudo run &lt;me&gt;</pre><small class="muted">这台机器的探针版本较旧，需要手动执行一次；升级后会自动配置。</small>'])assert.ok(commands.includes(text),text);
+  const routes=page['#steering-routes'].html.split('<tr>').slice(1);
+  assert.ok(routes[0].includes('&lt;Movies&gt;')&&routes[0].includes('<span class="pill on">只测不切</span> <span class="pill warn">IP、Gone 没有部署该节点，对外仍用直连地址</span> <span class="pill info">统一出口：&lt;本机&gt;</span>'));
+  assert.ok(routes[1].includes('<strong>shows</strong>')&&routes[1].includes('<span class="pill off">关闭</span></td><td>—</td>'),'a node that is simply switched off has no problem to report');
+  assert.ok(routes[2].includes('<span class="pill warn">只有一台机器</span> <span class="pill warn">未开启自动切流</span> <span class="pill danger">统一出口未生效：出口 &lt;不在线&gt;</span>'));
+  // Nothing set up yet: the defaults, and what to do first.
+  const blank=view.steeringView({},NOW);
+  assert.deepEqual([blank['#steering-mode'],blank['#steering-bound'],blank['#steering-mode-state'],blank['#steering-auto-excluded'].text,blank['#steering-auto-ranges'].text],[{value:'off'},{value:64},{text:'关闭',className:'pill '},'','']);
+  assert.ok(blank['#steering-machines'].html.includes('还没有机器')&&blank['#steering-routes'].html.includes('还没有节点')&&blank['#steering-commands'].html.includes('填写入口域名并保存后'));
+  assert.ok(view.steeringView({settings:{entryDomain:'e.example.com'}},NOW)['#steering-commands'].html.includes('请先在「部署向导」保存统一证书邮箱。'));
+  assert.ok(view.steeringView({settings:{entryDomain:'e.example.com',mode:'on'},certificateEmail:'a@b.c'},NOW)['#steering-commands'].html.includes('还没有可参与切流的机器。'));
+});
+
+test('the live steering tables say what was decided, how it turned out, and for which clients',()=>{
+  const d={machines:[{id:'a',name:'<A>'},{id:'b',name:'B'}],routes:[{id:'r1',name:'Movies',alias:'movies'},{id:'r2',name:'',alias:'shows'}],live:{
+    events:[{at:NOW,routeId:'r1',from:'a',to:'b',mode:'on',reason:'better_line',fromRateBps:400000,toRateBps:2400000,client:'Infuse'},{at:0,routeId:'gone',from:'b',to:'',mode:'shadow',reason:'custom <reason>',fromRateBps:0,toRateBps:0,client:''}],
+    effects:{on:{total:20,better:13,worse:3,upstream:2,notLanded:1,unmeasured:1,medianGain:3.2,pairs:[{from:'a',to:'b',total:12,better:9,worse:2,medianGain:2.5},{from:'b',to:'x',total:8,better:4,worse:1,medianGain:0}]},shadow:{total:9,persisted:6,recovered:2,unmeasured:1}},networks:17,
+    ranges:[{client:'a<b',continued:12,trialContinued:3,state:'on'},{client:'T',continued:0,trialContinued:1,state:'trial'},{client:'O',continued:0,trialContinued:0,state:'off'},{client:'?',continued:1,trialContinued:1,state:'other'}],
+    clients:[{client:'Sen<Player>',total:8,landed:1,autoExcluded:true},{client:'Infuse',total:30,landed:29,autoExcluded:false}]}};
+  const live=view.steeringLiveView(d,NOW),events=live['#steering-events'].html.split('<tr>').slice(1);
+  assert.ok(events[0].includes(`<td>${view.clockTime(NOW)}</td><td>Movies</td><td>&lt;A&gt; → B</td><td>切到更快的线路</td><td>3.2 Mbps → 19.2 Mbps</td><td>Infuse</td>`),events[0]);
+  assert.ok(events[1].includes('<td>—</td><td>gone</td><td>B → 收到请求的机器 <span class="pill info">本应切换</span></td><td>custom &lt;reason&gt;</td><td>—</td><td>—</td>'),events[1]);
+  const effects=live['#steering-effects'].html;
+  for(const text of ['真实切换（最近 20 次）</small><strong>65% 卡顿解除</strong>','仍卡顿 3 · 源站慢 2 · 没跟随跳转 1 · 未测到 1 · 中位提速 3.2×','本应切换（最近 9 次）</small><strong>67% 持续卡顿</strong>','3 分钟内自行恢复 2 · 未测到 1','<strong>17</strong>'])assert.ok(effects.includes(text),text);
+  assert.equal(live['#steering-effect-pairs'].html,'<tr><td>&lt;A&gt; → B</td><td>12</td><td>9</td><td>2</td><td>2.5×</td></tr><tr><td>B → x</td><td>8</td><td>4</td><td>1</td><td>—</td></tr>');
+  assert.deepEqual([...live['#steering-ranges'].html.matchAll(/<td>([^<]*)<\/td><td>(\d+) 次<\/td><td>(\d+) 次<\/td><td>(?:<span class="pill (\w+)">)?/g)].map(match=>match.slice(1,5)),[['a&lt;b','12','3','on'],['T','0','1','info'],['O','0','0','off'],['?','1','1',undefined]]);
+  assert.equal(live['#steering-clients'].html,'<tr><td>Sen&lt;Player&gt;</td><td>8</td><td>1</td><td><span class="pill danger">已自动排除</span></td></tr><tr><td>Infuse</td><td>30</td><td>29</td><td><span class="pill on">正常</span></td></tr>');
+  // Nothing yet: every table says so instead of standing empty, and no rate is made up.
+  const empty=view.steeringLiveView({},NOW);
+  for(const [id,text] of [['#steering-playback','等待新的播放进度'],['#steering-events','暂无切流决策'],['#steering-sessions','最近 10 分钟没有取流会话'],['#steering-effect-pairs','还没有真实切换'],['#steering-ranges','还没有已确认的分段接续'],['#steering-clients','还没有跳转记录']])assert.ok(empty[id].html.includes(text),id);
+  assert.ok(empty['#steering-effects'].html.includes('<strong>— 卡顿解除</strong>')&&empty['#steering-effects'].html.includes('中位提速 —'));
+  assert.deepEqual([view.mbps(0),view.mbps(1e6),view.clockTime(0)],['—','8.0 Mbps','—']);
+});
+
+test('saving the steering settings sends them as typed; an empty segment size means the usual one',()=>{
+  const typed={'#steering-mode':'on','#steering-entry':' entry.example.com','#steering-excluded':'Infuse\nRex','#steering-bounded':'','#steering-bound':'32','#steering-bound-auto':true};
+  assert.deepEqual(view.steeringSave(typed),{mode:'on',entryDomain:' entry.example.com',excludedClients:'Infuse\nRex',boundedClients:'',boundMB:32,boundAuto:true});
+  assert.deepEqual([view.steeringSave({...typed,'#steering-bound':''}).boundMB,view.steeringSave(typed,{clearAutoExcluded:true}).clearAutoExcluded,Object.keys(view.steeringSave(typed,{clearRangeAuto:true})).at(-1)],[64,true,'clearRangeAuto']);
+  for(const field of view.STEERING_FIELDS)assert.ok(control(field.id),field.id);
+});
