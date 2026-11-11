@@ -187,7 +187,7 @@ EOF
   systemctl enable --now aegis-relay-agent-entry.path
 fi
 if [ "$MODE" = ip ]; then
-  # IP 反代模式：配置明文 HTTP 入口。探针从状态文件读到新地址，不需要重建容器。
+  # IP 反代模式：直连地址是本机公网 IP，明文 HTTP。探针从状态文件读到新地址，不需要重建容器。
   if "$INSTALL_DIR/agent-configure-ip.sh"; then
     echo "Agent 已同步，IP 反代模式已就绪。之后可在面板填写域名切换到 HTTPS。"
   else
