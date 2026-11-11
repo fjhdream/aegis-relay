@@ -4,7 +4,7 @@ umask 077
 # Its own place, in full, and then away from wherever it was started: python puts the current
 # directory on its module path, and a script run by hand from inside data/ (which belongs to the
 # container) must not load what the container left there.
-AEGIS_HERE=$(cd "$(dirname "$0")" && pwd)
+AEGIS_HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd /
 # Without the library nothing can be done about a request (every installer copies src/, so this takes
 # a damaged install, or the instant an upgrade replaces src/). The request must not sit there

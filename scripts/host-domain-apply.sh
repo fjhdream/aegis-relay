@@ -4,7 +4,7 @@ umask 077
 # Its own place, in full, and then away from wherever it was started: python puts the current
 # directory on its module path, and a script run by hand from inside data/ (which belongs to the
 # container) must not load what the container left there.
-AEGIS_HERE=$(cd "$(dirname "$0")" && pwd)
+AEGIS_HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd /
 # Without the library the request cannot be read safely; it must still not sit there re-triggering
 # this unit, and the panel must not wait for an answer that never comes: its `pending` status goes too,
