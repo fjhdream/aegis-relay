@@ -25,11 +25,8 @@ DNS_IP=$(getent ahostsv4 "$PROXY_DOMAIN" | awk 'NR==1{print $1}')
 if [ -n "$PUBLIC_IP" ] && [ -n "$DNS_IP" ] && [ "$PUBLIC_IP" != "$DNS_IP" ]; then
   echo "提示：$PROXY_DOMAIN 可能启用了 CDN/Cloudflare 代理；将继续使用 HTTP-01 验证。"
 fi
-SITE="$AEGIS_NGINX_DIR/sites-available/aegis-relay.conf"
-BACKUP=""
-if [ -f "$SITE" ]; then BACKUP="$SITE.backup.$(date +%Y%m%d%H%M%S)"; cp "$SITE" "$BACKUP"; fi
-restore_site() { if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then cp "$BACKUP" "$SITE"; nginx -t >/dev/null 2>&1 && systemctl reload nginx || true; fi; }
-trap 'restore_site' HUP INT TERM
+NEW_SITE=$(mktemp "${TMPDIR:-/tmp}/aegis-panel-site.XXXXXX")
+trap 'rm -f "$NEW_SITE"' EXIT
 {
   data_plane_upstream aegis_relay_backend aegis_connection_upgrade
   cat <<EOF
@@ -84,14 +81,13 @@ server {
 EOF
   data_plane_location aegis_relay_backend aegis_connection_upgrade
   echo "}"
-} > "$SITE"
-ln -sfn "$SITE" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay.conf"
+} > "$NEW_SITE"
 rm -f "$AEGIS_NGINX_DIR/sites-enabled/default"
-if ! nginx -t; then restore_site; echo "Nginx 双域名配置校验失败，已回滚。" >&2; exit 1; fi
-systemctl enable --now nginx
-systemctl reload nginx
-if ! certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"; then restore_site; echo "面板域名证书配置失败，已恢复旧配置。" >&2; exit 1; fi
-if ! certbot --nginx -d "$PROXY_DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"; then restore_site; echo "代理域名证书申请失败，已恢复旧配置。请检查 DNS、Cloudflare 和 80/443 端口。" >&2; exit 1; fi
+site_install aegis-relay "$NEW_SITE" || { echo "Nginx 双域名配置校验失败，已回滚。" >&2; exit 1; }
+# Interrupted from here on, the panel goes back to the site it had.
+trap 'site_restore aegis-relay' HUP INT TERM
+if ! certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"; then site_restore aegis-relay; echo "面板域名证书配置失败，已恢复旧配置。" >&2; exit 1; fi
+if ! certbot --nginx -d "$PROXY_DOMAIN" --non-interactive --agree-tos --redirect -m "$EMAIL"; then site_restore aegis-relay; echo "代理域名证书申请失败，已恢复旧配置。请检查 DNS、Cloudflare 和 80/443 端口。" >&2; exit 1; fi
 systemctl enable --now certbot.timer 2>/dev/null || true
 set_env "$INSTALL_DIR/.env" LOCAL_PROXY_BASE_URL "https://$PROXY_DOMAIN"
 set_env "$INSTALL_DIR/.env" CERTIFICATE_EMAIL "$EMAIL"

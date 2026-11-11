@@ -66,6 +66,31 @@ set_env(){
   chmod 600 "$1.tmp"; mv "$1.tmp" "$1"
 }
 
+# Put a site in place: keep a copy of the one it replaces, enable it, and have Nginx check and load it.
+# If Nginx refuses it the previous site is put back before this returns. FILE holds the new site; it
+# is a file and not standard input on purpose: piping into a shell function runs it in a subshell, and
+# site_restore would then not know what to restore.
+#   site_install NAME FILE
+site_install(){
+  aegis_site=$AEGIS_NGINX_DIR/sites-available/$1.conf aegis_enabled=$AEGIS_NGINX_DIR/sites-enabled/$1.conf
+  AEGIS_SITE_BACKUP="" AEGIS_SITE_WAS_ENABLED=0
+  if [ -e "$aegis_enabled" ] || [ -L "$aegis_enabled" ]; then AEGIS_SITE_WAS_ENABLED=1; fi
+  if [ -f "$aegis_site" ]; then AEGIS_SITE_BACKUP="$aegis_site.backup.$(date +%Y%m%d%H%M%S)"; cp "$aegis_site" "$AEGIS_SITE_BACKUP" || return 1; fi
+  cp "$2" "$aegis_site" && ln -sfn "$aegis_site" "$aegis_enabled" || { site_restore "$1"; return 1; }
+  if ! nginx -t; then site_restore "$1"; echo "Nginx 配置校验失败，已恢复原来的站点。" >&2; return 1; fi
+  systemctl enable --now nginx && systemctl reload nginx || { site_restore "$1"; return 1; }
+}
+
+# Undo the last site_install of NAME: the site it replaced comes back, or the new one goes if there was
+# none, and Nginx loads the result. For a later step that fails (the certificate, say).
+#   site_restore NAME
+site_restore(){
+  aegis_site=$AEGIS_NGINX_DIR/sites-available/$1.conf aegis_enabled=$AEGIS_NGINX_DIR/sites-enabled/$1.conf
+  if [ -n "${AEGIS_SITE_BACKUP:-}" ] && [ -f "$AEGIS_SITE_BACKUP" ]; then cp "$AEGIS_SITE_BACKUP" "$aegis_site"; else rm -f "$aegis_site"; fi
+  [ "${AEGIS_SITE_WAS_ENABLED:-0}" = 1 ] || rm -f "$aegis_enabled"
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+}
+
 # ---------------------------------------------------------------------------------------------------
 # An agent's direct address (直连地址, see GLOSSARY.md): the domain (HTTPS) or the public IP (plain
 # HTTP) its Nginx answers on, in front of the agent container. Every way of setting it comes through
@@ -180,15 +205,17 @@ agent_serve_domain(){
 #   agent_serve_ip
 agent_serve_ip(){ agent_switch ip "" agent_ip_steps; }
 
+# A switch that fails at any step leaves the machine serving on the address it had: the site Nginx had
+# loaded is back in place, .env is untouched.
 agent_domain_steps(){
-  aegis_site=$AEGIS_NGINX_DIR/sites-available/aegis-relay-agent.conf
   host_packages nginx certbot python3-certbot-nginx || return 1
-  agent_site_for_domain "$1" > "$aegis_site" || return 1
-  ln -sfn "$aegis_site" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-agent.conf" || return 1
-  nginx -t || return 1
-  systemctl enable --now nginx || return 1
-  systemctl reload nginx || return 1
-  certbot --nginx -d "$1" --non-interactive --agree-tos --redirect -m "$2" || return 1
+  aegis_new=$(mktemp "${TMPDIR:-/tmp}/aegis-agent-site.XXXXXX") || return 1
+  if agent_site_for_domain "$1" > "$aegis_new" && site_install aegis-relay-agent "$aegis_new"; then rm -f "$aegis_new"; else rm -f "$aegis_new"; return 1; fi
+  if ! certbot --nginx -d "$1" --non-interactive --agree-tos --redirect -m "$2"; then
+    site_restore aegis-relay-agent
+    echo "证书申请失败，已恢复原来的站点。请检查 DNS、Cloudflare 与 80/443 端口后重试。" >&2
+    return 1
+  fi
   systemctl enable --now certbot.timer 2>/dev/null || true
   set_env "$AEGIS_AGENT_DIR/.env" AGENT_DOMAIN "$1" || return 1
   set_env "$AEGIS_AGENT_DIR/.env" AGENT_EMAIL "$2" || return 1
@@ -197,22 +224,20 @@ agent_domain_steps(){
 }
 
 agent_ip_steps(){
-  aegis_site=$AEGIS_NGINX_DIR/sites-available/aegis-relay-agent.conf
   host_packages nginx || return 1
   aegis_ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
   [ -n "$aegis_ip" ] || { echo "无法检测公网 IP" >&2; return 1; }
-  aegis_backup=""
-  if [ -f "$aegis_site" ]; then aegis_backup="$aegis_site.backup.$(date +%Y%m%d%H%M%S)"; cp "$aegis_site" "$aegis_backup" || return 1; fi
-  agent_site_for_ip > "$aegis_site" || return 1
-  ln -sfn "$aegis_site" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-agent.conf" || return 1
-  rm -f "$AEGIS_NGINX_DIR/sites-enabled/default"
-  if ! nginx -t; then
-    [ -n "$aegis_backup" ] && cp "$aegis_backup" "$aegis_site"
-    echo "Nginx 配置校验失败，已回滚。" >&2
+  # The agent becomes the default server, so the distribution's default site has to make way; it comes
+  # back if the switch does not go through.
+  aegis_default=$AEGIS_NGINX_DIR/sites-enabled/default
+  aegis_default_target=$(readlink "$aegis_default" 2>/dev/null || true)
+  rm -f "$aegis_default"
+  aegis_new=$(mktemp "${TMPDIR:-/tmp}/aegis-agent-site.XXXXXX") || return 1
+  if agent_site_for_ip > "$aegis_new" && site_install aegis-relay-agent "$aegis_new"; then rm -f "$aegis_new"; else
+    rm -f "$aegis_new"
+    if [ -n "$aegis_default_target" ]; then ln -sfn "$aegis_default_target" "$aegis_default"; nginx -t >/dev/null 2>&1 && systemctl reload nginx || true; fi
     return 1
   fi
-  systemctl enable --now nginx || return 1
-  systemctl reload nginx || return 1
   set_env "$AEGIS_AGENT_DIR/.env" AGENT_DOMAIN "" || return 1
   set_env "$AEGIS_AGENT_DIR/.env" AGENT_PROXY_MODE ip || return 1
   set_env "$AEGIS_AGENT_DIR/.env" AGENT_PROXY_IP "$aegis_ip" || return 1
