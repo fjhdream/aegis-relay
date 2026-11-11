@@ -65,3 +65,97 @@ set_env(){
   awk -v key="$2" -v value="$3" 'BEGIN{done=0} $0 ~ "^"key"=" {print key"="value;done=1;next} {print} END{if(!done)print key"="value}' "$1" > "$1.tmp"
   chmod 600 "$1.tmp"; mv "$1.tmp" "$1"
 }
+
+# ---------------------------------------------------------------------------------------------------
+# An agent's direct address (直连地址, see GLOSSARY.md): the domain (HTTPS) or the public IP (plain
+# HTTP) its Nginx answers on, in front of the agent container. Every way of setting it comes through
+# the two functions below: the installer, the upgrade, the aegis-relay-agent command and the request
+# the panel hands the agent. They report failure by their return value and never `exit`, so they work
+# the same called on their own line or inside an `if`.
+
+# The agent's site, printed.
+#   agent_site_for_domain DOMAIN
+agent_site_for_domain(){
+  data_plane_upstream aegis_agent_backend aegis_agent_connection_upgrade
+  cat <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $1;
+    access_log off;
+    client_max_body_size 0;
+    if (\$host != $1) { return 421; }
+EOF
+  data_plane_location aegis_agent_backend aegis_agent_connection_upgrade
+  echo "}"
+}
+
+agent_site_for_ip(){
+  data_plane_upstream aegis_agent_backend aegis_agent_connection_upgrade
+  cat <<EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    access_log off;
+    client_max_body_size 0;
+EOF
+  data_plane_location aegis_agent_backend aegis_agent_connection_upgrade
+  echo "}"
+}
+
+# 第三方软件源失效（如 402/GPG 过期）不应中断脚本：所需软件包通常已安装，真正缺包时 apt-get install
+# 仍会明确报错。
+host_packages(){
+  apt-get update || echo "警告：apt 源索引更新失败（常见于机器上某个第三方软件源失效），将沿用现有索引继续。" >&2
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+}
+
+# Serve the agent on DOMAIN over HTTPS, with a Let's Encrypt certificate registered to EMAIL.
+#   agent_serve_domain DOMAIN EMAIL
+agent_serve_domain(){
+  aegis_domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  aegis_email=$2
+  aegis_site=$AEGIS_NGINX_DIR/sites-available/aegis-relay-agent.conf
+  [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; return 1; }
+  printf '%s' "$aegis_domain" | grep -Eq '^[A-Za-z0-9.-]+$' || { echo "域名格式无效" >&2; return 1; }
+  printf '%s' "$aegis_email" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+$' || { echo "邮箱格式无效" >&2; return 1; }
+  host_packages nginx certbot python3-certbot-nginx || return 1
+  agent_site_for_domain "$aegis_domain" > "$aegis_site" || return 1
+  ln -sfn "$aegis_site" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-agent.conf" || return 1
+  nginx -t || return 1
+  systemctl enable --now nginx || return 1
+  systemctl reload nginx || return 1
+  certbot --nginx -d "$aegis_domain" --non-interactive --agree-tos --redirect -m "$aegis_email" || return 1
+  systemctl enable --now certbot.timer 2>/dev/null || true
+  set_env "$AEGIS_AGENT_DIR/.env" AGENT_DOMAIN "$aegis_domain" || return 1
+  set_env "$AEGIS_AGENT_DIR/.env" AGENT_EMAIL "$aegis_email" || return 1
+  echo "Agent HTTPS 已就绪: https://$aegis_domain/"
+}
+
+# IP 反代模式：以本机公网 IP 作为入口，Nginx 监听 80 端口明文 HTTP 转发到本地 Agent。
+#   agent_serve_ip
+agent_serve_ip(){
+  aegis_site=$AEGIS_NGINX_DIR/sites-available/aegis-relay-agent.conf
+  [ "$(id -u)" -eq 0 ] || { echo "请使用 sudo 运行" >&2; return 1; }
+  [ -f "$AEGIS_AGENT_DIR/.env" ] || { echo "未找到 Agent 安装" >&2; return 1; }
+  host_packages nginx || return 1
+  aegis_ip=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+  [ -n "$aegis_ip" ] || { echo "无法检测公网 IP" >&2; return 1; }
+  aegis_backup=""
+  if [ -f "$aegis_site" ]; then aegis_backup="$aegis_site.backup.$(date +%Y%m%d%H%M%S)"; cp "$aegis_site" "$aegis_backup" || return 1; fi
+  agent_site_for_ip > "$aegis_site" || return 1
+  ln -sfn "$aegis_site" "$AEGIS_NGINX_DIR/sites-enabled/aegis-relay-agent.conf" || return 1
+  rm -f "$AEGIS_NGINX_DIR/sites-enabled/default"
+  if ! nginx -t; then
+    [ -n "$aegis_backup" ] && cp "$aegis_backup" "$aegis_site"
+    echo "Nginx 配置校验失败，已回滚。" >&2
+    return 1
+  fi
+  systemctl enable --now nginx || return 1
+  systemctl reload nginx || return 1
+  set_env "$AEGIS_AGENT_DIR/.env" AGENT_DOMAIN "" || return 1
+  set_env "$AEGIS_AGENT_DIR/.env" AGENT_PROXY_MODE ip || return 1
+  set_env "$AEGIS_AGENT_DIR/.env" AGENT_PROXY_IP "$aegis_ip" || return 1
+  echo "Agent IP 反代已就绪: http://$aegis_ip/"
+}
