@@ -6,7 +6,7 @@ import path from 'node:path';
 import { b64u, randomToken, timingEqual } from './security.js';
 import { agentRequestInput, panelResponseInput } from './agent-api.js';
 import { openAgentSnapshot } from './agent-config.js';
-import { AtomicRouteSource } from './local-agent.js';
+import { AtomicRouteSource } from './snapshot-follower.js';
 import { decodeNodes } from './node-wire.js';
 import { verifySnapshot } from './snapshot.js';
 import { coalescedWriter, writeAtomic } from './store.js';

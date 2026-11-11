@@ -1,46 +1,13 @@
-import crypto from 'node:crypto';
-import fs from 'node:fs';
-import { ensurePanelSigningIdentity, verifySnapshot } from './snapshot.js';
-import { b64u, randomToken, timingEqual } from './security.js';
-import { writeAtomic } from './store.js';
+import { ensurePanelSigningIdentity } from './snapshot.js';
+import { randomToken, timingEqual } from './security.js';
 import { ensureAgentRegistry, LOCAL_AGENT_ID, routeIdsForAgent, routesForAgent } from './agent-registry.js';
 import { DesiredSnapshots } from './desired-snapshots.js';
-import { decodeNodes } from './node-wire.js';
-
-function freeze(value) {
-  if(value&&typeof value==='object'&&!Object.isFrozen(value)){
-    for(const child of Object.values(value))freeze(child);
-    Object.freeze(value);
-  }
-  return value;
-}
-
-function cloneRoutes(routes) {
-  return freeze(structuredClone(Array.isArray(routes)?routes:[]));
-}
-
-export class AtomicRouteSource {
-  constructor(routes=[]) { this.routes=cloneRoutes(routes); }
-  getRoutes() { return this.routes; }
-  apply(routes) { this.routes=cloneRoutes(routes); return this.routes; }
-}
+import { AtomicRouteSource, SnapshotFollower } from './snapshot-follower.js';
 
 function storageKey(encoded) {
   const key=Buffer.from(String(encoded||''),'base64url');
   if(key.length!==32||key.toString('base64url')!==encoded)throw new Error('invalid local agent storage key');
   return key;
-}
-
-function seal(snapshot, encodedKey) {
-  const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv('aes-256-gcm',storageKey(encodedKey),iv);
-  const data=Buffer.concat([cipher.update(JSON.stringify(snapshot)),cipher.final()]);
-  return JSON.stringify({v:1,iv:b64u(iv),tag:b64u(cipher.getAuthTag()),data:b64u(data)});
-}
-
-function open(payload, encodedKey) {
-  const env=JSON.parse(payload),decipher=crypto.createDecipheriv('aes-256-gcm',storageKey(encodedKey),Buffer.from(env.iv,'base64url'));
-  decipher.setAuthTag(Buffer.from(env.tag,'base64url'));
-  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(env.data,'base64url')),decipher.final()]));
 }
 
 // The panel machine's own agent. It follows its desired snapshot like a remote machine does, only over
@@ -49,8 +16,8 @@ function open(payload, encodedKey) {
 export class LocalAgent {
   constructor({store,cacheFile=`${store.file}.local-agent.snapshot`,snapshots=null,localBase=''}) {
     const registered=Array.isArray(store.data.agents)&&store.data.agents.some(agent=>agent.id===LOCAL_AGENT_ID);
-    this.store=store;this.cacheFile=cacheFile;this.snapshots=snapshots||new DesiredSnapshots({store,localBase});this.previousFile=`${cacheFile}.previous`;this.routeSource=new AtomicRouteSource(registered?routesForAgent(store.data,LOCAL_AGENT_ID):store.data.routes);
-    this.panelIdentity=null;this.record=null;this.lastError='';this.applyState='starting';this.lastSeen=null;
+    this.store=store;this.cacheFile=cacheFile;this.snapshots=snapshots||new DesiredSnapshots({store,localBase});this.routeSource=new AtomicRouteSource(registered?routesForAgent(store.data,LOCAL_AGENT_ID):store.data.routes);
+    this.panelIdentity=null;this.record=null;this.follower=null;this.lastError='';this.applyState='starting';this.lastSeen=null;
   }
 
   register() {
@@ -66,34 +33,14 @@ export class LocalAgent {
     if(!record.agentStorageKey){record.agentStorageKey=randomToken(32);changed=true;}
     if(registry.changed)changed=true;
     if(!timingEqual(record.pinnedPanelKeyId||'',this.panelIdentity.keyId)||!timingEqual(record.pinnedPanelPublicKey||'',this.panelIdentity.publicKey))throw new Error('local agent panel signing key mismatch');
-    storageKey(record.agentStorageKey);
     this.record=record;
+    this.follower=new SnapshotFollower({cacheFile:this.cacheFile,storageKey:storageKey(record.agentStorageKey),panelIdentity:{algorithm:'Ed25519',keyId:record.pinnedPanelKeyId,publicKey:record.pinnedPanelPublicKey},routeSource:this.routeSource});
     if(changed)this.store.save();
     return record;
   }
 
-  pinnedIdentity() { return {algorithm:'Ed25519',keyId:this.record.pinnedPanelKeyId,publicKey:this.record.pinnedPanelPublicKey}; }
-
-  loadCachedSnapshot() {
-    if(!fs.existsSync(this.cacheFile))return false;
-    const snapshot=open(fs.readFileSync(this.cacheFile,'utf8'),this.record.agentStorageKey);
-    verifySnapshot(snapshot,this.pinnedIdentity());
-    this.routeSource.apply(decodeNodes(snapshot.nodes));
-    this.record.appliedRevision=snapshot.revision;this.record.appliedHash=snapshot.hash;
-    return true;
-  }
-
-  apply(snapshot) {
-    const decision=verifySnapshot(snapshot,this.pinnedIdentity(),{currentRevision:this.record.appliedRevision||0,currentHash:this.record.appliedHash||null});
-    if(decision.status==='noop')return decision;
-    const routes=decodeNodes(snapshot.nodes);
-    cloneRoutes(routes);
-    if(fs.existsSync(this.cacheFile))writeAtomic(this.previousFile,fs.readFileSync(this.cacheFile));
-    writeAtomic(this.cacheFile,seal(snapshot,this.record.agentStorageKey));
-    this.routeSource.apply(routes);
-    this.record.appliedRevision=snapshot.revision;this.record.appliedHash=snapshot.hash;
-    return decision;
-  }
+  // The store keeps what this machine has applied next to what the panel wants of it.
+  recordApplied() { this.record.appliedRevision=this.follower.revision;this.record.appliedHash=this.follower.hash; }
 
   ack(snapshot,status,error='') {
     this.record.lastAck={revision:snapshot?.revision||0,hash:snapshot?.hash||null,status,at:new Date().toISOString(),error:String(error||'').slice(0,240)};
@@ -104,27 +51,22 @@ export class LocalAgent {
 
   // Apply the desired snapshot as it stands; a no-op when it is already applied.
   reconcile() {
-    let snapshot;
-    try {
-      snapshot=this.snapshots.desired(LOCAL_AGENT_ID);
-      const decision=this.apply(snapshot);
-      this.ack(snapshot,'applied');
-      this.applyState='active';this.lastError='';
-      this.store.save();
-      return {ok:true,decision:decision.status,revision:snapshot.revision,hash:snapshot.hash};
-    } catch(error) {
-      this.ack(snapshot,'rejected',error.message);
-      this.applyState='error';this.lastError=String(error.message||error).slice(0,240);
-      this.store.save();
-      return {ok:false,error:this.lastError,revision:this.record?.appliedRevision||0};
-    }
+    let snapshot,result;
+    // A snapshot that cannot even be compiled (a node still waiting for an access-key rotation, say)
+    // is reported the same way as one this machine refuses.
+    try { snapshot=this.snapshots.desired(LOCAL_AGENT_ID);result=this.follower.accept(snapshot); }
+    catch(error) { result={ok:false,error:String(error.message||error).slice(0,240)}; }
+    this.recordApplied();
+    this.ack(snapshot,result.ok?'applied':'rejected',result.error);
+    this.applyState=result.ok?'active':'error';this.lastError=result.error;
+    this.store.save();
+    return result.ok?{ok:true,decision:result.decision,revision:snapshot.revision,hash:snapshot.hash}:{ok:false,error:this.lastError,revision:this.record.appliedRevision||0};
   }
 
   start() {
     this.register();
-    let loaded=false;
-    try { loaded=this.loadCachedSnapshot(); } catch(error) { this.lastError=`cached snapshot rejected: ${error.message}`; }
-    if(!loaded){this.record.appliedRevision=0;this.record.appliedHash=null;}
+    // A cache that is missing or no longer trusted leaves revision 0, so the desired snapshot applies.
+    this.follower.load();this.recordApplied();
     this.unsubscribe?.();
     this.unsubscribe=this.snapshots.subscribe(changed=>{if(changed.includes(LOCAL_AGENT_ID))this.reconcile();});
     return this.reconcile();
