@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import http from 'node:http';import https from 'node:https';import net from 'node:net';
-import {handleUpgrade,makeProxyHandler,RELAY_SERVER_OPTIONS,shouldRewriteStreamBody,stripAdminSetCookies,validateUpstream,validateUpstreamList} from '../src/proxy.js';import {clearTlsSessions,getRuntimeStatus,RELAY_HIGH_WATER_MARK,stripAdminCredentials} from '../src/upstream-exchange.js';import {deriveKey,tokenDigest} from '../src/security.js';
+import {handleUpgrade,makeProxyHandler,shouldRewriteStreamBody,stripAdminSetCookies,validateUpstream,validateUpstreamList} from '../src/proxy.js';import {clearTlsSessions,getRuntimeStatus,RELAY_HIGH_WATER_MARK,stripAdminCredentials} from '../src/upstream-exchange.js';import {deriveKey,tokenDigest} from '../src/security.js';
 const TEST_TLS_CERT=`-----BEGIN CERTIFICATE-----
 MIIDGjCCAgKgAwIBAgIUIbeDFssFh3d60STn8JZVJvohWqwwDQYJKoZIhvcNAQEL
 BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcyNDA1NTI1MFoXDTM2MDcy
@@ -53,7 +53,7 @@ import { Metrics } from '../src/metrics.js';
 const listen=s=>new Promise(r=>s.listen(0,'127.0.0.1',()=>r(s.address().port))),close=s=>new Promise(r=>{s.closeAllConnections?.();s.close(r)});
 const listenAny=s=>new Promise(r=>s.listen(0,()=>r(s.address().port)));
 const request=(port,path,{method='GET',headers={},body}={})=>new Promise((resolve,reject)=>{const req=http.request({hostname:'127.0.0.1',port,path,method,headers},res=>{const chunks=[];res.on('data',chunk=>chunks.push(chunk));res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:Buffer.concat(chunks)}))});req.on('error',reject);if(body)req.write(body);req.end()});
-test('relay servers use the shared bounded high-throughput socket window',()=>{assert.equal(RELAY_HIGH_WATER_MARK,256*1024);assert.equal(RELAY_SERVER_OPTIONS.highWaterMark,RELAY_HIGH_WATER_MARK);assert.equal(RELAY_SERVER_OPTIONS.noDelay,true);assert.equal(RELAY_SERVER_OPTIONS.keepAlive,true)});
+test('relay sockets use one bounded high-throughput window',()=>{assert.equal(RELAY_HIGH_WATER_MARK,256*1024)});
 test('media rides its own warm pool, separate from the API pool, so a seek reuses a hot socket',async()=>{
   const sockets=[];const upstream=http.createServer((q,s)=>{sockets.push({url:q.url,port:q.socket.remotePort,connection:q.headers.connection});s.end(q.url.includes('/Videos/')?'media':q.url.includes('PlaybackInfo')?'control':'api')}),up=await listen(upstream),key=deriveKey('q'.repeat(32));
   const store={data:{routes:[{id:'clean-media',alias:'clean-media',enabled:true,accessMode:'alias_only',upstreams:[`http://127.0.0.1:${up}`],allowPrivate:true}]}};

@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { b64u, randomToken, timingEqual } from './security.js';
@@ -10,7 +9,7 @@ import { AtomicRouteSource } from './snapshot-follower.js';
 import { decodeNodes } from './node-wire.js';
 import { verifySnapshot } from './snapshot.js';
 import { coalescedWriter, writeAtomic } from './store.js';
-import { handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS } from './proxy.js';
+import { createRelayServer } from './proxy.js';
 import { activeUpstreamLine } from './upstream-exchange.js';
 import { EGRESS_CAPABILITY, SteeringEngine, STEERING_CAPABILITY } from './steering.js';
 import { PLAYBACK_OBSERVATION_CAPABILITY } from './playback-observation.js';
@@ -154,7 +153,7 @@ async function followConfig(identity,config,healthy){let backoff=0;for(;;){const
 
 async function steeringExchange(identity,payload){const result=await signedRequest(identity,'POST','/api/agent/v1/steering',payload,20_000);if(!result.response.ok)throw new Error(result.data?.error||`steering sync failed (${result.response.status})`);return result.data;}
 
-function startProxy(config,identity,metricStore,health,steering){const metrics=new Metrics(metricStore),key=storageKey(identity);steering.canServe=route=>metrics.canServe(route);const relay=makeProxyHandler(config.routeSource,key,metrics,steering),server=http.createServer(RELAY_SERVER_OPTIONS,(req,res)=>{res.on('error',()=>{});try{const out=relay(req,res);if(out&&typeof out.catch==='function')out.catch(error=>{console.error('[aegis-agent] relay error',error?.message||error);if(!res.headersSent&&!res.writableEnded){res.writeHead(502,{'cache-control':'no-store'});res.end('bad gateway')}})}catch(error){if(!res.headersSent&&!res.writableEnded){res.writeHead(502,{'cache-control':'no-store'});res.end('bad gateway')}}});server.requestTimeout=0;server.keepAliveTimeout=75_000;server.keepAliveTimeoutBuffer=5_000;server.headersTimeout=80_000;server.on('connection',socket=>{socket.setNoDelay(true);socket.setKeepAlive(true,15_000)});server.on('clientError',(_error,socket)=>{if(!socket.destroyed)socket.destroy()});server.on('upgrade',(req,socket,head)=>{socket.on('error',()=>socket.destroy());try{handleUpgrade(req,socket,head,config.routeSource,key)}catch{socket.destroy()}});return new Promise((resolve,reject)=>{let started=false;server.on('error',error=>{if(!started)return reject(error);health.proxyHealthy=false;console.error(`[aegis-agent] proxy server error: ${error?.message||error}`)});server.on('close',()=>{health.proxyHealthy=false});server.listen(PROXY_PORT,'0.0.0.0',()=>{started=true;resolve({server,metrics})})})}
+function startProxy(config,identity,metricStore,health,steering){const metrics=new Metrics(metricStore);steering.canServe=route=>metrics.canServe(route);const server=createRelayServer({routeSource:config.routeSource,key:storageKey(identity),metrics,steering,label:'aegis-agent'});return new Promise((resolve,reject)=>{let started=false;server.on('error',error=>{if(!started)return reject(error);health.proxyHealthy=false;console.error(`[aegis-agent] proxy server error: ${error?.message||error}`)});server.on('close',()=>{health.proxyHealthy=false});server.listen(PROXY_PORT,'0.0.0.0',()=>{started=true;resolve({server,metrics})})})}
 
 async function checkIn(identity,config,startedAt,bootId,proxyHealthy,telemetry){const payload={protocolVersion:1,agentVersion:VERSION,bootId,uptimeSeconds:Math.floor((Date.now()-startedAt)/1000),currentRevision:config.revision,currentConfigId:config.hash,applyState:config.applyState,proxyHealthy,domain:effectiveDomain(),proxyMode:effectiveMode(),domainStatus:readDomainStatus(DATA_DIR),entryStatus:readEntryStatus(DATA_DIR),certificateNotAfter:null,capabilities:CAPABILITIES,telemetry},result=await signedRequest(identity,'POST','/api/agent/v1/check-in',payload);if(!result.response.ok)throw new Error(result.data?.error||`check-in failed (${result.response.status})`);return result.data;}
 

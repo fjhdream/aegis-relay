@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deriveKey, hashPassword, newTotpSecret, randomToken, RateLimiter, requestIp, tokenDigest, verifyPassword, verifyTotp, timingEqual } from './security.js';
 import { Store } from './store.js';
-import { handleUpgrade, makeProxyHandler, RELAY_SERVER_OPTIONS } from './proxy.js';
+import { createRelayServer } from './proxy.js';
 import { activeUpstreamLine, getRuntimeStatus } from './upstream-exchange.js';
 import { Metrics } from './metrics.js';
 import { diagnoseRoute } from './diagnostics.js';
@@ -321,32 +321,24 @@ admin.requestTimeout=35_000;admin.headersTimeout=10_000;admin.listen(cfg.adminPo
 const steering=new SteeringEngine({selfId:LOCAL_AGENT_ID,lineOf:activeUpstreamLine,canServe:route=>metrics.canServe(route)});
 // The panel machine syncs with its own hub exactly as a remote machine would, minus the network.
 steering.start(localTransport(steeringHub,LOCAL_AGENT_ID),()=>localAgent.routeSource.getRoutes());
-const relay=makeProxyHandler(localAgent.routeSource,key,metrics,steering);
 const panelHostname=baseHostname(cfg.publicBaseUrl),proxyHostname=baseHostname(cfg.localProxyBaseUrl)||panelHostname,splitDomains=!!panelHostname&&!!proxyHostname&&panelHostname!==proxyHostname;
 function requestHostname(req){try{return new URL(`http://${String(req.headers.host||'')}`).hostname.toLowerCase()}catch{return''}}
 // The steering entry domain is a second public name of this machine's data plane. Checked on every
 // proxied request, so it only reads the stored domain; there is no cache, a panel edit applies at once.
 function isEntryHost(hostname){const entry=readEntryDomain(store.data);return !!entry&&hostname===entry}
-// A single bad request must never take the relay down mid-playback; nginx keeps serving, so do we.
-function relayFailed(res,err){console.error('[aegis] relay error',err&&err.stack||err);if(res.headersSent||res.destroyed||res.writableEnded)return;try{res.writeHead(502,{'cache-control':'no-store'});res.end('bad gateway')}catch{}}
-const proxy=http.createServer(RELAY_SERVER_OPTIONS,(req,res)=>{
-  res.on('error',()=>{});
-  let pathname; try{pathname=new URL(req.url,'http://relay.invalid').pathname}catch{return relayFailed(res,new Error('invalid request target'))}
-  try{
+// The panel machine's relay server also carries the admin panel and the agent API, picked by the
+// host a request came in on; everything else is relayed like on any other machine.
+const proxy=createRelayServer({routeSource:localAgent.routeSource,key,metrics,steering,
+  acceptUpgrade:req=>!splitDomains||requestHostname(req)===proxyHostname||isEntryHost(requestHostname(req)),
+  route(req,res,relay){
+    let pathname; try{pathname=new URL(req.url,'http://relay.invalid').pathname}catch{throw new Error('invalid request target')}
     const hostname=requestHostname(req),role=isEntryHost(hostname)?'proxy':domainRequestRole({panelHostname,proxyHostname,requestHostname:hostname});
     if(role==='reject')return json(res,421,{error:'misdirected request'});
-    if(role==='proxy'){const out=relay(req,res);if(out&&typeof out.catch==='function')out.catch(err=>relayFailed(res,err));return}
+    if(role==='proxy')return relay(req,res);
     if(pathname==='/agent-install.sh'&&req.method==='GET'){res.writeHead(200,headers({'content-type':'text/x-shellscript; charset=utf-8'}));return res.end(agentInstaller)}
     if(pathname==='/agent-upgrade.sh'&&req.method==='GET'){res.writeHead(200,headers({'content-type':'text/x-shellscript; charset=utf-8'}));return res.end(agentUpgrader)}
-    const out=pathname.startsWith('/api/agent/v1/')?agentApi.handle(req,res):(isRootAdminRequest(pathname)?serveAdmin(req,res,'/'):(role==='control'?json(res,404,{error:'not found'}):relay(req,res)));
-    if(out&&typeof out.catch==='function')out.catch(err=>relayFailed(res,err));
-  }
-  catch(err){relayFailed(res,err)}
-});
-proxy.requestTimeout=0;proxy.keepAliveTimeout=75_000;proxy.keepAliveTimeoutBuffer=5_000;proxy.headersTimeout=80_000;
-proxy.on('connection',socket=>{socket.setNoDelay(true);socket.setKeepAlive(true,15_000)});
-proxy.on('clientError',(err,socket)=>{if(!socket.destroyed)socket.destroy()});
-proxy.on('upgrade',(req,socket,head)=>{socket.on('error',()=>socket.destroy());try{if(splitDomains&&requestHostname(req)!==proxyHostname&&!isEntryHost(requestHostname(req)))return socket.destroy();handleUpgrade(req,socket,head,localAgent.routeSource,key)}catch(err){console.error('[aegis] upgrade error',err&&err.stack||err);socket.destroy()}});
+    return pathname.startsWith('/api/agent/v1/')?agentApi.handle(req,res):(isRootAdminRequest(pathname)?serveAdmin(req,res,'/'):(role==='control'?json(res,404,{error:'not found'}):relay(req,res)));
+  }});
 proxy.listen(cfg.proxyPort,cfg.proxyHost,()=>console.log(`AegisRelay proxy listening on ${cfg.proxyHost}:${cfg.proxyPort}`));
 process.on('uncaughtException',err=>console.error('[aegis] uncaught exception',err&&err.stack||err));
 process.on('unhandledRejection',err=>console.error('[aegis] unhandled rejection',err&&err.stack||err));
