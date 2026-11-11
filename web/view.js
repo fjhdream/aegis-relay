@@ -194,3 +194,49 @@ export function deployOptions(agents){
   const remote=(agents||[]).filter(a=>a.id&&a.id!=='local');
   return {html:remote.map(a=>`<option value="${escapeHtml(a.id)}">${escapeHtml(a.name||a.id)}${a.domain?' · '+escapeHtml(a.domain):(a.proxyMode==='ip'?' · IP 反代':'')}</option>`).join(''),chosen:remote.length===1?remote[0].id:null};
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Machines.
+
+// A moment, in the viewer's own language and time zone.
+export const localTime=at=>new Date(at).toLocaleString();
+
+// One card per machine: its state, the address it serves on, the nodes it carries (ticked among all
+// the nodes there are), and what its last change of address came to. `panelVersion` is what a
+// machine's own version is held against.
+export function agentsView({agents,routes,panelVersion}){
+  const labels={online:'在线',stale:'连接延迟',offline:'失联',revoked:'已撤销'};
+  return {'#agent-grid':{html:agents.map(a=>{const change=a.domainChange,working=change&&['pending','applying'].includes(change.state),failed=change?.state==='failed',local=a.transport==='loopback',isIp=a.proxyMode==='ip',inputDomain=working||failed?(change.mode==='ip'?'':change.desiredDomain):(isIp?'':a.domain),targetLabel=change?(change.mode==='ip'?'IP 反代':change.desiredDomain||''):'',status=change?`<div class="node-test show"><span class="${failed?'bad':working?'warn':'good'}">●</span>&nbsp;${escapeHtml(change.message||'')}${targetLabel&&targetLabel!==a.domain?` · 目标 ${escapeHtml(targetLabel)}`:''}</div>`:'';const probeVer=local?panelVersion:(a.agentVersion||''),probeCurrent=!!panelVersion&&probeVer===panelVersion;return`<article class="node-card agent-card" data-id="${escapeHtml(a.id)}" data-status="${escapeHtml(a.status)}"><div class="node-card-head"><span class="drag-handle" title="拖动调整机器顺序" draggable="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="18" r="1"/></svg></span><div style="min-width:0;flex:1"><h3><input class="agent-name" value="${escapeHtml(a.name||'')}" maxlength="80" title="直接修改名称，点「保存名称与节点」后生效"></h3><span class="node-path">${escapeHtml(a.transport==='loopback'?'本机环回':'安全轮询')}</span></div><span class="pill ${a.inSync?'on':'warn'}">${a.inSync?'配置已同步':'等待同步'}</span>${a.agentVersion&&panelVersion&&a.agentVersion!==panelVersion?`<span class="pill warn" title="该机器仍在运行旧版本代理程序">待升级 ${escapeHtml(a.agentVersion)}</span>`:''}</div><div class="tag-row"><span class="pill ${a.status==='online'?'on':'warn'}">${labels[a.status]||'失联'}</span>${local?'':`<span class="pill ${isIp?'':'info'}">${isIp?'IP 反代':'HTTPS 域名'}</span>`}<span class="pill ${working?'warn':a.applyState==='active'?'info':'warn'}">${working?(change.mode==='ip'?'正在切换 IP 反代':'正在配置域名'):a.applyState==='active'?'代理运行中':a.applyState==='error'?'新配置未生效':'已注册 · 等待配置'}</span></div><div class="node-meta"><div><small>当前生效域名</small><strong>${isIp?('IP 反代'+(a.domain?' · '+escapeHtml(a.domain):'')):escapeHtml(a.domain||'尚未设置')}</strong></div><div><small>已选节点</small><strong>${a.routeIds.length} 个</strong></div><div><small>探针·反代版本</small><strong>${probeVer?`v${escapeHtml(probeVer)}${panelVersion?` <span style="color:var(--${probeCurrent?'green':'amber'})">· ${probeCurrent?'最新':'待升级'}</span>`:''}`:'未知'}</strong></div><div><small>最近回执</small><strong>${a.lastSeen?localTime(a.lastSeen):'尚未连接'}</strong></div></div><div class="agent-editor"><label>代理域名<div class="agent-domain-row"><input class="agent-domain" value="${escapeHtml(inputDomain||'')}" placeholder="${local?'emby.example.com':'留空＝用本机 IP 反代'}" ${working?'disabled':''}><button type="button" class="btn ghost switch-domain" ${working?'disabled':''}>切换代理域名</button></div><small>${local?'只有点「切换代理域名」才会改域名：自动配置 Nginx、申请证书并停用旧代理域名，必须与面板域名不同。本机只做面板管理、不承担反代时留空即可，不用点这个按钮。':'只有点「切换代理域名」才会改域名：填写域名自动申请证书走 HTTPS；留空则以本机公网 IP 明文 HTTP 反代。'}</small></label><details class="agent-routes"><summary>部署节点<span class="routes-count">已选 ${a.routeIds.length} / ${routes.length}</span></summary>${routes.length?`<div class="route-tools"><button type="button" class="route-bulk route-all">全选</button><button type="button" class="route-bulk route-none">全不选</button>${routes.length>8?'<input class="agent-route-search" placeholder="搜索节点">':''}</div>`:''}<div class="agent-route-list">${routes.map(r=>`<label class="${a.routeIds.includes(r.id)?'checked':''}" data-search="${escapeHtml((r.name+' '+r.alias).toLowerCase())}"><input type="checkbox" data-route-id="${r.id}" ${a.routeIds.includes(r.id)?'checked':''}><span><b>${escapeHtml(r.name)}</b><small>/${escapeHtml(r.alias)}/</small></span></label>`).join('')||'<small>请先创建 Emby 节点</small>'}</div></details><div class="node-actions"><button class="btn primary save-agent">保存名称与节点</button>${a.canDelete?'<button class="btn ghost danger delete-agent">从面板删除</button>':''}</div></div>${status||a.error?status||`<div class="node-test show"><span class="bad">●</span>&nbsp;${escapeHtml(a.error)}</div>`:''}${a.agentVersion&&panelVersion&&a.agentVersion!==panelVersion?`<div class="node-test show"><span class="warn">●</span>&nbsp;代理程序 ${escapeHtml(a.agentVersion)} 落后于面板 ${escapeHtml(panelVersion)}，在该机器执行：<code>sudo aegis-relay-agent update</code></div>`:''}</article>`}).join('')||'<article class="panel empty-state"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><path d="M12 7v4M6.7 16.8l3.8-4M17.3 16.8l-3.8-4"/></svg><h3>添加第一台代理机器</h3><p>生成一次性安装指令，机器注册后会自动出现。</p><button class="btn primary open-agent">添加机器</button></article>'}};
+}
+// How many of a machine's node boxes are ticked.
+export const routesChosen=(chosen,total)=>`已选 ${chosen} / ${total}`;
+// What saving a card asks of the panel: the name and the nodes, never the address (a panel machine
+// that only manages has no address to send, and the panel would refuse the whole change for it).
+export function agentSave(agent,{name,routeIds}){
+  const clean=String(name).trim();
+  if(!clean)return {error:'机器名称不能为空'};
+  return {body:{name:clean,routeIds},message:agent.id==='local'?'代理机器配置已保存':'已保存，正在下发到该机器…',watch:agent.id!=='local'};
+}
+// What 「切换代理域名」 asks of the panel: the address as typed, where empty means the machine's own IP
+// over plain HTTP. Nothing is asked when that is what the machine serves on already.
+export function domainSwitch(agent,typed){
+  const domain=String(typed).trim(),current=agent.proxyMode==='ip'?'':(agent.domain||'');
+  if(domain===current)return {unchanged:true,message:'代理域名没有变化，无需切换'};
+  return {unchanged:false,body:{domain},message:domain?'域名切换已提交，正在申请证书':'已提交：切换为 IP 反代（HTTP）'};
+}
+// After a save: whether some machine that is not known to be gone has yet to apply its configuration.
+export const awaitingSync=agents=>agents.some(a=>a.id!=='local'&&a.status!=='offline'&&!a.inSync);
+// After a switch of address: whether one is still under way, and what the first that failed says.
+export function switchProgress(agents){
+  const failed=agents.find(a=>a.domainChange?.state==='failed');
+  return {working:agents.some(a=>a.domainChange&&['pending','applying'].includes(a.domainChange.state)),failure:failed?failed.domainChange.message||'切换失败':''};
+}
+
+// Adding a machine: the form as it opens, with the nodes it could carry, and the command once made.
+export function enrollFormView(routes){
+  return {'#agent-name':{value:''},'#agent-domain-new':{value:''},'#agent-command-wrap':{hidden:true},'#agent-enroll-form':{hidden:false},
+    '#agent-enroll-routes':{html:routes.map(route=>`<label><input type="checkbox" data-enroll-route="${route.id}"><span><b>${escapeHtml(route.name)}</b><small>/${escapeHtml(route.alias)}/</small></span></label>`).join('')||'<small>暂时不部署节点，注册后仍可选择。</small>'}};
+}
+export function enrollmentView(result){
+  return {'#agent-command':{text:result.command},'#agent-command-expiry':{text:`有效期至 ${new Date(result.expiresAt).toLocaleTimeString()}`},'#agent-enroll-form':{hidden:true},'#agent-command-wrap':{hidden:false}};
+}
