@@ -21,6 +21,39 @@ test('every generated Nginx data plane has reusable upstreams and a valid large 
   }
 });
 
+// A script's data-plane location: the `location / {` block that proxies to the relay upstream, in the
+// server that takes unlimited request bodies. configure-local-domain.sh also sends its panel domain's
+// `location /` to the relay with a 1m limit (control plane); admin and ACME locations are not
+// `location /`. Comments are dropped, the per-script names (upstream, connection-upgrade map variable)
+// normalised and the directives sorted, since their order inside a location does not matter to Nginx.
+const dataPlaneDirectives=file=>{
+  const source=fs.readFileSync(new URL(`../${file}`,import.meta.url),'utf8');
+  const blocks=source.split(/^server \{$/m).slice(1).filter(server=>server.includes('client_max_body_size 0;'))
+    .flatMap(server=>[...server.matchAll(/^([ \t]*)location \/ \{\n([\s\S]*?)^\1\}$/gm)].map(match=>match[2]))
+    .filter(body=>/proxy_pass http:\/\/aegis_(?:agent|relay|entry)_backend;/.test(body));
+  assert.equal(blocks.length,1,`${file} should have exactly one data-plane location`);
+  return blocks[0].split('\n').map(line=>line.trim()).filter(line=>line&&!line.startsWith('#'))
+    .map(line=>line.replace(/aegis_(?:agent|relay|entry)_backend/g,'aegis_*_backend').replace(/aegis_(?:agent_|entry_)?connection_upgrade/g,'aegis_*_connection_upgrade')).sort();
+};
+
+test('every generated Nginx data plane has the same directives as the others',()=>{
+  const directives=new Map(dataPlaneScripts.map(file=>[file,dataPlaneDirectives(file)]));
+  const drift=[...new Set([...directives.values()].flat())].sort().flatMap(line=>{
+    const missing=dataPlaneScripts.filter(file=>!directives.get(file).includes(line));
+    return missing.length?[`${line} missing from ${missing.join(', ')}`]:[];
+  });
+  assert.deepEqual(drift,[]);
+});
+
+test('every generated Nginx data plane overwrites the forwarded headers the relay trusts',()=>{
+  // The relay reads the viewer address (viewer list, steering history) from X-Real-IP and the scheme
+  // from X-Forwarded-Proto; Nginx passes a client's own copies through unless it sets them itself.
+  for(const file of dataPlaneScripts){
+    const directives=dataPlaneDirectives(file);
+    for(const header of ['proxy_set_header Host \\$host;','proxy_set_header X-Forwarded-Proto \\$scheme;','proxy_set_header X-Real-IP \\$remote_addr;'])assert.ok(directives.includes(header),`${file} is missing ${header}`);
+  }
+});
+
 test('the shared entry domain answers ACME challenges for the other machines, once and never in a loop',()=>{
   const source=fs.readFileSync(new URL('../scripts/configure-entry-domain.sh',import.meta.url),'utf8');
   assert.ok(source.includes('try_files \\$uri @aegis_acme_peers;'));
