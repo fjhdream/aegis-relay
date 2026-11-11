@@ -233,3 +233,22 @@ test('the signed steering endpoint exchanges sessions, and the check-in reportin
   assert.deepEqual(JSON.parse(entryResponse.raw).entry,{domain:'entry.example.com',email:'ops@example.com',peers:['s1.example.com']});
   assert.deepEqual([data.agents[1].entryStatus.state,data.agents[1].entryStatus.attempt,data.agents[1].entryStatus.message.length],['failed',2,500]);
 });
+
+test('a machine still refusing its snapshot keeps the reason on its record; one that reports active loses it',async()=>{
+  const data={routes:[],agents:[],deployments:[],enrollmentTokens:[],controlPlane:{}},store={data,save(){},audit(){}};
+  const api=new AgentApi({store,version:'0.13.11'}),issued=issueEnrollment(data,{name:'HK'}),sign=crypto.generateKeyPairSync('ed25519'),box=crypto.generateKeyPairSync('x25519');
+  await api.handle(request('/api/agent/v1/enroll',JSON.stringify({protocolVersion:1,requestNonce:'refusal-enroll-nonce-001',token:issued.token,agent:{signPublicKey:publicDer(sign.publicKey),boxPublicKey:publicDer(box.publicKey),agentVersion:'0.13.11',capabilities:[]},machine:{}}),{'content-type':'application/json'}),response());
+  const record=data.agents[0],desired=api.snapshots.desired(record.id);let sent=0;
+  const call=async(path,payload)=>{const body=Buffer.from(JSON.stringify(payload)),res=response();await api.handle(request(path,body,signedHeaders({method:'POST',path,agentId:record.id,privateKey:sign.privateKey,body,nonce:`refusal-nonce-${String(++sent).padStart(8,'0')}`})),res);return res.status};
+  const beat=applyState=>call('/api/agent/v1/check-in',{agentVersion:'0.13.11',currentRevision:0,applyState,proxyHealthy:true,capabilities:[]});
+  assert.equal(await call('/api/agent/v1/ack',{revision:desired.revision,hash:desired.hash,status:'rejected',error:'disk full',proxyHealthy:true}),200);
+  assert.deepEqual([record.applyState,record.error],['error','disk full']);
+  assert.equal(await beat('error'),200);
+  assert.deepEqual([record.applyState,record.error],['error','disk full'],'the heartbeat of a machine still in error leaves the reason');
+  // An agent older than 0.13.11 reports 'active' while it goes on refusing the snapshot.
+  assert.equal(await beat('active'),200);
+  assert.deepEqual([record.applyState,record.error],['active',undefined]);
+  assert.equal(await call('/api/agent/v1/ack',{revision:desired.revision,hash:desired.hash,status:'rejected',error:'disk full',proxyHealthy:true}),200);
+  assert.equal(await call('/api/agent/v1/ack',{revision:desired.revision,hash:desired.hash,status:'applied',proxyHealthy:true}),200);
+  assert.deepEqual([record.applyState,record.error,record.appliedRevision],['active',undefined,desired.revision],'applying it clears the reason');
+});

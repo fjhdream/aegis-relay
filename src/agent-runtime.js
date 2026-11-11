@@ -110,9 +110,8 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
   const report=error=>console.error(`[aegis-agent] ${String(error?.message||error).slice(0,160)}`);
 
   const follower=new SnapshotFollower({cacheFile:files.current,previousFile:files.previous,storageKey:key,panelIdentity:{algorithm:'Ed25519',keyId:identity.panelKeyId,publicKey:identity.panelSigningPublicKey}});
-  const cacheRejected=!follower.load()&&follower.applyState==='error',routes=()=>follower.routeSource.getRoutes();
-  // What the heartbeat reports: 'active' once any snapshot is applied, whatever happened since.
-  const applyState=()=>follower.revision?'active':cacheRejected?'error':'waiting';
+  follower.load();
+  const routes=()=>follower.routeSource.getRoutes();
 
   async function signedRequest(method,pathAndQuery,payload=null,timeoutMs=0){
     const body=payload===null?Buffer.alloc(0):Buffer.from(JSON.stringify(payload)),timestamp=Math.floor(now()/1000),nonce=randomToken(16),contentHash=sha256(body);
@@ -153,7 +152,7 @@ export async function startAgent({dataDir,panelUrl,domain='',proxyMode='',proxyI
   }
 
   async function checkIn(telemetry){
-    const serving=servingAddress({dir:dataDir,installed}),payload={protocolVersion:1,agentVersion:version,bootId,uptimeSeconds:Math.floor((now()-startedAt)/1000),currentRevision:follower.revision,currentConfigId:follower.hash,applyState:applyState(),proxyHealthy:healthy(),domain:serving.domain,proxyMode:serving.mode,domainStatus:readDomainStatus(dataDir),entryStatus:readEntryStatus(dataDir),certificateNotAfter:null,capabilities:CAPABILITIES,telemetry};
+    const serving=servingAddress({dir:dataDir,installed}),payload={protocolVersion:1,agentVersion:version,bootId,uptimeSeconds:Math.floor((now()-startedAt)/1000),currentRevision:follower.revision,currentConfigId:follower.hash,applyState:follower.applyState,proxyHealthy:healthy(),domain:serving.domain,proxyMode:serving.mode,domainStatus:readDomainStatus(dataDir),entryStatus:readEntryStatus(dataDir),certificateNotAfter:null,capabilities:CAPABILITIES,telemetry};
     const result=await signedRequest('POST','/api/agent/v1/check-in',payload);
     if(!result.response.ok)throw new Error(result.data?.error||`check-in failed (${result.response.status})`);
     return result.data;

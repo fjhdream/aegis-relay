@@ -166,9 +166,10 @@ test('a snapshot the agent cannot apply is reported; it keeps serving the last o
   const second=await sleeps.next(otherWait,'the second wait');assert.equal(second.ms,4_000);second.release();
   const third=await sleeps.next(otherWait,'the third wait');assert.equal(third.ms,8_000);
   assert.equal(panel.audits.filter(item=>item===`agent.config_rejected ${agentId} revision 2`).length,3);
-  // Meanwhile the heartbeat goes on reporting the snapshot it serves.
+  // Meanwhile the heartbeat reports the snapshot it serves, and that the newer one is still refused.
+  const reason=record.error;
   await beat();
-  assert.deepEqual([record.applyState,record.appliedRevision],['active',1]);
+  assert.deepEqual([record.applyState,record.appliedRevision,record.error],['error',1,reason]);
   // The disk is fine again: the next attempt applies it.
   fs.rmdirSync(blocker);third.release();
   await until(()=>panel.applied(agentId,2),'the snapshot to be applied at last');
