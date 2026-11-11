@@ -102,6 +102,12 @@ export function followDomain({dir,desired={},installed={},nowMs=Date.now()}){
   if(toIp?serving.mode==='ip':serving.mode==='domain'&&serving.domain===domain)return false;
   if(fs.existsSync(path.join(dir,REQUEST_FILE)))return false;
   const status=readDomainStatus(dir);
+  // A request the host turned away without being able to say which (its answer names no request): the
+  // same one would only be turned away again, so it is not filed again before the usual pause.
+  if(status&&status.state==='failed'&&!status.requestId){
+    const age=nowMs-Date.parse(status.updatedAt||'');
+    if(!Number.isFinite(age)||age<=DOMAIN_RETRY_MS)return false;
+  }
   if(status&&(toIp?status.mode==='ip':status.mode==='domain'&&status.desiredDomain===domain)){
     if(status.state!=='failed')return false;
     const age=nowMs-Date.parse(status.updatedAt||'');

@@ -10,7 +10,7 @@ INSTALL_DIR=${1:-}
 # Its own place, in full, and then away from wherever it was started: python puts the current
 # directory on its module path, and a script run by hand from inside data/ (which belongs to the
 # container) must not load what the container left there.
-AEGIS_HERE=$(cd "$(dirname "$0")" && pwd)
+AEGIS_HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd /
 # The library is in src/ under an agent's install directory and beside the panel's scripts/. Without it
 # the request cannot be read safely; it must still not sit there re-triggering this unit, and its
@@ -79,7 +79,7 @@ try:
     peers = value.get("peers"); attempt = value.get("attempt", 1)
     need(isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,80}", request_id))
     need(DOMAIN.fullmatch(entry))
-    need(re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", email) and len(email) <= 254)  # email_ok in src/host-site.sh
+    need(re.fullmatch(r"[A-Za-z0-9!%&*+/=?^_{|}~.][A-Za-z0-9!#%&\x27*+/=?^_{|}~.-]*@[A-Za-z0-9.-]+", email, re.ASCII) and len(email) <= 254)  # email_ok in src/host-site.sh
     need(isinstance(peers, list) and len(peers) <= 16)
     peers = [str(peer).lower() for peer in peers]
     need(all(DOMAIN.fullmatch(peer) and peer != entry for peer in peers))

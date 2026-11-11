@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { activeLocalDomain, domainRequestRole, DOMAIN_REQUEST_FILE, followDomain, forgetDomainSwitch, readDomainStatus, requestDomainSwitch, servingAddress } from '../src/domain-control.js';
 import { isCertificateEmail } from '../src/agent-registry.js';
-import { normalizeCertificateEmail } from '../src/agent-api.js';
-import { cleanEntryRequest } from '../src/steering-topology.js';
+import { certificateEmailAtStartup, normalizeCertificateEmail } from '../src/agent-api.js';
+import { cleanEntryRequest, entryAttempt } from '../src/steering-topology.js';
 
 test('active local domain prefers the separated data plane and validates bare HTTPS origins',()=>{
   assert.equal(activeLocalDomain({localProxyBaseUrl:'https://embyus.example.com',publicBaseUrl:'https://panel.example.com'}),'embyus.example.com');
@@ -170,8 +170,9 @@ test('an agent that enrolls again forgets what the host did for its previous lif
 test('no request is filed with a certificate email a host would refuse', () => {
   // The hosts write the email into .env, where `${` starts a variable for Compose, and hand it to
   // certbot as root. One rule (isCertificateEmail) decides, wherever an email comes in.
-  const odd = ['ops${x@example.com', 'ops@ex\u0001ample.com', 'ops@example.com x', '用户@example.com', "a'b@example.com", 'a b@example.com', 'a@b@c', `${'a'.repeat(243)}@example.com`, '', null, undefined, 7];
-  const fine = ['ops@example.com', 'First.Last+relay_1%x-y@Sub.Example-Domain.com', `${'a'.repeat(242)}@example.com`];
+  const odd = ['ops${x@example.com', 'ops`id`@example.com', 'ops\\n@example.com', '"a"@example.com', "'ops@example.com", '#ops@example.com', '-ops@example.com', 'ops@ex\u0001ample.com', 'ops@example.com x', '用户@example.com', 'a b@example.com', 'a@b@c', 'ops@exa_mple.com', `${'a'.repeat(243)}@example.com`, '', null, undefined, 7];
+  // What an address is ordinarily written with stays, so an email saved under the older, looser rule still is one.
+  const fine = ['ops@example.com', 'First.Last+relay_1%x-y@Sub.Example-Domain.com', "o'brien@example.com", 'a~b#c!d&e*f/g=h?i^j{k|l}m@example.com', '_under@example.com', `${'a'.repeat(242)}@example.com`];
   assert.deepEqual([odd.map(isCertificateEmail), fine.map(isCertificateEmail)], [odd.map(() => false), fine.map(() => true)]);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-domain-email-'));
   try {
@@ -186,4 +187,38 @@ test('no request is filed with a certificate email a host would refuse', () => {
     assert.equal(requestDomainSwitch({ dir, domain: 'hk.example.com', email: 'First.Last+relay_1%x-y@Sub.Example-Domain.com' }).state, 'pending');
     assert.equal(JSON.parse(fs.readFileSync(path.join(dir, DOMAIN_REQUEST_FILE), 'utf8')).certificateEmail, 'first.last+relay_1%x-y@sub.example-domain.com');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a panel starts with a certificate email the hosts accept, or with none', () => {
+  // An address saved before the rule was tightened, or one in the environment, that the hosts would
+  // refuse is not kept to be handed to them: whatever needs one then asks for it to be saved again.
+  assert.deepEqual([
+    certificateEmailAtStartup('ops@example.com', 'other@example.com'), certificateEmailAtStartup('', ' env@example.com '), certificateEmailAtStartup(undefined, undefined),
+    certificateEmailAtStartup('ops${x@example.com', 'env@example.com'), certificateEmailAtStartup('ops${x@example.com', ''), certificateEmailAtStartup('', '用户@example.com'), certificateEmailAtStartup("o'brien@example.com", '')
+  ], ['ops@example.com', 'env@example.com', '', 'env@example.com', '', '', "o'brien@example.com"]);
+});
+
+test('a request the host turned away without naming it is not filed again at once', () => {
+  // The same request would only be turned away again (a host on another version, say): without a
+  // pause it would be filed on every heartbeat for as long as that lasted.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-domain-refused-')), now = Date.parse('2026-11-11T08:00:00Z'), at = ms => new Date(now - ms).toISOString();
+  const wanted = { dir, desired: { mode: '', domain: 'hk.example.com', email: 'ops@example.com' }, installed: { mode: 'ip', domain: '', ip: '203.0.113.9' }, nowMs: now };
+  const refusal = ago => fs.writeFileSync(path.join(dir, 'host-domain-status.json'), JSON.stringify({ requestId: '', state: 'failed', mode: 'domain', desiredDomain: '', currentDomain: '203.0.113.9', message: 'refused', updatedAt: at(ago) }));
+  try {
+    refusal(5_000);
+    assert.equal(followDomain(wanted), false, 'not within the pause');
+    assert.deepEqual(fs.readdirSync(dir), ['host-domain-status.json']);
+    assert.equal(followDomain({ ...wanted, desired: { mode: 'ip' }, installed: { mode: 'domain', domain: 'old.example.com', ip: '' } }), false, 'nor for another change');
+    refusal(10 * 60_000 + 1);
+    assert.equal(followDomain(wanted), true, 'after it, the request is filed again');
+    // A failure that names its request is the usual case and keeps the usual rule: another change is asked for at once.
+    forgetDomainSwitch(dir);
+    fs.writeFileSync(path.join(dir, 'host-domain-status.json'), JSON.stringify({ requestId: 'request-0001', state: 'failed', mode: 'domain', desiredDomain: 'other.example.com', currentDomain: '203.0.113.9', message: 'certbot', updatedAt: at(5_000) }));
+    assert.equal(followDomain(wanted), true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  // The entry domain: a nameless refusal waits out the first pause (3 minutes); one that names its request is told apart by what it asked for.
+  const entry = { domain: 'entry.example.com', email: 'ops@example.com', peers: ['a.example.com'] }, nameless = ago => ({ requestId: '', state: 'failed', entryDomain: '', peers: [], attempt: 1, message: 'refused', updatedAt: at(ago) });
+  assert.deepEqual([entryAttempt(entry, nameless(5_000), now), entryAttempt(entry, nameless(3 * 60_000 - 1), now), entryAttempt(entry, nameless(3 * 60_000), now), entryAttempt(entry, null, now),
+    entryAttempt(entry, { requestId: 'request-0001', state: 'failed', entryDomain: 'old.example.com', peers: [], attempt: 2, message: '', updatedAt: at(5_000) }, now),
+    entryAttempt(entry, { requestId: 'request-0002', state: 'failed', entryDomain: 'entry.example.com', peers: ['a.example.com'], attempt: 1, message: '', updatedAt: at(5_000) }, now)], [0, 0, 1, 1, 1, 0]);
 });

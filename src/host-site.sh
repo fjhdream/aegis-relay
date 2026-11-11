@@ -174,20 +174,23 @@ HOST_REQUEST_BROKE_OFF="宿主机脚本中途出错，切换没有完成。请�
 
 # Whether VALUE, all of it, matches PATTERN (an extended regular expression from ^ to $). grep judges
 # a line at a time: a value with a line break in it would pass as soon as one of its lines matched,
-# and the other lines would go wherever the value goes (an Nginx site, an argument to certbot).
+# and the other lines would go wherever the value goes (an Nginx site, an argument to certbot). A
+# range in the pattern is a range of ASCII, whatever locale the script is run in.
 #   value_matches VALUE PATTERN
 value_matches(){
   case $1 in *'
 '*) return 1 ;; esac
-  printf '%s' "$1" | grep -Eq -e "$2"
+  printf '%s' "$1" | LC_ALL=C grep -Eq -e "$2"
 }
 
 # Whether VALUE is a certificate email this host will hand to certbot and write into .env: at most 254
-# characters of plain ASCII from the usual set. Nothing in it is syntax to a shell, to Compose (which
-# expands \${…} when it reads .env) or to Nginx. The panel goes by the same rule
-# (isCertificateEmail in src/agent-registry.js).
+# characters; before the @, the characters an address may be written with, except the ones that are
+# syntax where it ends up (Compose reads .env: \$ starts a variable, a quote or a backslash changes
+# how the value is read, a leading # makes it a comment; a leading - is an option to certbot); after
+# it, a plain domain. An address outside ASCII cannot be an ACME contact. The panel goes by the same
+# rule (isCertificateEmail in src/agent-registry.js).
 #   email_ok VALUE
-email_ok(){ [ "${#1}" -le 254 ] && value_matches "$1" '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$'; }
+email_ok(){ [ "${#1}" -le 254 ] && value_matches "$1" "^[A-Za-z0-9!%&*+/=?^_{|}~.][A-Za-z0-9!#%&'*+/=?^_{|}~.-]*@[A-Za-z0-9.-]+\$"; }
 
 # Take away whatever is at a request's name, so that the path unit watching it comes to rest. A
 # request is a file; if the container put a directory or a link there, that goes too (a link is

@@ -84,6 +84,8 @@ function host() {
     root,dir,
     // Run a script as the machine would: an agent's from its install directory, the panel's from scripts/.
     run:(script,args=[],extra={},cwd)=>sh([path.join(dir(INSTALLED_ON_AGENT.includes(script)?'agent':'panel/scripts'),script),...args],extra,cwd),
+    // The shell itself, for a script started some other way (by a relative name, say).
+    sh,
     site:name=>read(path.join(dir('nginx'),'sites-available',`${name}.conf`)),
     enabled:name=>fs.existsSync(path.join(dir('nginx'),'sites-enabled',`${name}.conf`)),
     // What an upgrade does once the new agent is up, in the form agent-upgrade.sh calls it: on the left
@@ -367,7 +369,9 @@ test('a request from the panel is checked before it reaches Nginx, and answered 
     // Nothing was done, and the agent is told so: it reports the address it had, and asks again later.
     assert.deepEqual([h.requested(),quiet(),turnedAway(h.status()),h.status().currentDomain,h.reported()],[false,calls,true,before.currentDomain,{mode:'ip',domain:'203.0.113.9'}],what);
   }
-  assert.equal(followDomain({dir:h.dir('agent/data'),desired:{mode:'',domain:'hk.example.com',email:'ops@example.com'},installed:h.containerEnv()}),true,'a request that was turned away is filed again');
+  // The agent asks again, but not at once: the same request would only be turned away again.
+  const again={dir:h.dir('agent/data'),desired:{mode:'',domain:'hk.example.com',email:'ops@example.com'},installed:h.containerEnv()};
+  assert.deepEqual([followDomain(again),h.requested(),followDomain({...again,nowMs:Date.now()+10*60_000+1000}),h.requested()],[false,false,true,true],'a request that was turned away is filed again after the usual pause');
   fs.rmSync(path.join(h.dir('agent/data'),DOMAIN_REQUEST_FILE));
   // A switch that fails is reported with the reason, under the request's id, and the request is gone.
   h.request(good);
@@ -829,11 +833,13 @@ test('the entry request says how many times it was tried in a whole number, and 
   assert.deepEqual([applier.run(h).status,readJson(path.join(h.dir(applier.data),applier.status)).attempt],[0,1],'a request that does not say is a first attempt');
 });
 
-test('a certificate email is plain ASCII from the usual set, for every script and for the panel alike',{skip:!PYTHON&&'python3 is not installed'},()=>{
-  // It goes to certbot and into .env, which Compose reads: `${` there is the start of a variable. The
-  // old rule let through anything without a space or a second @.
-  const fine=['ops@example.com','first.last+relay_1%x-y@sub.example-domain.com','A@B.CO'];
-  const odd=['ops${x@example.com','ops$HOME@example.com','ops@ex\u0001ample.com','ops@example.com x','用户@example.com','ops@例子.com','a\'b@example.com','"a"@example.com','a`b@example.com','a;b@example.com','a b@example.com','a@b@example.com','@example.com','ops@','ops',`${'a'.repeat(243)}@example.com`,''];
+test('a certificate email holds nothing that is syntax where it ends up, for every script and for the panel alike',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  // It goes to certbot and into .env, which Compose reads: there `$` starts a variable, a quote or a
+  // backslash changes how the value is read, and a leading # makes it a comment. The old rule let
+  // through anything without a space or a second @. What an address is ordinarily written with stays.
+  const fine=['ops@example.com','first.last+relay_1%x-y@sub.example-domain.com','A@B.CO',"o'brien@example.com",'a~b#c!d&e*f/g=h?i^j{k|l}m@example.com','_under@example.com','+tag@example.com'];
+  const odd=['ops${x@example.com','ops$HOME@example.com','ops`id`@example.com','ops\\n@example.com','"a"@example.com',"'ops@example.com",'#ops@example.com','-ops@example.com','ops@ex\u0001ample.com','ops@example.com x','用户@example.com','ops@例子.com',
+    'a;b@example.com','a(b)@example.com','a<b>@example.com','a,b@example.com','a b@example.com','a@b@example.com','ops@exa_mple.com','ops@example.com/x','@example.com','ops@','ops',`${'a'.repeat(243)}@example.com`,''];
   // The hosts and the panel go by one rule.
   for(const email of [...fine,...odd,`${'a'.repeat(242)}@example.com`]){
     const shell=spawnSync('/bin/sh',['-c','. "$1"; email_ok "$2"','sh',LIBRARY,email],{env:{PATH:process.env.PATH}}).status===0;
@@ -849,13 +855,34 @@ test('a certificate email is plain ASCII from the usual set, for every script an
       // Turned away where the request is checked: not accepted and then tripped over by a later step.
       assert.deepEqual([result.status,result.output,fs.existsSync(file),applier.acted(h),turnedAway(readJson(path.join(h.dir(applier.data),applier.status))),h.since(calls).filter(call=>/^(nginx|certbot|systemctl|apt-get|docker) /.test(call))],[1,'',false,false,true,[]],`${script}, ${JSON.stringify(email)}: ${result.output}`);
     }
-    fs.writeFileSync(file,JSON.stringify({...applier.good,certificateEmail:'First.Last+relay_1%x-y@Sub.Example-Domain.com'}));
+    fs.writeFileSync(file,JSON.stringify({...applier.good,certificateEmail:'O\'Brien.Last+relay_1%x-y@Sub.Example-Domain.com'}));
     assert.deepEqual([applier.run(h).status,applier.acted(h)],[0,true],script);
-    assert.ok(h.calls().some(call=>call.startsWith('certbot ')&&call.includes('first.last+relay_1%x-y@sub.example-domain.com')),`${script}: certbot was given the address, in lower case`);
+    assert.ok(h.calls().some(call=>call.startsWith('certbot ')&&call.includes('o\'brien.last+relay_1%x-y@sub.example-domain.com')),`${script}: certbot was given the address, in lower case`);
   }
+  // What reaches .env is there as it was given, apostrophe and all.
+  const kept=agentOnItsIp();
+  assert.deepEqual([kept.run('agent-configure-domain.sh',['hk.example.com','o\'brien+a#b@example.com']).status,kept.env('agent').AGENT_EMAIL],[0,'o\'brien+a#b@example.com']);
   // And on a command line.
   const agent=agentOnItsIp(),refused=agent.run('agent-configure-domain.sh',['hk.example.com','ops${x@example.com']);
   assert.deepEqual([refused.status,/邮箱格式无效/.test(refused.output),agent.env('agent').AGENT_EMAIL],[1,true,'']);
+});
+
+test('a switch that fails says why in its own words, under its request\'s name',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  for(const [script,applier] of Object.entries(APPLIERS)){
+    const h=applier.prepare(),file=path.join(h.dir(applier.data),applier.request);
+    fs.writeFileSync(file,JSON.stringify(applier.good));
+    const result=applier.run(h,{TEST_CERTBOT_FAILS:'1',TEST_CERTBOT_SAYS:'Challenge failed: DNS problem NXDOMAIN'}),status=readJson(path.join(h.dir(applier.data),applier.status));
+    assert.deepEqual([result.status,fs.existsSync(file),status.requestId,status.state,status.message.includes('Challenge failed: DNS problem NXDOMAIN'),[REFUSED,BROKE_OFF].includes(status.message)],[1,false,applier.good.requestId,'failed',true,false],`${script}: ${status.message}`);
+  }
+});
+
+test('an apply script finds its library when it is started by a relative name with CDPATH set',()=>{
+  // `cd` then prints the directory it found: taken for part of the script's own place, the library
+  // would seem to be missing.
+  const h=host();
+  assert.equal(h.run('configure-domain.sh',['panel.example.com','ops@example.com']).status,0);
+  const calls=h.calls().length,result=h.sh(['scripts/host-domain-apply.sh'],{CDPATH:h.dir('panel')},h.dir('panel'));
+  assert.deepEqual([result.status,result.output,h.since(calls).filter(call=>!call.startsWith('id '))],[0,'',[]],'no request: nothing to do, and nothing said');
 });
 
 test('a request that was accepted but not seen through is answered failed, under its own name',{skip:!PYTHON&&'python3 is not installed'},()=>{

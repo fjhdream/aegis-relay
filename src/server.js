@@ -13,7 +13,7 @@ import { adminRelative, isRootAdminRequest, normalizeAdminPath } from './admin-p
 import { LocalAgent } from './local-agent.js';
 import { DesiredSnapshots } from './desired-snapshots.js';
 import { LOCAL_AGENT_ID, publicAgent } from './agent-registry.js';
-import { AgentApi, normalizeCertificateEmail } from './agent-api.js';
+import { AgentApi, certificateEmailAtStartup, normalizeCertificateEmail } from './agent-api.js';
 import { aggregateTelemetry, indexViewersByNode, nodeChannels, sanitizeTelemetry, telemetryFromMetrics } from './telemetry.js';
 import { createDashboardFeed } from './dashboard-feed.js';
 import { activeLocalDomain, baseHostname, domainRequestRole } from './domain-control.js';
@@ -35,8 +35,8 @@ const cfg = {
   setupToken: process.env.SETUP_TOKEN || '', secureCookies: process.env.SECURE_COOKIES !== 'false', publicBaseUrl:process.env.PUBLIC_BASE_URL||'', localProxyBaseUrl:process.env.LOCAL_PROXY_BASE_URL||'', certificateEmail:process.env.CERTIFICATE_EMAIL||''
 };
 const key = deriveKey(process.env.APP_MASTER_KEY); const store = new Store(cfg.dataFile, key);
-// An address in the environment that no host would accept is left out, not a reason to stay down.
-if(!store.data.settings.certificateEmail&&cfg.certificateEmail){try{store.data.settings.certificateEmail=normalizeCertificateEmail(cfg.certificateEmail);store.save();}catch(error){console.error(`CERTIFICATE_EMAIL ignored: ${error.message}`);}}
+{const stored=store.data.settings.certificateEmail||'',email=certificateEmailAtStartup(stored,cfg.certificateEmail);
+  if(email!==stored){if(stored)console.error('the stored certificate email is not one the hosts accept any more; save it again in the deployment wizard');store.data.settings.certificateEmail=email;store.save();}}
 const configuredLocalDomain=activeLocalDomain(cfg);
 // Every machine's desired snapshot, the panel's own included. Anything below that changes nodes,
 // deployments, machines or steering settings calls snapshots.refresh(); it works out who changed.

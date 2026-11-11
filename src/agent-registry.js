@@ -1,10 +1,12 @@
 import { STEERING_CAPABILITY } from './steering.js';
 
-// A certificate email as every host accepts it (email_ok in src/host-site.sh): at most 254 characters
-// of plain ASCII from the usual set. It is written into .env files and handed to certbot by root, so
-// nothing in it may be syntax to a shell or to Compose; an address outside this set is refused here,
-// where the operator sees why, rather than by a host later.
-export const isCertificateEmail=value=>typeof value==='string'&&value.length<=254&&/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$/.test(value);
+// A certificate email as every host accepts it (email_ok in src/host-site.sh): at most 254 characters;
+// before the @, the characters an address may be written with, except the ones that are syntax where
+// the hosts put it (root writes it into .env, which Compose reads: $ starts a variable, a quote or a
+// backslash changes how the value is read, a leading # makes it a comment; a leading - is an option
+// to certbot); after it, a plain domain. An address the hosts would refuse is refused here, where the
+// operator sees why.
+export const isCertificateEmail=value=>typeof value==='string'&&value.length<=254&&/^[A-Za-z0-9!%&*+\/=?^_{|}~.][A-Za-z0-9!#%&'*+\/=?^_{|}~.-]*@[A-Za-z0-9.-]+$/.test(value);
 
 export const LOCAL_AGENT_ID = 'local';
 

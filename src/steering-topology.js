@@ -212,7 +212,12 @@ export function cleanEntryStatus(value) {
 export function entryAttempt(desired, status, nowMs=Date.now()) {
   if(!desired)return 0;
   const same=status&&status.entryDomain===desired.domain&&status.peers.join(' ')===desired.peers.join(' ');
-  if(!same)return 1;
+  if(!same){
+    // A request the host turned away without being able to say which (its answer names no request and
+    // no domain): the same one would only be turned away again, so it waits out the first pause.
+    if(status&&status.state==='failed'&&!status.requestId){const age=nowMs-Date.parse(status.updatedAt||'');if(!Number.isFinite(age)||age<ENTRY_RETRY_MINUTES[0]*60_000)return 0;}
+    return 1;
+  }
   if(status.state!=='failed')return 0;
   const waitMs=ENTRY_RETRY_MINUTES[Math.min(ENTRY_RETRY_MINUTES.length-1,Math.max(0,status.attempt-1))]*60_000,age=nowMs-Date.parse(status.updatedAt||'');
   return Number.isFinite(age)&&age>=waitMs?status.attempt+1:0;
