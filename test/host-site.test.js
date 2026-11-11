@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { DOMAIN_REQUEST_FILE, readDomainStatus, servingAddress } from '../src/domain-control.js';
 
 // The host scripts, run for real against a stand-in host: a temporary directory holds Nginx's site
 // directories, the install directories and Let's Encrypt's, and a bin/ ahead of PATH holds stand-ins
@@ -26,7 +27,7 @@ const STUBS={
   curl:'for a in "$@"; do [ "$a" = -o ] && exit 22; done; echo 203.0.113.9',
   getent:'[ "$1" = ahostsv4 ] && echo "203.0.113.9 STREAM $2"; exit 0',
   // certbot --nginx rewrites the site it finds the domain in; certonly leaves a certificate behind.
-  certbot:`[ "\${TEST_CERTBOT_FAILS:-0}" = 1 ] && { echo "certbot: challenge failed" >&2; exit 1; }
+  certbot:`[ "\${TEST_CERTBOT_FAILS:-0}" = 1 ] && { printf '%s\\n' "\${TEST_CERTBOT_SAYS:-certbot: challenge failed}" >&2; exit 1; }
 domain=; only=0; prev=
 for a in "$@"; do [ "$prev" = -d ] && domain=$a; [ "$a" = certonly ] && only=1; prev=$a; done
 if [ "$only" = 1 ]; then mkdir -p "$AEGIS_LETSENCRYPT_DIR/live/$domain"; : > "$AEGIS_LETSENCRYPT_DIR/live/$domain/fullchain.pem"; : > "$AEGIS_LETSENCRYPT_DIR/live/$domain/privkey.pem"; exit 0; fi
@@ -57,6 +58,13 @@ function host() {
     site:name=>read(path.join(dir('nginx'),'sites-available',`${name}.conf`)),
     enabled:name=>fs.existsSync(path.join(dir('nginx'),'sites-enabled',`${name}.conf`)),
     calls:()=>(read(calls)||'').trim().split('\n').filter(Boolean),
+    // The agent's side of things: the status file as the agent reads it, the address it will report on
+    // its next heartbeat (the same reading src/agent-runtime.js does), and a request as it files one.
+    status:()=>readDomainStatus(dir('agent/data')),
+    reported(){const env=this.env('agent');return servingAddress({dir:dir('agent/data'),installed:{mode:env.AGENT_PROXY_MODE||'',domain:env.AGENT_DOMAIN||'',ip:env.AGENT_PROXY_IP||''}})},
+    forgetStatus:()=>fs.rmSync(path.join(dir('agent/data'),'host-domain-status.json'),{force:true}),
+    request:value=>fs.writeFileSync(path.join(dir('agent/data'),DOMAIN_REQUEST_FILE),typeof value==='string'?value:JSON.stringify(value)),
+    requested:()=>fs.existsSync(path.join(dir('agent/data'),DOMAIN_REQUEST_FILE)),
     // An install's .env as an object ("panel" or "agent").
     env:install=>Object.fromEntries((read(path.join(dir(install),'.env'))||'').split('\n').filter(Boolean).map(line=>[line.slice(0,line.indexOf('=')),line.slice(line.indexOf('=')+1)]))
   };
@@ -181,17 +189,15 @@ test('the panel\'s domain setup leaves its .env saying what Nginx now serves, an
   assert.deepEqual([same.status,/面板域名与代理域名必须不同/.test(same.output)],[1,true]);
 });
 
-test('setting an agent\'s direct address records it in the agent\'s .env',()=>{
+test('an agent on a domain gets a certificate that renews itself; on its IP it needs none',()=>{
   const h=host();
   assert.equal(h.run('agent-configure-domain.sh',['HK.Example.com','ops@example.com']).status,0);
-  assert.deepEqual(h.env('agent'),{PANEL_URL:'https://panel.example.com',AGENT_DOMAIN:'hk.example.com',AGENT_EMAIL:'ops@example.com'});
   assert.deepEqual(h.calls().filter(call=>call.startsWith('certbot ')),['certbot --nginx -d hk.example.com --non-interactive --agree-tos --redirect -m ops@example.com']);
   assert.match(h.site('aegis-relay-agent'),/# managed by Certbot: hk\.example\.com/,'the certificate went into the site');
-  assert.ok(h.calls().includes('systemctl enable --now certbot.timer'),'and is renewed by itself');
-  // Then moved to its public IP: plain HTTP, no certificate, and the distribution's default site out of the way.
+  assert.ok(h.calls().includes('systemctl enable --now certbot.timer'));
+  // Moved to its public IP: plain HTTP, no certificate, and the distribution's default site out of the way.
   fs.symlinkSync('../sites-available/default',path.join(h.dir('nginx'),'sites-enabled','default'));
   assert.equal(h.run('agent-configure-ip.sh').status,0);
-  assert.deepEqual(h.env('agent'),{PANEL_URL:'https://panel.example.com',AGENT_DOMAIN:'',AGENT_EMAIL:'ops@example.com',AGENT_PROXY_MODE:'ip',AGENT_PROXY_IP:'203.0.113.9'});
   assert.equal(h.calls().filter(call=>call.startsWith('certbot ')).length,1);
   assert.equal(fs.existsSync(path.join(h.dir('nginx'),'sites-enabled','default')),false);
   assert.equal(fs.statSync(path.join(h.dir('agent'),'.env')).mode&0o777,0o600);
@@ -199,8 +205,113 @@ test('setting an agent\'s direct address records it in the agent\'s .env',()=>{
   const fresh=host();
   for(const args of [['bad_domain!','ops@example.com'],['hk.example.com','not-an-email'],['hk.example.com']]){
     assert.equal(fresh.run('agent-configure-domain.sh',args).status,1,args.join(' '));
-    assert.deepEqual([fresh.site('aegis-relay-agent'),fresh.calls().filter(call=>!call.startsWith('id '))],[null,[]],args.join(' '));
+    assert.deepEqual([fresh.site('aegis-relay-agent'),fresh.status(),fresh.calls()],[null,null,[]],args.join(' '));
   }
+});
+
+// The request files are read with python3 on the host; a machine without it cannot run those tests.
+const PYTHON=spawnSync('python3',['-c','print(1)']).status===0;
+// An agent installed on its IP, as `agent-install.sh --mode ip` leaves it.
+function agentOnItsIp() {
+  const h=host();
+  fs.writeFileSync(path.join(h.dir('agent'),'.env'),'PANEL_URL=https://panel.example.com\nAGENT_DOMAIN=\nAGENT_EMAIL=\nAGENT_VERSION=0.13.12\n');
+  assert.equal(h.run('agent-configure-ip.sh').status,0);
+  return h;
+}
+// The three ways a switch is asked for. The installer and the upgrade run the configure scripts.
+const CALLERS={
+  'the configure scripts (installer, upgrade)':{domain:(h,domain,email)=>h.run('agent-configure-domain.sh',[domain,email]),ip:h=>h.run('agent-configure-ip.sh')},
+  'the aegis-relay-agent command':{domain:(h,domain,email)=>h.run('aegis-relay-agent',['domain',domain,email]),ip:h=>h.run('aegis-relay-agent',['ip'])},
+  'a request from the panel':{python:true,
+    domain:(h,domain,email)=>{h.request({version:1,requestId:'request-0001',mode:'domain',desiredDomain:domain,certificateEmail:email});return h.run('agent-host-domain-apply.sh')},
+    ip:h=>{h.request({version:1,requestId:'request-0002',mode:'ip'});return h.run('agent-host-domain-apply.sh')}}
+};
+
+test('whoever sets an agent\'s direct address, the agent ends up reporting what Nginx serves',t=>{
+  const ends=[];
+  for(const [who,caller] of Object.entries(CALLERS)){
+    if(caller.python&&!PYTHON){t.diagnostic(`python3 is not installed: skipping "${who}"`);continue}
+    const h=agentOnItsIp(),calls=h.calls().length,seen=[];
+    // From its IP to a domain.
+    const toDomain=caller.domain(h,'HK.Example.com','ops@example.com');
+    assert.equal(toDomain.status,0,`${who}: ${toDomain.output}`);
+    assert.match(h.site('aegis-relay-agent'),/server_name hk\.example\.com;/,who);
+    assert.deepEqual(h.env('agent'),{PANEL_URL:'https://panel.example.com',AGENT_DOMAIN:'hk.example.com',AGENT_EMAIL:'ops@example.com',AGENT_VERSION:'0.13.12',AGENT_PROXY_MODE:'domain',AGENT_PROXY_IP:'203.0.113.9'},who);
+    const {requestId,updatedAt,...onDomain}=h.status();
+    assert.deepEqual(onDomain,{state:'active',mode:'domain',desiredDomain:'hk.example.com',currentDomain:'hk.example.com',message:'域名已切换，证书自动续期已启用'},who);
+    assert.ok(Math.abs(Date.now()-Date.parse(updatedAt))<60_000,`${who}: ${updatedAt}`);
+    assert.deepEqual(h.reported(),{mode:'domain',domain:'hk.example.com'},who);
+    seen.push(h.env('agent'),onDomain);
+    // The status file goes when the machine enrolls again; .env alone must say the same.
+    h.forgetStatus();
+    assert.deepEqual(h.reported(),{mode:'domain',domain:'hk.example.com'},`${who}, from .env alone`);
+    // And back to its IP.
+    const toIp=caller.ip(h);
+    assert.equal(toIp.status,0,`${who}: ${toIp.output}`);
+    assert.match(h.site('aegis-relay-agent'),/server_name _;/,who);
+    assert.deepEqual(h.env('agent'),{PANEL_URL:'https://panel.example.com',AGENT_DOMAIN:'',AGENT_EMAIL:'ops@example.com',AGENT_VERSION:'0.13.12',AGENT_PROXY_MODE:'ip',AGENT_PROXY_IP:'203.0.113.9'},who);
+    const {requestId:second,updatedAt:later,...onIp}=h.status();
+    assert.deepEqual(onIp,{state:'active',mode:'ip',desiredDomain:'',currentDomain:'203.0.113.9',message:'已切换为 IP 反代（HTTP）'},who);
+    assert.deepEqual(h.reported(),{mode:'ip',domain:'203.0.113.9'},who);
+    h.forgetStatus();
+    assert.deepEqual(h.reported(),{mode:'ip',domain:'203.0.113.9'},`${who}, from .env alone`);
+    seen.push(h.env('agent'),onIp);
+    // The status names the panel's request when there was one.
+    assert.deepEqual([requestId,second],caller.python?['request-0001','request-0002']:['',''],who);
+    // The agent container is left running: nobody watching through this machine loses their stream.
+    assert.deepEqual(h.calls().slice(calls).filter(call=>call.startsWith('docker')),[],who);
+    ends.push(seen);
+  }
+  for(const end of ends)assert.deepEqual(end,ends[0],'every caller leaves the same state');
+});
+
+test('a machine whose .env and status file disagreed is put right by the next switch',()=>{
+  // Two states older versions could leave behind. An agent that once got a domain from the panel, with
+  // the status file still saying so, switched since by a path that did not update it:
+  const stale=agentOnItsIp();
+  fs.writeFileSync(path.join(stale.dir('agent/data'),'host-domain-status.json'),JSON.stringify({requestId:'old-request-01',state:'active',mode:'domain',desiredDomain:'old.example.com',currentDomain:'old.example.com',message:'',updatedAt:'2026-01-01T00:00:00Z'}));
+  assert.deepEqual(stale.reported(),{mode:'domain',domain:'old.example.com'},'it reports a domain Nginx no longer serves');
+  assert.equal(stale.run('aegis-relay-agent',['domain','new.example.com','ops@example.com']).status,0);
+  assert.deepEqual([stale.reported(),stale.status().currentDomain,stale.status().requestId],[{mode:'domain',domain:'new.example.com'},'new.example.com','']);
+  // And one moved from its IP to a domain while .env kept AGENT_PROXY_MODE=ip:
+  const marked=host();
+  fs.writeFileSync(path.join(marked.dir('agent'),'.env'),'AGENT_DOMAIN=hk.example.com\nAGENT_EMAIL=ops@example.com\nAGENT_PROXY_MODE=ip\nAGENT_PROXY_IP=203.0.113.9\n');
+  assert.deepEqual(marked.reported(),{mode:'ip',domain:'203.0.113.9'},'it reports its IP while Nginx serves the domain');
+  assert.equal(marked.run('agent-configure-domain.sh',['hk.example.com','ops@example.com']).status,0);
+  assert.deepEqual([marked.reported(),marked.env('agent').AGENT_PROXY_MODE],[{mode:'domain',domain:'hk.example.com'},'domain']);
+});
+
+test('a request from the panel is checked before it reaches Nginx, and answered in the status file',{skip:!PYTHON&&'python3 is not installed'},()=>{
+  const h=agentOnItsIp(),before=h.status(),quiet=()=>h.calls().filter(call=>/^(nginx|certbot|systemctl|apt-get) /.test(call)).length,calls=quiet();
+  assert.deepEqual([h.run('agent-host-domain-apply.sh').status,quiet()],[0,calls],'nothing to do without a request');
+  // The request comes from an unprivileged container: anything unexpected is dropped, not acted on.
+  const good={version:1,requestId:'request-0003',mode:'domain',desiredDomain:'hk.example.com',certificateEmail:'ops@example.com'};
+  for(const [what,request] of [['no request id',{...good,requestId:''}],['a request id with shell characters',{...good,requestId:'$(reboot)-0001'}],['an unknown mode',{...good,mode:'tunnel'}],
+    ['a domain with shell characters',{...good,desiredDomain:'hk.example.com;reboot'}],['a domain that is a path',{...good,desiredDomain:'../../etc'}],['no email',{...good,certificateEmail:''}],['an email with a space',{...good,certificateEmail:'ops @example.com'}],
+    ['a domain that is not a string',{...good,desiredDomain:['hk.example.com']}],['not JSON','{']]){
+    h.request(request);
+    assert.equal(h.run('agent-host-domain-apply.sh').status,1,what);
+    assert.deepEqual([h.requested(),quiet(),h.status()],[false,calls,before],what);
+  }
+  // A switch that fails is reported with the reason, under the request's id, and the request is gone.
+  h.request(good);
+  const failed=h.run('agent-host-domain-apply.sh',[],{TEST_CERTBOT_FAILS:'1',TEST_CERTBOT_SAYS:'Challenge failed for "hk.example.com":\tDNS problem\\NXDOMAIN'});
+  assert.deepEqual([failed.status,h.requested()],[1,false]);
+  const status=h.status();
+  assert.deepEqual([status.requestId,status.state,status.mode,status.desiredDomain,status.currentDomain],['request-0003','failed','domain','hk.example.com','203.0.113.9']);
+  assert.ok(status.message.endsWith('Challenge failed for "hk.example.com": DNS problem\\NXDOMAIN'),status.message);
+  assert.deepEqual([h.env('agent').AGENT_DOMAIN,h.env('agent').AGENT_PROXY_MODE],['','ip'],'.env still names the address it had');
+  assert.equal(fs.statSync(path.join(h.dir('agent/data'),'host-domain-status.json')).mode&0o777,0o644,'the agent container can read it');
+  assert.deepEqual(fs.readdirSync(h.dir('agent/data')),['host-domain-status.json'],'no temporary file is left behind');
+});
+
+test('the aegis-relay-agent command says how it is used instead of guessing',()=>{
+  const h=agentOnItsIp(),calls=h.calls().length;
+  for(const args of [['domain'],['domain','hk.example.com'],['domain','hk.example.com','ops@example.com','extra'],['nonsense']]){
+    const result=h.run('aegis-relay-agent',args);
+    assert.deepEqual([result.status,/用法/.test(result.output)],[1,true],args.join(' '));
+  }
+  assert.equal(h.calls().length,calls,'and touches nothing');
 });
 
 test('a dead third-party APT source does not stop a site from being set up; a missing package does',()=>{
@@ -245,7 +356,7 @@ test('the entry domain is refused when it is this machine\'s own direct domain',
 
 test('an install ships the library with every script that sources it',()=>{
   const sourcing=fs.readdirSync(SCRIPTS).filter(name=>fs.readFileSync(path.join(SCRIPTS,name),'utf8').includes('host-site.sh}"')).sort();
-  assert.deepEqual(sourcing,['agent-configure-domain.sh','agent-configure-ip.sh','configure-domain.sh','configure-entry-domain.sh','configure-local-domain.sh']);
+  assert.deepEqual(sourcing,['agent-configure-domain.sh','agent-configure-ip.sh','agent-host-domain-apply.sh','configure-domain.sh','configure-entry-domain.sh','configure-local-domain.sh']);
   // An agent gets its scripts one by one, from the installer and again from every upgrade; the library
   // has to be among them, and in place before the first script that needs it.
   for(const installer of ['agent-install.sh','agent-upgrade.sh']){
